@@ -83,3 +83,6 @@ GRAPH_HOPS = 1
 GRAPH_NEIGHBOR_BUDGET = 3
 GRAPH_EDGE_KINDS = ("adj", "intra", "cross")
 GRAPH_DECAY = {"adj": 0.85, "intra": 0.70, "cross": 0.60}
+
+CUSTOM_CORPUS_FILE = "corpus_chunks_custom.jsonl"
+SUPPORTED_DOC_EXTENSIONS = (".txt", ".pdf")

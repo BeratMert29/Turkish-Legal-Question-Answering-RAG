@@ -134,13 +134,14 @@ class DataProcessor:
         self._ensure_loaded()
         return self._df[self._df["split"] == split].reset_index(drop=True)
 
-    def chunk_text(self, text: str, doc_id: str, source: str) -> list[CorpusChunk]:
+    @staticmethod
+    def chunk_text(text: str, doc_id: str, source: str) -> list[CorpusChunk]:
         """Chunk by article boundaries or RecursiveCharacterTextSplitter."""
         if len(text) < config.CORPUS_DOC_MIN_CHARS:
             return []
 
         if not getattr(config, 'ARTICLE_CHUNKING_ENABLED', True):
-            return self._char_chunk(text, doc_id, source)
+            return DataProcessor._char_chunk(text, doc_id, source)
 
         article_regex = getattr(config, 'ARTICLE_REGEX', r'(?=(?:MADDE|Madde)\s+\d+)')
         parts = re.split(article_regex, text)
@@ -148,7 +149,7 @@ class DataProcessor:
 
         article_parts = [p for p in parts if re.match(r'(?:MADDE|Madde)\s+\d+', p)]
         if len(article_parts) < 2:
-            return self._char_chunk(text, doc_id, source)
+            return DataProcessor._char_chunk(text, doc_id, source)
 
         chunks: list[CorpusChunk] = []
 
@@ -192,7 +193,8 @@ class DataProcessor:
 
         return chunks
 
-    def _char_chunk(self, text: str, doc_id: str, source: str) -> list[CorpusChunk]:
+    @staticmethod
+    def _char_chunk(text: str, doc_id: str, source: str) -> list[CorpusChunk]:
         """Fallback: character-window chunking only."""
         raw_chunks = _TEXT_SPLITTER.split_text(text)
         chunks: list[CorpusChunk] = []

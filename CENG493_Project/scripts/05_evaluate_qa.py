@@ -10,6 +10,7 @@ import config
 from data.data_processor import DataProcessor
 from evaluation.qa_metrics import compute_all_qa_metrics_with_citation
 from evaluation.hallucination import stratified_sample, run_hallucination_analysis
+from sentence_transformers import CrossEncoder  # type: ignore[import-untyped]
 
 
 def parse_args():
@@ -22,17 +23,23 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset",
-        choices=["kaggle", "hmgs"],
+        choices=["kaggle", "hmgs", "custom"],
         default="kaggle",
         help="Evaluation dataset to use (default: kaggle)",
     )
+    parser.add_argument("--qa-file", default=None, dest="qa_file", help="Path to custom benchmark JSONL (for suffix resolution)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    suffix = "_hmgs" if args.dataset == "hmgs" else ""
+    if args.dataset == "hmgs":
+        suffix = "_hmgs"
+    elif args.dataset == "custom" or args.qa_file:
+        suffix = "_custom"
+    else:
+        suffix = ""
 
     predictions_path = config.RESULTS_DIR / f"qa_predictions_{args.mode}{suffix}.jsonl"
     print(f"Loading predictions from {predictions_path}")
@@ -72,7 +79,6 @@ def main():
     retrieved_results = {p["query_id"]: p.get("retrieved_chunks", []) for p in valid}
 
     print("Loading NLI model: cross-encoder/nli-deberta-v3-small (~180 MB, first run downloads)")
-    from sentence_transformers import CrossEncoder
     nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small")
 
     sample = stratified_sample(valid, config.HALLUCINATION_SAMPLE_SIZE)
