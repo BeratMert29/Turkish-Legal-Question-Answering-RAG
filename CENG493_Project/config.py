@@ -84,3 +84,7 @@ BM25_MIN_TOKEN_LENGTH = 2
 
 # Oracle relevance (scripts/03_evaluate_retrieval.py)
 TOP_K_ORACLE = 5
+
+# Custom corpus / benchmark support
+CUSTOM_CORPUS_FILE = "corpus_chunks_custom.jsonl"
+SUPPORTED_DOC_EXTENSIONS = (".txt", ".pdf")

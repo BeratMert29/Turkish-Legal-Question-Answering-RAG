@@ -86,7 +86,8 @@ class DataProcessor:
     # Chunking
     # ------------------------------------------------------------------
 
-    def chunk_text(self, text: str, doc_id: str, source: str) -> list[CorpusChunk]:
+    @staticmethod
+    def chunk_text(text: str, doc_id: str, source: str) -> list[CorpusChunk]:
         """Split text into overlapping chunks using sentence-boundary-aware splitting.
 
         Uses RecursiveCharacterTextSplitter which respects paragraph/sentence
@@ -131,7 +132,7 @@ class DataProcessor:
             context = row.context if pd.notna(row.context) else ""
             if not context:
                 continue
-            for chunk in self.chunk_text(str(context), str(row.id), str(row.source)):
+            for chunk in DataProcessor.chunk_text(str(context), str(row.id), str(row.source)):
                 text_hash = hashlib.md5(chunk.text.encode()).hexdigest()
                 if text_hash in seen_hashes:
                     skipped += 1
@@ -153,7 +154,7 @@ class DataProcessor:
                     text   = entry.get("text", "")
                     source = entry.get("source", "")
                     doc_id = entry.get("doc_id", "")
-                    for chunk in self.chunk_text(text, doc_id, source):
+                    for chunk in DataProcessor.chunk_text(text, doc_id, source):
                         text_hash = hashlib.md5(chunk.text.encode()).hexdigest()
                         if text_hash in seen_hashes:
                             skipped += 1

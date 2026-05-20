@@ -22,17 +22,23 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset",
-        choices=["kaggle", "hmgs"],
+        choices=["kaggle", "hmgs", "custom"],
         default="kaggle",
         help="Evaluation dataset to use (default: kaggle)",
     )
+    parser.add_argument("--qa-file", default=None, dest="qa_file", help="Path to custom benchmark JSONL (for suffix resolution)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    suffix = "_hmgs" if args.dataset == "hmgs" else ""
+    if args.dataset == "hmgs":
+        suffix = "_hmgs"
+    elif args.dataset == "custom" or args.qa_file:
+        suffix = "_custom"
+    else:
+        suffix = ""
 
     # Load predictions
     predictions_path = config.RESULTS_DIR / f"qa_predictions_{args.mode}{suffix}.jsonl"
