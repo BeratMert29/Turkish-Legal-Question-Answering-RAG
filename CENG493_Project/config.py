@@ -44,7 +44,7 @@ HMGS_SOURCE_MAP = {
     "213 sayılı Vergi Usul Kanunu":          "Vergi Usul Kanunu",
     "657 sayılı Devlet Memurları Kanunu":    "Devlet Memurları Kanunu",
 }
-HMGS_EVAL_EXPECTED = 161  # 240 raw - 49 no corpus - 5 VUK (misattributed) - 25 MC-ref
+HMGS_EVAL_EXPECTED = 161  # 240 raw - 49 no corpus - 5 VUK (misattributed) - 25 MC-ref; enforced as soft assertion in build_gold_eval_set
 
 # Embedding
 EMBEDDING_MODEL = "BAAI/bge-m3"
@@ -71,6 +71,8 @@ LLM_API_KEY = "ollama"
 LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 512
 LLM_FINETUNED_MAX_TOKENS = 256  # shorter cap for fine-tuned model to reduce runaway generation
+
+KAGGLE_MIN_SCORE = 6
 
 # Evaluation
 HALLUCINATION_SAMPLE_SIZE = 150
