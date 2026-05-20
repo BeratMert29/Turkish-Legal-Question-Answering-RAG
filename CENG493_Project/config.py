@@ -41,7 +41,7 @@ HMGS_SOURCE_MAP = {
     "213 sayılı Vergi Usul Kanunu":          "Vergi Usul Kanunu",
     "657 sayılı Devlet Memurları Kanunu":    "Devlet Memurları Kanunu",
 }
-HMGS_EVAL_EXPECTED = 161
+HMGS_EVAL_EXPECTED = 161  # enforced as soft assertion in build_gold_eval_set
 
 EMBEDDING_MODEL = "BAAI/bge-m3"
 FINETUNED_EMBEDDING_MODEL = str(BASE_DIR / "models" / "bge-m3-turkish-legal")
@@ -65,7 +65,6 @@ LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 512
 LLM_FINETUNED_MAX_TOKENS = 256
 
-CORPUS_EVAL_HOLDOUT_RATIO = 0.2
 KAGGLE_MIN_SCORE = 6
 
 HALLUCINATION_SAMPLE_SIZE = 150

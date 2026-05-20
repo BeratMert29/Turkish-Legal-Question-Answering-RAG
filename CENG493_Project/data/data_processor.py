@@ -362,6 +362,13 @@ class DataProcessor:
             "build_gold_eval_set: kept=%d  dropped=no_corpus:%d  mc_ref:%d  noisy_src:%d",
             len(examples), skipped, skipped_mc, skipped_src,
         )
+        expected = getattr(config, "HMGS_EVAL_EXPECTED", None)
+        if expected and len(examples) < expected * 0.8:
+            log.warning(
+                "build_gold_eval_set: only %d examples built, expected ~%d. "
+                "Check HMGS CSV filtering or HMGS_SOURCE_MAP.",
+                len(examples), expected,
+            )
         return examples
 
     @staticmethod
@@ -409,6 +416,17 @@ class DataProcessor:
                 "build_relevant_chunk_map: %d/%d queries have no relevant chunks. "
                 "Check that qa.source values match corpus chunk sources.",
                 no_match_count, len(qa_examples),
+            )
+        matched_count = sum(1 for v in relevant_map.values() if v)
+        log.info(
+            "build_relevant_chunk_map: %d/%d queries have relevant chunks (%.1f%%)",
+            matched_count, len(qa_examples),
+            100 * matched_count / len(qa_examples) if qa_examples else 0,
+        )
+        if qa_examples and matched_count < len(qa_examples) * 0.5:
+            log.warning(
+                "build_relevant_chunk_map: fewer than 50%% of queries matched. "
+                "Retrieval metrics may be unreliable. Check corpus/eval split alignment."
             )
         return relevant_map
 
