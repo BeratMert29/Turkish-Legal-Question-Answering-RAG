@@ -57,7 +57,7 @@ def compute_scenario3_score(
     Final = avg(relevancy, faithfulness, coherence)
     """
     scores = [
-        float(s) if s is not None else 0.5
+        float(s) if s is not None else 0.0  # unavailable metric treated as 0, not neutral 0.5
         for s in (relevancy_score, faithfulness_score, coherence_score)
     ]
     return sum(scores) / len(scores)
@@ -98,16 +98,23 @@ def compute_all_scenario_scores(
     s1 = compute_scenario1_score(retrieval_metrics, qa_metrics, g)
 
     # Scenario 2 — use semantic_similarity if provided, else F1 proxy
+    scenario2_used_f1_fallback = semantic_similarity is None
     sim = float(semantic_similarity) if semantic_similarity is not None else float(qa_metrics.get("f1", 0.0))
     s2 = compute_scenario2_score(qa_metrics, sim)
 
     # Scenario 3 — use LLM scores; fall back to available proxies
-    relevancy  = float(llm.get("relevancy",  qa_metrics.get("f1", 0.5)))
-    coherence  = float(llm.get("coherence",  0.5))
+    scenario3_used_f1_fallback = "relevancy" not in llm
+    relevancy  = float(llm.get("relevancy",  qa_metrics.get("f1", 0.0)))
+    coherence  = float(llm.get("coherence",  0.0))
     s3 = compute_scenario3_score(relevancy, g, coherence)
 
-    return {
+    result = {
         "scenario1": round(s1, 6),
         "scenario2": round(s2, 6),
         "scenario3": round(s3, 6),
     }
+    if scenario2_used_f1_fallback:
+        result["scenario2_used_f1_fallback"] = True
+    if scenario3_used_f1_fallback:
+        result["scenario3_used_f1_fallback"] = True
+    return result

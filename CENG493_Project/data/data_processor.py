@@ -86,7 +86,8 @@ class DataProcessor:
     # Chunking
     # ------------------------------------------------------------------
 
-    def chunk_text(self, text: str, doc_id: str, source: str) -> list[CorpusChunk]:
+    @staticmethod
+    def chunk_text(text: str, doc_id: str, source: str) -> list[CorpusChunk]:
         """Split text into overlapping chunks using sentence-boundary-aware splitting.
 
         Uses RecursiveCharacterTextSplitter which respects paragraph/sentence
@@ -131,7 +132,7 @@ class DataProcessor:
             context = row.context if pd.notna(row.context) else ""
             if not context:
                 continue
-            for chunk in self.chunk_text(str(context), str(row.id), str(row.source)):
+            for chunk in DataProcessor.chunk_text(str(context), str(row.id), str(row.source)):
                 text_hash = hashlib.md5(chunk.text.encode()).hexdigest()
                 if text_hash in seen_hashes:
                     skipped += 1
@@ -153,7 +154,7 @@ class DataProcessor:
                     text   = entry.get("text", "")
                     source = entry.get("source", "")
                     doc_id = entry.get("doc_id", "")
-                    for chunk in self.chunk_text(text, doc_id, source):
+                    for chunk in DataProcessor.chunk_text(text, doc_id, source):
                         text_hash = hashlib.md5(chunk.text.encode()).hexdigest()
                         if text_hash in seen_hashes:
                             skipped += 1
@@ -299,6 +300,13 @@ class DataProcessor:
             "build_gold_eval_set: kept=%d  dropped=no_corpus:%d  mc_ref:%d  noisy_src:%d",
             len(examples), skipped, skipped_mc, skipped_src,
         )
+        expected = getattr(config, "HMGS_EVAL_EXPECTED", None)
+        if expected and len(examples) < expected * 0.8:
+            log.warning(
+                "build_gold_eval_set: only %d examples built, expected ~%d. "
+                "Check HMGS CSV filtering or HMGS_SOURCE_MAP.",
+                len(examples), expected,
+            )
         return examples
 
     # ------------------------------------------------------------------
@@ -385,6 +393,17 @@ class DataProcessor:
                 "build_relevant_chunk_map: %d/%d queries have no relevant chunks. "
                 "Check that qa.source values match corpus chunk sources.",
                 no_match_count, len(qa_examples),
+            )
+        matched_count = sum(1 for v in relevant_map.values() if v)
+        log.info(
+            "build_relevant_chunk_map: %d/%d queries have relevant chunks (%.1f%%)",
+            matched_count, len(qa_examples),
+            100 * matched_count / len(qa_examples) if qa_examples else 0,
+        )
+        if qa_examples and matched_count < len(qa_examples) * 0.5:
+            log.warning(
+                "build_relevant_chunk_map: fewer than 50%% of queries matched. "
+                "Retrieval metrics may be unreliable. Check corpus/eval split alignment."
             )
         return relevant_map
 

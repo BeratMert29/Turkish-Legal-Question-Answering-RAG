@@ -200,12 +200,13 @@ def compute_all_qa_metrics(predictions: list[dict]) -> dict:
     result = {k: sum(m[k] for m in metrics) / len(metrics) for k in keys}
     # Corpus-level BLEU via evaluate
     if _USE_HF_EVALUATE:
-        preds_norm = [normalize_turkish(p["predicted"]) for p in predictions]
+        preds_norm = [normalize_turkish(strip_citations(p["predicted"])) for p in predictions]
         refs_norm = [[normalize_turkish(p["expected"])] for p in predictions]
         bleu_result = _BLEU_METRIC.compute(predictions=preds_norm, references=refs_norm)
         result["bleu"] = float(bleu_result["bleu"])
     else:
-        result["bleu"] = _corpus_bleu_fallback(predictions)
+        stripped = [{**p, "predicted": strip_citations(p["predicted"])} for p in predictions]
+        result["bleu"] = _corpus_bleu_fallback(stripped)
     result["num_samples"] = len(predictions)
     return result
 

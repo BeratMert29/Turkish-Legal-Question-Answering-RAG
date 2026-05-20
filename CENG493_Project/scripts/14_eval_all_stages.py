@@ -675,6 +675,9 @@ def main() -> None:
 
         summary_path = config.BASE_DIR / "results" / "ablation_summary.json"
         summary_path.parent.mkdir(parents=True, exist_ok=True)
+        if args.limit:
+            all_results["limit_applied"] = True
+            all_results["limit_value"] = args.limit
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(all_results, f, ensure_ascii=False, indent=2)
         print(f"Full results saved to: {summary_path}")
