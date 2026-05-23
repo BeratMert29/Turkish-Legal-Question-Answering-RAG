@@ -12,10 +12,16 @@ Prerequisites:
   - Fine-tuned embedding (optional): python scripts/12_finetune_embeddings.py
 
 Usage:
-    python scripts/14_eval_all_stages.py                           # all available stages
+    python scripts/14_eval_all_stages.py                           # all available stages (CSV format)
     python scripts/14_eval_all_stages.py --stages base,rrf_rerank,llm_ft
     python scripts/14_eval_all_stages.py --stages base --dataset hmgs
     python scripts/14_eval_all_stages.py --list-stages
+    python scripts/14_eval_all_stages.py \
+        --corpus /content/datasets/corpus.jsonl \
+        --eval-data /content/datasets/gold_benchmark.json          # external evaluator format
+    python scripts/14_eval_all_stages.py \
+        --corpus /content/datasets/corpus.jsonl \
+        --eval-data /content/datasets/rag_eval.json                # external rag eval
 
 Available stages:
     base         BGE-M3 base    + dense          + qwen2.5:7b
@@ -45,7 +51,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import config
-from data.data_processor import DataProcessor
+from data.data_processor import DataProcessor, CorpusChunk, QAExample
 from evaluation.hallucination import run_hallucination_analysis, stratified_sample
 from evaluation.qa_metrics import compute_all_qa_metrics_with_citation
 from evaluation.retrieval_metrics import compute_all_metrics
@@ -65,6 +71,78 @@ from retrieval.embedder import Embedder
 from retrieval.reranker import Reranker
 from retrieval.retriever import Retriever
 from utils import check_ollama, inject_citations, set_seeds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# External data loaders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_external_corpus(path: Path) -> list:
+    """Load corpus from evaluator-format corpus.jsonl -> list[CorpusChunk]."""
+    from data.corpus_loader import load_corpus_jsonl
+    raw_chunks = load_corpus_jsonl(path)
+    return [
+        CorpusChunk(**{k: r[k] for k in ("chunk_id", "doc_id", "text", "source", "char_len")})
+        for r in raw_chunks
+    ]
+
+
+def _load_external_qa(path: Path) -> tuple[list, bool]:
+    """Load QA examples from rag_eval.json or gold_benchmark.json.
+
+    Auto-detects format from first item keys.
+    Attaches gold_source_ids as a dynamic attribute so build_relevant_chunk_map
+    Strategy 0 (exact chunk ID match) works correctly.
+
+    Returns (qa_examples, short_answer_mode).
+    """
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not data:
+        raise ValueError(f"Empty QA file: {path}")
+
+    first = data[0]
+    examples = []
+
+    if "query_id" in first and "query" in first:
+        # rag_eval.json format — open-ended answers, no short-answer mode
+        short_answer_mode = False
+        for item in data:
+            qa = QAExample(
+                query_id=item["query_id"],
+                question=item["query"],
+                answer=item.get("gold_answer_extract", ""),
+                context="",
+                source=item.get("source", ""),
+                data_type="",
+            )
+            qa.gold_source_ids = item.get("gold_chunk_ids", [])
+            examples.append(qa)
+
+    elif "question_id" in first and "question" in first:
+        # gold_benchmark.json format — exam-style, short answers
+        short_answer_mode = True
+        for item in data:
+            gold_sources = item.get("gold_sources", [])
+            qa = QAExample(
+                query_id=item["question_id"],
+                question=item["question"],
+                answer=item.get("verified_answer", ""),
+                context="",
+                source=gold_sources[0].get("source", "") if gold_sources else "",
+                data_type="",
+            )
+            qa.gold_source_ids = [s["source_id"] for s in gold_sources]
+            examples.append(qa)
+
+    else:
+        raise ValueError(
+            f"Unrecognised QA file format in {path}. "
+            "Expected rag_eval.json (query_id+query) or gold_benchmark.json (question_id+question)."
+        )
+
+    return examples, short_answer_mode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,10 +489,10 @@ def run_stage(
             )}
             for p in predictions
         ]
-        judge_result     = llm_judge_answer(judge_preds, config.LLM_BASE_URL, config.LLM_MODEL, sample_size=20)
-        faith_result     = llm_judge_faithfulness(predictions, config.LLM_BASE_URL, config.LLM_MODEL, sample_size=20)
-        relev_result     = llm_judge_relevancy(judge_preds, config.LLM_BASE_URL, config.LLM_MODEL, sample_size=20)
-        coher_result     = llm_judge_coherence(predictions, config.LLM_BASE_URL, config.LLM_MODEL, sample_size=20)
+        judge_result     = llm_judge_answer(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
+        faith_result     = llm_judge_faithfulness(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
+        relev_result     = llm_judge_relevancy(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
+        coher_result     = llm_judge_coherence(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
         llm_judge_score          = judge_result["score"]
         llm_faithfulness_score   = faith_result["score"]
         llm_relevancy_score      = relev_result["score"]
@@ -579,6 +657,19 @@ def main() -> None:
         default=None,
         help="Limit QA examples per stage for quick testing (e.g. --limit 30).",
     )
+    parser.add_argument(
+        "--corpus",
+        type=str,
+        default=None,
+        help="Path to external corpus.jsonl (evaluator format). Overrides DataProcessor corpus loading.",
+    )
+    parser.add_argument(
+        "--eval-data",
+        type=str,
+        default=None,
+        help="Path to external rag_eval.json or gold_benchmark.json. "
+             "Auto-detects format. Overrides --dataset.",
+    )
     args = parser.parse_args()
 
     if args.list_stages:
@@ -630,16 +721,32 @@ def main() -> None:
         )
 
     # ── Load data (shared) ────────────────────────────────────────────────
-    short_answer_mode = (args.dataset == "hmgs")
     print("Loading data …")
-    processor = DataProcessor(config.RAW_DATA_PATH)
-    processor.load_and_validate()
-    corpus_chunks = list(processor.build_corpus_chunks())
 
-    if args.dataset == "hmgs":
-        qa_examples = DataProcessor.build_gold_eval_set()
+    # External evaluator format (--corpus / --eval-data)
+    if args.corpus:
+        print(f"  Corpus source : {args.corpus} (external evaluator format)")
+        corpus_chunks = _load_external_corpus(Path(args.corpus))
     else:
-        qa_examples = processor.build_qa_eval_set()
+        processor = DataProcessor(config.RAW_DATA_PATH)
+        processor.load_and_validate()
+        corpus_chunks = list(processor.build_corpus_chunks())
+
+    if args.eval_data:
+        print(f"  QA source     : {args.eval_data} (external evaluator format)")
+        qa_examples, short_answer_mode = _load_external_qa(Path(args.eval_data))
+    else:
+        short_answer_mode = (args.dataset == "hmgs")
+        if args.dataset == "hmgs":
+            qa_examples = DataProcessor.build_gold_eval_set()
+        else:
+            if not args.corpus:
+                pass  # processor already initialised above
+            else:
+                processor = DataProcessor(config.RAW_DATA_PATH)
+                processor.load_and_validate()
+            qa_examples = processor.build_qa_eval_set()
+
     if args.limit:
         qa_examples = qa_examples[:args.limit]
         print(f"  [--limit {args.limit}] Evaluating first {args.limit} examples only.")

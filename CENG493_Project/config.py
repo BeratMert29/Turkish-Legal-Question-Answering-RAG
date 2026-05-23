@@ -81,6 +81,7 @@ LLM_API_KEY = "ollama"
 LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 512
 LLM_FINETUNED_MAX_TOKENS = 256  # shorter cap for fine-tuned model to reduce runaway generation
+LLM_JUDGE_MODEL = "llama3.3:70b"   # separate judge model to avoid self-evaluation bias
 
 KAGGLE_MIN_SCORE = 6
 

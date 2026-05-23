@@ -1,4 +1,5 @@
 """Evaluate retrieval quality using context-hash ground truth + BM25 hybrid."""
+import argparse
 import os, sys
 if sys.platform == "darwin":
     os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -12,7 +13,7 @@ if _project_root not in sys.path:
     sys.path.append(_project_root)
 
 import config
-from data.data_processor import DataProcessor
+from data.data_processor import DataProcessor, CorpusChunk, QAExample
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever
 from retrieval.bm25_retriever import BM25Index
@@ -20,7 +21,104 @@ from retrieval.reranker import Reranker
 from evaluation.retrieval_metrics import compute_all_metrics
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# External data loaders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_external_corpus(path: Path) -> list[CorpusChunk]:
+    """Load corpus from evaluator-format corpus.jsonl -> list[CorpusChunk]."""
+    from data.corpus_loader import load_corpus_jsonl
+    raw_chunks = load_corpus_jsonl(path)
+    return [
+        CorpusChunk(**{k: r[k] for k in ("chunk_id", "doc_id", "text", "source", "char_len")})
+        for r in raw_chunks
+    ]
+
+
+def _load_external_qa(path: Path) -> tuple[list[QAExample], bool]:
+    """Load QA examples from rag_eval.json or gold_benchmark.json.
+
+    Auto-detects format from first item keys.
+    Attaches gold_source_ids as a dynamic attribute so build_relevant_chunk_map
+    can use exact chunk ID matching when available.
+
+    Returns:
+        A tuple of (qa_examples, short_answer_mode).
+    """
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not data:
+        raise ValueError(f"Empty QA file: {path}")
+
+    if isinstance(data, dict):
+        data = list(data.values())
+
+    first = data[0]
+    examples = []
+
+    if "query_id" in first and "query" in first:
+        # rag_eval.json format — open-ended answers, no short-answer mode
+        short_answer_mode = False
+        for item in data:
+            qa = QAExample(
+                query_id=item["query_id"],
+                question=item["query"],
+                answer=item.get("gold_answer_extract", ""),
+                context="",
+                source=item.get("source", ""),
+                data_type="external",
+            )
+            qa.gold_source_ids = item.get("gold_chunk_ids", [])
+            examples.append(qa)
+
+    elif "question_id" in first and "question" in first:
+        # gold_benchmark.json format — exam-style, short answers
+        short_answer_mode = True
+        for item in data:
+            gold_sources = item.get("gold_sources", [])
+            qa = QAExample(
+                query_id=item["question_id"],
+                question=item["question"],
+                answer=item.get("verified_answer", ""),
+                context="",
+                source=gold_sources[0].get("source", "") if gold_sources else "",
+                data_type="external",
+            )
+            qa.gold_source_ids = [s["source_id"] for s in gold_sources]
+            examples.append(qa)
+
+    else:
+        raise ValueError(
+            f"Unrecognised QA file format in {path}. "
+            "Expected rag_eval.json (query_id+query) or gold_benchmark.json (question_id+question)."
+        )
+
+    return examples, short_answer_mode
+
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluate retrieval quality across all retrieval modes."
+    )
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to external corpus.jsonl (evaluator format). "
+             "When provided, DataProcessor corpus loading is skipped.",
+    )
+    parser.add_argument(
+        "--eval-data",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to external rag_eval.json or gold_benchmark.json. "
+             "Auto-detects format. When provided, DataProcessor QA loading is skipped.",
+    )
+    args = parser.parse_args()
+
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     index_path    = config.INDEX_DIR / config.INDEX_FILE
@@ -33,11 +131,29 @@ def main():
     n_corpus = retriever.index.ntotal
     print(f"  Index loaded: {n_corpus} vectors")
 
-    print(f"\nLoading data from {config.RAW_DATA_PATH}")
-    processor = DataProcessor(config.RAW_DATA_PATH)
-    processor.load_and_validate()
-    corpus_chunks = list(processor.build_corpus_chunks())
-    qa_examples   = processor.build_qa_eval_set()
+    # ── Load corpus chunks ─────────────────────────────────────────────────
+    if args.corpus:
+        print(f"\nLoading external corpus from {args.corpus}")
+        corpus_chunks = _load_external_corpus(args.corpus)
+    else:
+        print(f"\nLoading data from {config.RAW_DATA_PATH}")
+        processor = DataProcessor(config.RAW_DATA_PATH)
+        processor.load_and_validate()
+        corpus_chunks = list(processor.build_corpus_chunks())
+
+    # ── Load QA examples ───────────────────────────────────────────────────
+    if args.eval_data:
+        print(f"Loading external QA data from {args.eval_data}")
+        qa_examples, _ = _load_external_qa(args.eval_data)
+    else:
+        if not args.corpus:
+            # processor already initialised above
+            pass
+        else:
+            processor = DataProcessor(config.RAW_DATA_PATH)
+            processor.load_and_validate()
+        qa_examples = processor.build_qa_eval_set()
+
     print(f"  Corpus chunks: {len(corpus_chunks)}")
     print(f"  QA examples:   {len(qa_examples)}")
 

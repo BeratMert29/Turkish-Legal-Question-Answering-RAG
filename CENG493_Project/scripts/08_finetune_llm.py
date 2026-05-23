@@ -16,28 +16,22 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import config
+from generation.rag_pipeline import TURKISH_PROMPT
 
 HF_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-QLORA_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+QLORA_MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
 ADAPTER_DIR = config.BASE_DIR / "models" / "qwen25_lora"
 
 RAG_DATASET    = config.PROCESSED_DIR / "qa_train_rag.jsonl"
 MERGED_DATASET = config.PROCESSED_DIR / "qa_train_merged.jsonl"
 FALLBACK_DATASET = config.PROCESSED_DIR / "qa_train.jsonl"
 
-SYSTEM_PROMPT = (
-    "Sen Türk hukuku alanında uzman bir hukuki asistansın. "
-    "Yanıtını yalnızca verilen bağlama dayandır. "
-    "Kısa, doğrudan ve kaynaklı cevap ver. "
-    "Yeni soru üretme, bağlamı tekrar yazma."
-)
-
 TRAINING_CONFIG = {
     "base_model": HF_MODEL_ID,
     "backend": "safe_lora_fp16",
     "lora": {
-        "r": 8,
-        "lora_alpha": 16,
+        "r": 16,
+        "lora_alpha": 32,
         "lora_dropout": 0.05,
         "target_modules": [
             "q_proj", "k_proj", "v_proj", "o_proj",
@@ -53,14 +47,14 @@ TRAINING_CONFIG = {
         "bnb_4bit_compute_dtype": "float16",
     },
     "training": {
-        "num_train_epochs": 1,
-        "per_device_train_batch_size": 1,
-        "gradient_accumulation_steps": 4,
-        "effective_batch_size": 4,
+        "num_train_epochs": 3,
+        "per_device_train_batch_size": 4,
+        "gradient_accumulation_steps": 2,
+        "effective_batch_size": 8,
         "learning_rate": 5e-5,
         "warmup_ratio": 0.03,
         "lr_scheduler_type": "cosine",
-        "max_length": 512,
+        "max_length": 2048,
         "dataset_text_field": "text",
         "logging_steps": 10,
         "save_strategy": "no",
@@ -68,7 +62,7 @@ TRAINING_CONFIG = {
         "bf16": False,
         "optim": "adamw_torch",
         "report_to": "none",
-        "gradient_checkpointing": False,
+        "gradient_checkpointing": True,
         "dataloader_num_workers": 0,
     },
     "adapter_output_dir": str(ADAPTER_DIR),
@@ -95,7 +89,7 @@ def format_as_chat(example: dict, tokenizer) -> str:
     else:
         user_content = question
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": TURKISH_PROMPT},
         {"role": "user", "content": user_content},
         {"role": "assistant", "content": example["answer"]},
     ]
