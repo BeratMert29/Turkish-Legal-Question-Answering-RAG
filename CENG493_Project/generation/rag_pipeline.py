@@ -7,14 +7,14 @@ TURKISH_PROMPT = """Sen Türk hukuku alanında uzman bir hukuki asistansın. Gö
 
 ZORUNLU KURALLAR:
 1. Yanıtını YALNIZCA verilen [Kaynak N] kaynaklarına dayandır.
-2. Cevabını bağlamdaki AYNI kelime ve ifadelerle ver — parafraz yapma, kaynaklardaki orijinal hukuki terminolojiyi koru.
+2. Hukuki terimleri, kanun adlarını ve madde numaralarını AYNEN koru. Açıklamanı kendi cümlelerinle yap, ancak hukuki kavramları değiştirme veya basitleştirme.
 3. İlgili her atıfta kanun adını VE madde numarasını açıkça belirt (örnek: "Türk Medeni Kanunu Madde 997").
 4. Birden fazla kaynak ilgiliyse hepsini sentezle ve [Kaynak N] numarasıyla göster.
 5. Bağlam soruyu yanıtlamak için yetersizse "Sağlanan bağlam bu soruyu yanıtlamak için yeterli değildir." yaz; asla tahmin yürütme.
 
 YANIT YAPISI:
-- İlk cümle: Sorunun doğrudan, kısa yanıtı (bağlamdaki tam ifadeyi kullan).
-- Devamı: Hukuki dayanak — ilgili kanun adı, madde numarası ve bağlamdan alınan açıklama.
+- İlk cümle: Sorunun doğrudan, kısa yanıtı.
+- Devamı: Hukuki dayanak — ilgili kanun adı, madde numarası ve bağlamdan çıkarılan açıklama.
 - Gereksiz giriş cümlesi, tekrar veya açıklama ekleme.
 
 Yanıtını yalnızca Türkçe ver."""
@@ -23,8 +23,8 @@ SHORT_ANSWER_PROMPT = """Sen Türk hukuku alanında uzman bir hukuki asistansın
 
 ZORUNLU KURALLAR:
 1. Yanıtın yalnızca TEK bir ifade, sayı veya hukuki kavramdan oluşmalıdır — cümle kurma, açıklama yapma, gerekçe gösterme.
-2. Bağlamdaki AYNI kelime veya ifadeyi kullan — parafraz yapma.
-3. Yanıtı öncelikle bağlamdan çıkar. Bağlamda tam ifade yoksa, en ilgili hukuki terimi yaz.
+2. Hukuki terimleri ve kavramları AYNEN kullan, basitleştirme.
+3. Yanıtı öncelikle bağlamdan çıkar. Bağlamda doğrudan cevap yoksa, en ilgili hukuki terimi yaz.
 4. Yalnızca bağlam tamamen ilgisizse şunu yaz: Bilgi yok
 5. Fazladan kelime, noktalama veya açıklama ekleme.
 6. Yanıtının hemen ardına, kullandığın kaynağın numarasını şu formatta ekle: [Kaynak 1]
@@ -32,14 +32,7 @@ ZORUNLU KURALLAR:
 Yanıtını yalnızca Türkçe ver."""
 
 class ChunkExpander:
-    """Expands retrieved chunks with their immediate neighbors from the metadata store.
-
-    Neighbors are identified via the trailing integer in chunk_id
-    (format: "{source}_{doc_id}_{index}"). Only chunks sharing the same
-    source+doc_id prefix are considered adjacent. The expanded text is the
-    deduplication-free concatenation: prev_tail + current + next_head, using
-    the overlap boundary so text is not doubled.
-    """
+    """Merge chunk text with adjacent chunks (same chunk_id prefix) from metadata."""
 
     def __init__(self, metadata_path: str | Path):
         metadata_path = Path(metadata_path)
@@ -75,7 +68,7 @@ class ChunkExpander:
         return prefix, idx
 
     def expand(self, chunk: dict, window: int = 1) -> str:
-        """Return text of chunk expanded by up to `window` neighbors on each side."""
+        """Concatenate neighboring chunk texts within window."""
         chunk_id = chunk.get("chunk_id", "")
         prefix, idx = self._lookup(chunk_id)
         if prefix is None or prefix not in self._by_prefix:
@@ -128,18 +121,11 @@ class RAGPipeline:
         )
 
     def get_llm_client(self) -> openai.OpenAI:
-        """Return the shared OpenAI client pointing at Ollama endpoint."""
+        """Ollama OpenAI-compatible client."""
         return self._client
 
     def assemble_context(self, chunks: list) -> tuple[str, list]:
-        """
-        Format top_k_for_generation chunks as numbered sources.
-        When a ChunkExpander is attached, each chunk's text is expanded with
-        its immediate neighbors before formatting, increasing the chance that
-        answers near chunk boundaries are included in context.
-        Returns (context_str, included_chunks) where included_chunks contains
-        only the chunks whose text was not truncated out.
-        """
+        """Numbered sources string and chunks included (respects context_window_chars)."""
         selected = chunks[:self.top_k_for_generation]
         parts = []
         included = []
@@ -160,7 +146,7 @@ class RAGPipeline:
         return context, included
 
     def generate(self, question: str, context: str) -> str:
-        """Generate answer via Ollama LLM."""
+        """Single chat completion."""
         response = self._client.chat.completions.create(
             model=self.model,
             temperature=self.temperature,
@@ -175,34 +161,22 @@ class RAGPipeline:
         content = response.choices[0].message.content
         if not content:
             raise ValueError("LLM returned empty response")
-        # Find earliest occurrence of any stop marker (with or without leading newline/space)
         cut = len(content)
         for marker in ["Soru:", "Bağlam:", "Question:", "\nQ:"]:
             idx = content.find(marker)
-            # Skip if marker appears at the very start (first 10 chars) — avoid cutting legitimate openings
             if idx != -1 and idx >= 10:
                 cut = min(cut, idx)
         content = content[:cut]
         return content.strip()
 
     def run(self, question: str, top_k_retrieval: int = config.TOP_K_RETRIEVAL) -> dict:
-        """
-        Full RAG pipeline: retrieve → assemble context → generate.
-
-        Returns:
-            {
-                "question": str,
-                "answer": str,
-                "retrieved_chunks": list[RetrievedChunk],   # ← key is "retrieved_chunks"
-                "context_used": str,
-            }
-        """
+        """Retrieve, assemble context, generate."""
         retrieved_chunks = self.retriever.retrieve(question, top_k=top_k_retrieval)
         context_used, context_chunks = self.assemble_context(retrieved_chunks)
         answer = self.generate(question, context_used)
         return {
             "question": question,
             "answer": answer,
-            "retrieved_chunks": context_chunks,   # only chunks that were in context
+            "retrieved_chunks": context_chunks,
             "context_used": context_used,
         }

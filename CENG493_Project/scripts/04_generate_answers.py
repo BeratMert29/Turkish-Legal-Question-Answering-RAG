@@ -13,7 +13,7 @@ if _project_root not in sys.path:
 import config
 from data.data_processor import DataProcessor
 from data.qa_loader import resolve_qa_set
-from data.corpus_loader import resolve_corpus
+from data.corpus_loader import resolve_corpus, load_corpus_jsonl
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever
 from generation.rag_pipeline import RAGPipeline, ChunkExpander
@@ -103,8 +103,7 @@ def main():
     if needs_bm25:
         from retrieval.bm25_retriever import BM25Index
         corpus_path = resolve_corpus(args.corpus, args.docs_path)
-        corpus_chunks_raw = DataProcessor.load_jsonl(corpus_path)
-        corpus_chunks = corpus_chunks_raw
+        corpus_chunks = load_corpus_jsonl(corpus_path)  # auto-normalizes evaluator format
         print(f"Building BM25 index over {len(corpus_chunks)} chunks...")
         bm25_index = BM25Index()
         bm25_index.build([{"text": c["text"], "chunk_id": c["chunk_id"]} for c in corpus_chunks])

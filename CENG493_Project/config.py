@@ -6,6 +6,8 @@ BASE_DIR = Path(__file__).parent
 CHUNK_SIZE = 1400
 CHUNK_OVERLAP = 180
 CORPUS_DOC_MIN_CHARS = 180
+ARTICLE_CHUNKING_ENABLED = True  # True → split at MADDE boundaries first
+ARTICLE_REGEX = r'(?=(?:MADDE|Madde)\s+\d+)'
 
 # Data
 QA_EVAL_EXPECTED = 300
@@ -51,7 +53,7 @@ EMBEDDING_MODEL = "BAAI/bge-m3"
 FINETUNED_EMBEDDING_MODEL = str(BASE_DIR / "models" / "bge-m3-turkish-legal")
 HF_PERPLEXITY_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 EMBEDDING_DIM = 1024
-EMBEDDING_BATCH_SIZE = 32
+EMBEDDING_BATCH_SIZE = 8  # lower = less VRAM; increase to 32 if you have 12GB+ VRAM
 
 # Retrieval
 TOP_K_RETRIEVAL = 10
@@ -62,6 +64,13 @@ CONTEXT_WINDOW_CHARS = 14000
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 RERANKER_CANDIDATES = 10   # initial dense/RRF pool before cross-encoder re-ranking
 RRF_K = 60                 # RRF smoothing constant
+
+GRAPH_FILE = "graph.json"
+GRAPH_EXPANSION_ENABLED = False
+GRAPH_HOPS = 1
+GRAPH_NEIGHBOR_BUDGET = 3
+GRAPH_EDGE_KINDS = ("adj", "intra", "cross")
+GRAPH_DECAY = {"adj": 0.85, "intra": 0.70, "cross": 0.60}
 
 # LLM (Ollama — free, no API key)
 LLM_MODEL = "qwen2.5:14b"

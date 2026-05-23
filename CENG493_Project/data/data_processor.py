@@ -3,6 +3,7 @@ from typing import Iterator
 import hashlib
 import json
 import pathlib
+import re
 
 import pandas as pd
 import config
@@ -15,6 +16,9 @@ _TEXT_SPLITTER = RecursiveCharacterTextSplitter(
     length_function=len,
     separators=["\n\n", "\n", ". ", " ", ""],
 )
+
+# Matches the start of a Turkish law article heading (e.g. "MADDE 1", "Madde 12").
+_ARTICLE_RE = re.compile(r"(?m)(?=^\s*MADDE\s+\d)", re.IGNORECASE)
 
 
 @dataclass
@@ -82,22 +86,35 @@ class DataProcessor:
         self._ensure_loaded()
         return self._df[self._df["split"] == split].reset_index(drop=True)
 
+    def _get_kaggle_corpus_eval_split(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Split kaggle rows into (corpus_df, eval_df) holding eval rows out of corpus.
+
+        Uses the same random_state=42 and QA_EVAL_EXPECTED cap as build_qa_eval_set()
+        so that the eval QA pairs are never seen in the FAISS corpus (data leakage fix).
+
+        Returns:
+            corpus_df: rows NOT sampled for eval — used for FAISS index construction.
+            eval_df:   rows sampled for eval — used to build the QA eval set.
+        """
+        df = self.get_corpus_rows()
+        n = min(config.QA_EVAL_EXPECTED, len(df))
+        eval_df = df.sample(n=n, random_state=42)
+        corpus_df = df.drop(eval_df.index).reset_index(drop=True)
+        eval_df = eval_df.reset_index(drop=True)
+        return corpus_df, eval_df
+
+    def get_eval_only_rows(self) -> pd.DataFrame:
+        """Return only the kaggle rows held out for eval (not in the FAISS corpus)."""
+        _, eval_df = self._get_kaggle_corpus_eval_split()
+        return eval_df
+
     # ------------------------------------------------------------------
     # Chunking
     # ------------------------------------------------------------------
 
     @staticmethod
-    def chunk_text(text: str, doc_id: str, source: str) -> list[CorpusChunk]:
-        """Split text into overlapping chunks using sentence-boundary-aware splitting.
-
-        Uses RecursiveCharacterTextSplitter which respects paragraph/sentence
-        boundaries before falling back to hard character limits, producing
-        cleaner chunks than a pure character-offset sliding window.
-        Returns [] for texts shorter than CORPUS_DOC_MIN_CHARS.
-        """
-        if len(text) < config.CORPUS_DOC_MIN_CHARS:
-            return []
-
+    def _char_chunk(text: str, doc_id: str, source: str) -> list["CorpusChunk"]:
+        """Character-based chunking via RecursiveCharacterTextSplitter (original method)."""
         raw_chunks = _TEXT_SPLITTER.split_text(text)
         chunks: list[CorpusChunk] = []
         for i, chunk in enumerate(raw_chunks):
@@ -112,6 +129,64 @@ class DataProcessor:
             ))
         return chunks
 
+    @staticmethod
+    def _article_chunk(text: str, doc_id: str, source: str) -> list["CorpusChunk"]:
+        """Article-level chunking: split at MADDE boundaries, sub-split oversized articles."""
+        parts = _ARTICLE_RE.split(text)
+        chunks: list[CorpusChunk] = []
+        chunk_index = 0
+        for part in parts:
+            part = part.strip()
+            if not part or len(part) < config.CORPUS_DOC_MIN_CHARS:
+                continue
+            if len(part) <= config.CHUNK_SIZE:
+                chunks.append(CorpusChunk(
+                    chunk_id=f"{source}_{doc_id}_{chunk_index}",
+                    doc_id=doc_id,
+                    text=part,
+                    source=source,
+                    char_len=len(part),
+                ))
+                chunk_index += 1
+            else:
+                # Article is larger than CHUNK_SIZE — sub-split it.
+                sub_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=config.CHUNK_SIZE,
+                    chunk_overlap=config.CHUNK_OVERLAP,
+                    length_function=len,
+                    separators=["\n\n", "\n", ". ", " ", ""],
+                )
+                for sub_chunk in sub_splitter.split_text(part):
+                    if len(sub_chunk) < config.CHUNK_OVERLAP:
+                        continue
+                    chunks.append(CorpusChunk(
+                        chunk_id=f"{source}_{doc_id}_{chunk_index}",
+                        doc_id=doc_id,
+                        text=sub_chunk,
+                        source=source,
+                        char_len=len(sub_chunk),
+                    ))
+                    chunk_index += 1
+        return chunks
+
+    @staticmethod
+    def chunk_text(text: str, doc_id: str, source: str) -> list["CorpusChunk"]:
+        """Split text into overlapping chunks.
+
+        When config.ARTICLE_CHUNKING_ENABLED is True, respects Turkish law article
+        boundaries (MADDE regex) before falling back to RecursiveCharacterTextSplitter
+        for oversized articles.  When False (default), uses plain character-based
+        splitting via RecursiveCharacterTextSplitter.
+
+        Returns [] for texts shorter than CORPUS_DOC_MIN_CHARS.
+        """
+        if len(text) < config.CORPUS_DOC_MIN_CHARS:
+            return []
+
+        if getattr(config, "ARTICLE_CHUNKING_ENABLED", False):
+            return DataProcessor._article_chunk(text, doc_id, source)
+        return DataProcessor._char_chunk(text, doc_id, source)
+
     # ------------------------------------------------------------------
     # Corpus builder (generator)
     # ------------------------------------------------------------------
@@ -123,12 +198,17 @@ class DataProcessor:
         build_relevant_chunk_map uses context-hash matching to correctly
         resolve the canonical chunk even when the query's row was deduplicated.
         Also loads supplementary law texts from extra_laws.jsonl if present.
+
+        Eval rows are held out (data leakage fix): only the complement of the
+        QA eval sample is indexed into FAISS.
         """
         seen_hashes: set[str] = set()
         kept = 0
         skipped = 0
 
-        for row in self.get_corpus_rows().itertuples(index=False):
+        corpus_df, _ = self._get_kaggle_corpus_eval_split()
+
+        for row in corpus_df.itertuples(index=False):
             context = row.context if pd.notna(row.context) else ""
             if not context:
                 continue
@@ -201,16 +281,14 @@ class DataProcessor:
         return examples
 
     def build_qa_eval_set(self) -> list[QAExample]:
-        """Build QA eval set sampled from kaggle split.
+        """Build QA eval set from the held-out kaggle split (data leakage fix).
 
-        Kaggle rows have question + answer + context + source, enabling
-        model-independent ground-truth relevance mapping via doc_id match.
-        Uses random_state=42 for reproducibility.
+        Eval rows are the same subset held out from the FAISS corpus by
+        _get_kaggle_corpus_eval_split(), so retrieval is always evaluated on
+        unseen queries.  Uses random_state=42 for reproducibility.
         """
-        df = self.get_corpus_rows()  # split == "kaggle", all rows have source+context
-        n = min(config.QA_EVAL_EXPECTED, len(df))
-        sampled = df.sample(n=n, random_state=42)
-        return self._rows_to_qa_examples(sampled)
+        _, eval_df = self._get_kaggle_corpus_eval_split()
+        return self._rows_to_qa_examples(eval_df)
 
     def build_qa_train_set(self) -> list[QAExample]:
         """Build QA train set (train split)."""
@@ -324,10 +402,11 @@ class DataProcessor:
         Model-independent: does NOT use embeddings to define relevance.
 
         Strategy (in order):
-        1. Exact source match: qa.source == chunk.source
-        2. doc_id prefix match: chunk.doc_id starts with qa's row id
-        3. Answer substring: chunk.text contains a significant portion of qa.answer
-           (at least 80 chars of the answer appears in the chunk)
+        0. gold_source_ids: exact chunk IDs from evaluator benchmark
+        1. Context hash match: re-chunk qa.context and match by text hash
+        2. doc_id match: chunk.doc_id == qa.query_id
+        2.5. Answer substring: chunk.text contains a significant portion of qa.answer
+        3. Source match: all chunks from qa.source (for HMGS gold sets)
 
         Returns dict mapping query_id -> list of relevant chunk_ids.
         """
@@ -348,12 +427,31 @@ class DataProcessor:
         for qa in qa_examples:
             relevant: list[str] = []
 
+            # Unified field accessors: support both QAExample dataclass and plain dict.
+            _is_dict = isinstance(qa, dict)
+            qa_query_id = qa["query_id"] if _is_dict else qa.query_id
+            qa_context  = qa.get("context", "") if _is_dict else qa.context
+            qa_answer   = qa.get("answer", "") if _is_dict else qa.answer
+            qa_source   = qa.get("source", "") if _is_dict else qa.source
+
+            # Strategy 0: gold_source_ids — exact chunk IDs supplied by the
+            # evaluator's benchmark (gold_benchmark.json / rag_eval.json).
+            # These are chunk_ids that exist verbatim in the corpus, so we use
+            # them directly without any heuristic matching.
+            gold_ids = qa.get("gold_source_ids") if _is_dict else getattr(qa, "gold_source_ids", None)
+            if gold_ids:
+                valid_ids = set(c.chunk_id for c in corpus_chunks)
+                relevant = [gid for gid in gold_ids if gid in valid_ids]
+                if relevant:
+                    relevant_map[qa_query_id] = relevant
+                    continue  # Skip remaining strategies — ground truth is exact.
+
             # Strategy 1: context-hash match — re-chunk qa.context and find
             # the canonical corpus chunks by text hash.  This correctly handles
             # the deduplicated corpus: the relevant chunk may be stored under a
             # different doc_id than qa.query_id if it was first seen in another row.
-            if qa.context:
-                for text in _TEXT_SPLITTER.split_text(qa.context):
+            if qa_context:
+                for text in _TEXT_SPLITTER.split_text(qa_context):
                     if len(text) >= config.CORPUS_DOC_MIN_CHARS:
                         h = hashlib.md5(text.encode()).hexdigest()
                         relevant.extend(hash_to_chunk_ids.get(h, []))
@@ -368,25 +466,25 @@ class DataProcessor:
 
             # Strategy 2: doc_id match — used when context is empty/missing
             if not relevant:
-                relevant = [c.chunk_id for c in corpus_chunks if c.doc_id == qa.query_id]
+                relevant = [c.chunk_id for c in corpus_chunks if c.doc_id == qa_query_id]
 
             # Strategy 2.5: answer substring match — for gold sets with known answers (e.g. HMGS)
             # Find chunks that contain a significant portion of the answer text.
-            if not relevant and qa.answer and len(qa.answer) >= 40:
-                answer_lower = qa.answer.lower().strip()
+            if not relevant and qa_answer and len(qa_answer) >= 40:
+                answer_lower = qa_answer.lower().strip()
                 search_str = answer_lower[:80] if len(answer_lower) >= 80 else answer_lower
-                candidate_chunks = by_source.get(qa.source, corpus_chunks) if qa.source else corpus_chunks
+                candidate_chunks = by_source.get(qa_source, corpus_chunks) if qa_source else corpus_chunks
                 relevant = [c.chunk_id for c in candidate_chunks if search_str in c.text.lower()]
 
             # Strategy 3: source match — for gold sets without context (e.g. HMGS)
             # All chunks from the matching law are considered relevant.
-            if not relevant and qa.source:
-                relevant = [c.chunk_id for c in by_source.get(qa.source, [])]
+            if not relevant and qa_source:
+                relevant = [c.chunk_id for c in by_source.get(qa_source, [])]
 
             if not relevant:
                 no_match_count += 1
 
-            relevant_map[qa.query_id] = relevant
+            relevant_map[qa_query_id] = relevant
 
         if no_match_count:
             log.warning(

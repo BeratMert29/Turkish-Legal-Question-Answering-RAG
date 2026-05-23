@@ -12,7 +12,7 @@ if _project_root not in sys.path:
 import argparse
 import config
 from data.data_processor import DataProcessor
-from data.corpus_loader import resolve_corpus
+from data.corpus_loader import resolve_corpus, load_corpus_jsonl
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever
 
@@ -27,7 +27,7 @@ def main():
     # Load corpus chunks
     corpus_path = resolve_corpus(args.corpus, args.docs_path)
     print(f"Loading corpus from {corpus_path}")
-    chunks = DataProcessor.load_jsonl(corpus_path)
+    chunks = load_corpus_jsonl(corpus_path)  # auto-normalizes evaluator format
     texts = [c['text'] for c in chunks]
     metadata = [{'chunk_id': c['chunk_id'], 'doc_id': c['doc_id'], 'source': c['source'], 'text': c['text']} for c in chunks]
     print(f"  Loaded {len(chunks)} chunks")

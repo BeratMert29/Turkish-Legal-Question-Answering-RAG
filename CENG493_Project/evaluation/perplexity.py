@@ -9,9 +9,7 @@ import math
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
 # Ollama model name -> HuggingFace model ID mapping
-# ---------------------------------------------------------------------------
 _OLLAMA_TO_HF: dict[str, str] = {
     "qwen2.5:7b": "Qwen/Qwen2.5-7B-Instruct",
     "qwen25-legal-ft": "Qwen/Qwen2.5-7B-Instruct",
@@ -65,10 +63,8 @@ def compute_perplexity(
         Mean perplexity across successful samples, or *None* if fewer than
         3 samples could be evaluated.
     """
-    # ------------------------------------------------------------------
     # 1. Availability check — import lazily so the module is importable
     #    even when torch / transformers are not installed.
-    # ------------------------------------------------------------------
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -79,9 +75,7 @@ def compute_perplexity(
         )
         return None
 
-    # ------------------------------------------------------------------
     # 2. Resolve HuggingFace model ID and build quantisation config.
-    # ------------------------------------------------------------------
     resolved_hf_id = hf_model_id if hf_model_id is not None else _resolve_hf_model_id(model)
     log.info("Loading HuggingFace model '%s' for perplexity evaluation.", resolved_hf_id)
 
@@ -103,26 +97,20 @@ def compute_perplexity(
                 "bitsandbytes is not installed; loading model in full precision."
             )
 
-    # ------------------------------------------------------------------
     # 3. Load tokenizer and model (lazy, inside the function).
-    # ------------------------------------------------------------------
     tokenizer = AutoTokenizer.from_pretrained(resolved_hf_id, use_fast=True)
     hf_model = AutoModelForCausalLM.from_pretrained(resolved_hf_id, **model_kwargs)
     hf_model.eval()
 
-    # ------------------------------------------------------------------
     # 4. Determine the device for tensor placement.
     #    With device_map="auto" the model may be split; use the embedding
     #    layer's device as the input device.
-    # ------------------------------------------------------------------
     try:
         input_device = next(hf_model.parameters()).device
     except StopIteration:
         input_device = torch.device("cpu")
 
-    # ------------------------------------------------------------------
     # 5. Iterate over samples and compute per-sample perplexity.
-    # ------------------------------------------------------------------
     sampled = predictions[:sample_size]
     perplexities: list[float] = []
 
@@ -177,9 +165,7 @@ def compute_perplexity(
             log.debug("Perplexity computation failed for sample: %s", exc)
             continue
 
-    # ------------------------------------------------------------------
     # 6. Aggregate results.
-    # ------------------------------------------------------------------
     if not perplexities:
         log.warning(
             "No perplexity values were computed (all samples failed or were skipped)."

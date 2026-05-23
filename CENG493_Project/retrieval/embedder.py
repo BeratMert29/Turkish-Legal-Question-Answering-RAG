@@ -110,7 +110,7 @@ class BGEM3Embedder:
         out = self.model.encode(
             texts,
             batch_size=self.batch_size,
-            max_length=512,
+            max_length=1024,
             return_dense=True,
             return_sparse=False,
             return_colbert_vecs=False,
@@ -125,7 +125,7 @@ class BGEM3Embedder:
         out = self.model.encode(
             texts,
             batch_size=self.batch_size,
-            max_length=512,
+            max_length=1024,
             return_dense=False,
             return_sparse=True,
             return_colbert_vecs=False,
@@ -140,7 +140,7 @@ class BGEM3Embedder:
         out = self.model.encode(
             texts,
             batch_size=self.batch_size,
-            max_length=512,
+            max_length=1024,
             return_dense=False,
             return_sparse=False,
             return_colbert_vecs=True,
@@ -165,7 +165,7 @@ class BGEM3Embedder:
         out = self.model.encode(
             texts,
             batch_size=self.batch_size,
-            max_length=512,
+            max_length=1024,
             return_dense=True,
             return_sparse=True,
             return_colbert_vecs=True,

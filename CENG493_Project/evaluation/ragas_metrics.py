@@ -27,6 +27,7 @@ def compute_ragas_metrics(
         from ragas.metrics import (
             faithfulness,
             answer_relevancy,
+            answer_correctness,
             context_precision,
             context_recall,
         )
@@ -68,7 +69,7 @@ def compute_ragas_metrics(
 
         result = evaluate(
             dataset=dataset,
-            metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+            metrics=[faithfulness, answer_relevancy, answer_correctness, context_precision, context_recall],
             llm=LangchainLLMWrapper(llm),
             embeddings=LangchainEmbeddingsWrapper(embeddings),
             raise_exceptions=False,
@@ -95,6 +96,7 @@ def compute_ragas_metrics(
         return {
             "ragas_faithfulness": _to_float(result["faithfulness"]),
             "ragas_answer_relevancy": _to_float(result["answer_relevancy"]),
+            "ragas_answer_correctness": _to_float(result["answer_correctness"]),
             "ragas_context_precision": _to_float(result["context_precision"]),
             "ragas_context_recall": _to_float(result["context_recall"]),
         }

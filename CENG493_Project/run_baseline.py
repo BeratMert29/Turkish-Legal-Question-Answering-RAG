@@ -245,6 +245,8 @@ def main() -> None:
                         help="Apply cross-encoder reranker after dense retrieval")
     parser.add_argument("--rrf", action="store_true",
                         help="Use RRF (Reciprocal Rank Fusion) of BM25+dense instead of linear blend")
+    parser.add_argument("--graph", action="store_true",
+                        help="Enable graph neighbor expansion after retrieval")
     parser.add_argument("--results-dir", type=Path, default=config.RESULTS_DIR,
                         help="Directory to write baseline_metrics.json")
     parser.add_argument(
@@ -256,6 +258,9 @@ def main() -> None:
 
     if args.hybrid and args.rrf:
         parser.error("--hybrid and --rrf are mutually exclusive (both are BM25+dense fusion strategies)")
+
+    if args.graph:
+        config.GRAPH_EXPANSION_ENABLED = True
 
     set_seeds(42)
 
@@ -275,6 +280,17 @@ def main() -> None:
         retriever, index_build_time = build_index(processor, embedder, chunks=corpus_chunks)
     else:
         retriever = load_index(embedder)
+
+    graph_index = None
+    if args.graph:
+        graph_path = config.INDEX_DIR / getattr(config, "GRAPH_FILE", "graph.json")
+        if graph_path.exists():
+            from retrieval.graph_index import GraphIndex
+            graph_index = GraphIndex(graph_path, config.INDEX_DIR / config.METADATA_FILE)
+            log.info("Graph index loaded: %s", graph_path)
+        else:
+            log.warning("--graph set but graph.json not found at %s; run scripts/15_build_graph.py", graph_path)
+    retriever.graph_index = graph_index
 
     if not args.eval and not args.retrieval_only:
         log.info("--eval not specified; exiting after index step.")

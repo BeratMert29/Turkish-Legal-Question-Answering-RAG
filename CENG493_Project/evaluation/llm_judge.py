@@ -22,9 +22,7 @@ from typing import Optional
 import requests
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_score(text: str) -> float:
     """Extract first float in [0,1] from text. Returns 0.5 on failure."""
@@ -82,9 +80,7 @@ def _subsample(items: list, sample_size: int, seed: int = 42) -> list:
     return rng.sample(items, sample_size)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Public API
-# ─────────────────────────────────────────────────────────────────────────────
 
 def llm_judge_answer(
     predictions: list[dict],

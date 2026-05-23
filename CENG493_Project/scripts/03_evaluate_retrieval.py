@@ -23,7 +23,6 @@ from evaluation.retrieval_metrics import compute_all_metrics
 def main():
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Load index ──────────────────────────────────────────────────────────
     index_path    = config.INDEX_DIR / config.INDEX_FILE
     metadata_path = config.INDEX_DIR / config.METADATA_FILE
     print(f"Loading index from {index_path}")
@@ -34,7 +33,6 @@ def main():
     n_corpus = retriever.index.ntotal
     print(f"  Index loaded: {n_corpus} vectors")
 
-    # ── Load data via DataProcessor (same approach as run_baseline.py) ──────
     print(f"\nLoading data from {config.RAW_DATA_PATH}")
     processor = DataProcessor(config.RAW_DATA_PATH)
     processor.load_and_validate()
@@ -43,7 +41,6 @@ def main():
     print(f"  Corpus chunks: {len(corpus_chunks)}")
     print(f"  QA examples:   {len(qa_examples)}")
 
-    # ── Build ground-truth relevance map ────────────────────────────────────
     print("\nBuilding ground-truth relevance map (context-hash)...")
     relevant_map = DataProcessor.build_relevant_chunk_map(corpus_chunks, qa_examples)
     matched = sum(1 for v in relevant_map.values() if v)
@@ -51,13 +48,11 @@ def main():
 
     questions = [qa.question for qa in qa_examples]
 
-    # ── Dense retrieval ──────────────────────────────────────────────────────
     print(f"\nDense retrieval for {len(qa_examples)} queries...")
     t0 = time.time()
     all_dense = retriever.batch_retrieve(questions, top_k=config.TOP_K_RETRIEVAL)
     print(f"  Done in {time.time()-t0:.1f}s")
 
-    # ── BM25 index + hybrid retrieval ───────────────────────────────────────
     print(f"\nBuilding BM25 index over {len(corpus_chunks)} chunks...")
     t0 = time.time()
     bm25_index = BM25Index()
@@ -71,39 +66,33 @@ def main():
     )
     print(f"  Done in {time.time()-t0:.1f}s")
 
-    # ── RRF retrieval ────────────────────────────────────────────────────────
     print(f"\nRRF retrieval for {len(qa_examples)} queries...")
     t0 = time.time()
     all_rrf = retriever.batch_rrf_retrieve(questions, bm25_index, top_k=config.TOP_K_RETRIEVAL)
     print(f"  Done in {time.time()-t0:.1f}s")
 
-    # ── Load reranker (shared for all rerank modes) ──────────────────────────
     print("\nLoading cross-encoder reranker...")
     reranker = Reranker()
     reranker.load_model()
 
-    # ── Dense + Rerank ───────────────────────────────────────────────────────
     print(f"\nDense+Rerank retrieval for {len(qa_examples)} queries...")
     t0 = time.time()
     dense_cands = retriever.batch_retrieve(questions, top_k=config.RERANKER_CANDIDATES)
     all_dense_rerank = reranker.batch_rerank(questions, dense_cands, top_k=config.TOP_K_RETRIEVAL)
     print(f"  Done in {time.time()-t0:.1f}s")
 
-    # ── Hybrid + Rerank ──────────────────────────────────────────────────────
     print(f"\nHybrid+Rerank retrieval for {len(qa_examples)} queries...")
     t0 = time.time()
     hybrid_cands = retriever.batch_hybrid_retrieve(questions, bm25_index, top_k=config.RERANKER_CANDIDATES)
     all_hybrid_rerank = reranker.batch_rerank(questions, hybrid_cands, top_k=config.TOP_K_RETRIEVAL)
     print(f"  Done in {time.time()-t0:.1f}s")
 
-    # ── RRF + Rerank ─────────────────────────────────────────────────────────
     print(f"\nRRF+Rerank retrieval for {len(qa_examples)} queries...")
     t0 = time.time()
     rrf_cands = retriever.batch_rrf_retrieve(questions, bm25_index, top_k=config.RERANKER_CANDIDATES)
     all_rrf_rerank = reranker.batch_rerank(questions, rrf_cands, top_k=config.TOP_K_RETRIEVAL)
     print(f"  Done in {time.time()-t0:.1f}s")
 
-    # ── Build metric results ─────────────────────────────────────────────────
     def build_results(all_retrieved):
         metric_results = []
         full_results   = {}
@@ -155,7 +144,6 @@ def main():
               f"{m.get('recall_at_10',0):8.4f}  {m.get('mrr',0):8.4f}  "
               f"{m.get('ndcg_at_10',0):8.4f}")
 
-    # ── Save ─────────────────────────────────────────────────────────────────
     out = {
         "dense_metrics":          dense_metrics,
         "hybrid_metrics":         hybrid_metrics,
