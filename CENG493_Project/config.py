@@ -6,6 +6,8 @@ BASE_DIR = Path(__file__).parent
 CHUNK_SIZE = 1400
 CHUNK_OVERLAP = 180
 CORPUS_DOC_MIN_CHARS = 180
+# Minimum chunk character length; shared by _char_chunk and _article_chunk
+MIN_CHUNK_CHARS = 180
 ARTICLE_CHUNKING_ENABLED = True  # True → split at MADDE boundaries first
 ARTICLE_REGEX = r'(?=(?:MADDE|Madde)\s+\d+)'
 
@@ -43,7 +45,6 @@ HMGS_SOURCE_MAP = {
     "6102 sayılı Türk Ticaret Kanunu":       "Türk Ticaret Kanunu",
     "2577 sayılı İdari Yargılama Usulü Kanunu": "İdari Yargılama Usulü Kanunu",
     "2004 sayılı İcra ve İflas Kanunu":      "İcra ve İflas Kanunu",
-    "213 sayılı Vergi Usul Kanunu":          "Vergi Usul Kanunu",
     "657 sayılı Devlet Memurları Kanunu":    "Devlet Memurları Kanunu",
 }
 HMGS_EVAL_EXPECTED = 161  # 240 raw - 49 no corpus - 5 VUK (misattributed) - 25 MC-ref; enforced as soft assertion in build_gold_eval_set
@@ -62,7 +63,7 @@ CONTEXT_WINDOW_CHARS = 14000
 
 # Re-ranker (Stage 2 retrieval)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
-RERANKER_CANDIDATES = 10   # initial dense/RRF pool before cross-encoder re-ranking
+RERANKER_CANDIDATES = 50   # fetch more candidates than TOP_K so reranker has a real pool to reorder
 RRF_K = 60                 # RRF smoothing constant
 
 GRAPH_FILE = "graph.json"
@@ -95,6 +96,10 @@ BM25_MIN_TOKEN_LENGTH = 2
 
 # Oracle relevance (scripts/03_evaluate_retrieval.py)
 TOP_K_ORACLE = 5
+
+# Maximum number of chunks assigned as relevant by strategy-3 (source-level fallback).
+# Caps the per-query relevant set so MRR/Recall/NDCG remain meaningful for HMGS queries.
+MAX_STRATEGY3_RELEVANT = 20
 
 # Custom corpus / benchmark support
 CUSTOM_CORPUS_FILE = "corpus_chunks_custom.jsonl"

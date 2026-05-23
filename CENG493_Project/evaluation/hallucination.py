@@ -19,7 +19,8 @@ def _classify_result(result: dict) -> str:
 
 def stratified_sample(results: list[dict], sample_size: int = config.HALLUCINATION_SAMPLE_SIZE) -> dict:
     """Sample ~third from each retrieval-score bucket (hit/partial/miss); fills to sample_size."""
-    random.seed(42)
+    # Use a local RNG instance to avoid mutating the global random state across runs.
+    rng = random.Random(42)
 
     hit_threshold = config.HALLUCINATION_HIT_THRESHOLD      # 0.7
     partial_threshold = config.HALLUCINATION_PARTIAL_THRESHOLD  # 0.4
@@ -35,15 +36,15 @@ def stratified_sample(results: list[dict], sample_size: int = config.HALLUCINATI
             misses.append(r)
 
     target = sample_size // 3
-    h = random.sample(hits, min(target, len(hits)))
-    p = random.sample(partial, min(target, len(partial)))
-    m = random.sample(misses, min(target, len(misses)))
+    h = rng.sample(hits, min(target, len(hits)))
+    p = rng.sample(partial, min(target, len(partial)))
+    m = rng.sample(misses, min(target, len(misses)))
 
     total = len(h) + len(p) + len(m)
     if total < sample_size:
         sampled_ids = {r.get("query_id") for r in h + p + m if r.get("query_id") is not None}
         pool = [x for x in hits + partial + misses if x.get("query_id") not in sampled_ids]
-        extra = random.sample(pool, min(sample_size - total, len(pool)))
+        extra = rng.sample(pool, min(sample_size - total, len(pool)))
         for i, item in enumerate(extra):
             if i % 3 == 0:
                 h.append(item)
@@ -159,9 +160,6 @@ def run_hallucination_analysis(
             "context_grounded": is_grounded,
             "answer_faithfulness_score": answer_faith_prob,
             "answer_faithful": is_answer_faithful,
-            "answer": predicted,
-            "faithful": is_grounded,
-            "score": grounding_prob,
         })
 
     total = sum(c["total"] for c in by_category.values())
@@ -189,8 +187,8 @@ def run_hallucination_analysis(
             "answer_faithfulness_count": faith_count,
             "answer_faithfulness_total": faith_total,
             "answer_faithfulness_rate": answer_faithfulness_rate,
-            "faithful_count": grounding_count,
-            "faithful_rate":  context_grounding_rate,
+            "context_grounding_count": grounding_count,
+            "context_grounding_rate":  context_grounding_rate,
             "by_category": by_category,
             "context_grounding_score_stats":  _stats(grounding_scores),
             "answer_faithfulness_score_stats": _stats(faith_scores),

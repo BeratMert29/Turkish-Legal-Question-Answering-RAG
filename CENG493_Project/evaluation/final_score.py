@@ -55,12 +55,11 @@ def compute_scenario3_score(
     """
     Scenario 3: No Gold Data
     Final = avg(relevancy, faithfulness, coherence)
+    Only averages over non-None metrics so a missing metric does not unfairly
+    zero out the denominator-averaged score.
     """
-    scores = [
-        float(s) if s is not None else 0.0  # unavailable metric treated as 0, not neutral 0.5
-        for s in (relevancy_score, faithfulness_score, coherence_score)
-    ]
-    return sum(scores) / len(scores)
+    scores = [float(s) for s in (relevancy_score, faithfulness_score, coherence_score) if s is not None]
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 def compute_all_scenario_scores(

@@ -179,8 +179,14 @@ def compute_perplexity(
         )
         return None
 
-    mean_ppl = sum(perplexities) / len(perplexities)
+    # Geometric mean of per-sample PPL values (equivalent to exp of mean loss),
+    # which avoids inflating the aggregate when any sample has unusually high loss.
+    valid_ppls = [p for p in perplexities if p > 0]
+    if not valid_ppls:
+        log.warning("All perplexity values are zero; cannot compute geometric mean.")
+        return None
+    mean_ppl = math.exp(sum(math.log(p) for p in valid_ppls) / len(valid_ppls))
     log.info(
-        "Perplexity computed over %d samples: %.4f", len(perplexities), mean_ppl
+        "Perplexity computed over %d samples (geometric mean): %.4f", len(valid_ppls), mean_ppl
     )
     return round(mean_ppl, 4)

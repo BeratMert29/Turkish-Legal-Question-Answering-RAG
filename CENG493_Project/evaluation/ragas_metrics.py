@@ -38,7 +38,10 @@ def compute_ragas_metrics(
         log.warning("RAGAS dependencies not installed (%s). Run: pip install ragas langchain-ollama", e)
         return None
 
-    sampled = [p for p in predictions[:sample_size] if p.get("predicted")]
+    import random as _random
+    _rng = _random.Random(42)
+    pool = [p for p in predictions if p.get("predicted")]
+    sampled = _rng.sample(pool, min(sample_size, len(pool)))
 
     data = {
         "question": [],

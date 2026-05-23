@@ -124,7 +124,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 7. LLM Judge + Semantic Similarity + Final Scenario Scores
     # ------------------------------------------------------------------
-    faithful_rate = hallucination.get("summary", {}).get("faithful_rate", 0.0)
+    _afr = hallucination.get("summary", {}).get("answer_faithfulness_rate")
+    faithful_rate = _afr if _afr is not None else hallucination.get("summary", {}).get("context_grounding_rate", 0.0)
 
     log.info("Running LLM Judge (sample=20) …")
     llm_judge_score = None

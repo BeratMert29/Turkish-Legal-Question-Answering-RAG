@@ -130,12 +130,11 @@ def _normalize_qa_record(row: dict, index: int) -> dict:
     elif row.get("gold_chunk_ids"):
         gold_source_ids = list(row["gold_chunk_ids"])
 
-    # --- source: prefer first gold source id, then plain source string ---
-    source = (
-        gold_source_ids[0]
-        if gold_source_ids
-        else row.get("source", "")
-    )
+    # --- source: use the human-readable source field from the record.
+    # Do NOT fall back to gold_source_ids[0] — that is a chunk ID string
+    # (e.g. "anayasa_000123_4"), not a law name, and would break citation
+    # accuracy / source_in_context_rate metrics. ---
+    source = row.get("source", "")
 
     return {
         "query_id": str(query_id),

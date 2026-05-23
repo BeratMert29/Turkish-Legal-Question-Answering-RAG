@@ -203,7 +203,7 @@ def run_hallucination_eval(predictions: list[dict]) -> dict:
         nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small", device=_nli_device)
     except Exception as exc:
         log.warning("NLI model unavailable (%s); skipping hallucination analysis", exc)
-        return {"summary": {"faithful_rate": None, "skipped": True}, "per_sample": []}
+        return {"summary": {"context_grounding_rate": None, "skipped": True}, "per_sample": []}
 
     retrieval_results_dict = {
         p["query_id"]: p.get("retrieved_chunks", [])
@@ -379,7 +379,7 @@ def main() -> None:
         "retrieval_metrics": retrieval_metrics,
         "qa_metrics": qa_metrics,
         "hallucination_summary": hallucination.get("summary", {}),
-        "faithfulness_rate": hallucination.get("summary", {}).get("faithful_rate"),
+        "faithfulness_rate": hallucination.get("summary", {}).get("context_grounding_rate"),
     }
     save_results(final_results, args.results_dir)
 

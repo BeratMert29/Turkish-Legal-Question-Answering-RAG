@@ -333,6 +333,13 @@ def run_stage(
                 "retrieved_chunks": [],
             })
 
+    # Filter out failed generations (empty predicted) to match 05_evaluate_qa.py behavior.
+    # Without this, empty strings from exceptions would suppress F1/BLEU/ROUGE scores.
+    failed = [p for p in predictions if not p.get("predicted")]
+    predictions = [p for p in predictions if p.get("predicted")]
+    if failed:
+        print(f"    Filtered {len(failed)} failed generation(s) from QA metrics.")
+
     qa_metrics = compute_all_qa_metrics_with_citation(predictions)
     print(f"    F1={qa_metrics.get('f1',0):.4f}  "
           f"ROUGE-L={qa_metrics.get('rouge_l',0):.4f}  "
@@ -383,7 +390,11 @@ def run_stage(
 
     sample = stratified_sample(predictions, config.HALLUCINATION_SAMPLE_SIZE)
     hall = run_hallucination_analysis(sample, full_retrieved, nli_model)
-    faithful_rate = hall["summary"].get("faithful_rate", 0.0)
+    # Prefer answer_faithfulness_rate (gold→predicted entailment) for scenario scoring;
+    # fall back to context_grounding_rate when gold answers are absent.
+    # Use an explicit None-check so a genuine 0.0 faithfulness rate is never discarded.
+    afr = hall["summary"].get("answer_faithfulness_rate")
+    faithful_rate = afr if afr is not None else hall["summary"].get("context_grounding_rate", 0.0)
     print(f"    Faithfulness={faithful_rate:.4f}")
 
     # ── LLM Judge (sampled) ───────────────────────────────────────────────

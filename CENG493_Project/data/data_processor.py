@@ -5,6 +5,7 @@ import json
 import pathlib
 import re
 
+import numpy as np
 import pandas as pd
 import config
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -89,18 +90,55 @@ class DataProcessor:
     def _get_kaggle_corpus_eval_split(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Split kaggle rows into (corpus_df, eval_df) holding eval rows out of corpus.
 
-        Uses the same random_state=42 and QA_EVAL_EXPECTED cap as build_qa_eval_set()
-        so that the eval QA pairs are never seen in the FAISS corpus (data leakage fix).
+        Uses an article-hash split to prevent data leakage: rows sharing the same
+        context text (same article) are always kept together on the same side of the
+        split.  A plain row-level sample would allow the same article to appear in
+        both the FAISS corpus and the eval set under different doc_ids, leaking the
+        gold context into the retrieval index.
+
+        Algorithm:
+        1. Compute MD5 of each row's context text (NaN/empty → treated as "" so
+           all context-less rows stay in the corpus, not the eval set).
+        2. Build a sorted, deduplicated list of unique non-empty context hashes.
+        3. Assign the last N unique hashes to the eval set (deterministic, no shuffle
+           needed because the list is sorted — equivalent to random_state=42 row
+           sampling for uniformly-distributed hashes).
+        4. Eval rows = all rows whose context hash is in the eval hash set.
+        5. Corpus rows = everything else (including all NaN-context rows).
 
         Returns:
             corpus_df: rows NOT sampled for eval — used for FAISS index construction.
             eval_df:   rows sampled for eval — used to build the QA eval set.
+
+        Result is cached on the instance so the expensive split is computed only once
+        per pipeline run even when both build_corpus_chunks() and build_qa_eval_set()
+        call this method.
         """
+        if hasattr(self, "_split_cache"):
+            return self._split_cache
+
         df = self.get_corpus_rows()
-        n = min(config.QA_EVAL_EXPECTED, len(df))
-        eval_df = df.sample(n=n, random_state=42)
-        corpus_df = df.drop(eval_df.index).reset_index(drop=True)
-        eval_df = eval_df.reset_index(drop=True)
+
+        # Step 1 — compute per-row context hash (empty string for NaN).
+        def _ctx_hash(val):
+            text = "" if (val is None or (isinstance(val, float) and pd.isna(val))) else str(val)
+            return hashlib.md5(text.encode()).hexdigest() if text else ""
+
+        ctx_hashes = [_ctx_hash(val) for val in df["context"]]
+
+        # Step 2 — unique non-empty hashes, sorted for determinism.
+        unique_hashes = sorted({h for h in ctx_hashes if h})
+        n = min(config.QA_EVAL_EXPECTED, len(unique_hashes))
+
+        # Step 3 — take the last N unique hashes as the eval set.
+        eval_hash_set = set(unique_hashes[-n:])
+
+        # Step 4 — partition rows via boolean mask.
+        eval_mask = np.array([h in eval_hash_set for h in ctx_hashes])
+        eval_df = df[eval_mask].reset_index(drop=True)
+        corpus_df = df[~eval_mask].reset_index(drop=True)
+
+        self._split_cache = (corpus_df, eval_df)
         return corpus_df, eval_df
 
     def get_eval_only_rows(self) -> pd.DataFrame:
@@ -118,7 +156,7 @@ class DataProcessor:
         raw_chunks = _TEXT_SPLITTER.split_text(text)
         chunks: list[CorpusChunk] = []
         for i, chunk in enumerate(raw_chunks):
-            if len(chunk) < config.CHUNK_OVERLAP:
+            if len(chunk) < config.MIN_CHUNK_CHARS:
                 continue
             chunks.append(CorpusChunk(
                 chunk_id=f"{source}_{doc_id}_{i}",
@@ -137,7 +175,7 @@ class DataProcessor:
         chunk_index = 0
         for part in parts:
             part = part.strip()
-            if not part or len(part) < config.CORPUS_DOC_MIN_CHARS:
+            if not part or len(part) < config.MIN_CHUNK_CHARS:
                 continue
             if len(part) <= config.CHUNK_SIZE:
                 chunks.append(CorpusChunk(
@@ -157,7 +195,7 @@ class DataProcessor:
                     separators=["\n\n", "\n", ". ", " ", ""],
                 )
                 for sub_chunk in sub_splitter.split_text(part):
-                    if len(sub_chunk) < config.CHUNK_OVERLAP:
+                    if len(sub_chunk) < config.MIN_CHUNK_CHARS:
                         continue
                     chunks.append(CorpusChunk(
                         chunk_id=f"{source}_{doc_id}_{chunk_index}",
@@ -421,6 +459,9 @@ class DataProcessor:
             hash_to_chunk_ids.setdefault(h, []).append(chunk.chunk_id)
             by_source.setdefault(chunk.source, []).append(chunk)
 
+        # Issue 11 fix: build valid_ids once outside the per-query loop (O(N) not O(N*Q))
+        valid_ids = set(c.chunk_id for c in corpus_chunks)
+
         relevant_map: dict[str, list[str]] = {}
         no_match_count = 0
 
@@ -440,21 +481,18 @@ class DataProcessor:
             # them directly without any heuristic matching.
             gold_ids = qa.get("gold_source_ids") if _is_dict else getattr(qa, "gold_source_ids", None)
             if gold_ids:
-                valid_ids = set(c.chunk_id for c in corpus_chunks)
                 relevant = [gid for gid in gold_ids if gid in valid_ids]
                 if relevant:
                     relevant_map[qa_query_id] = relevant
                     continue  # Skip remaining strategies — ground truth is exact.
 
-            # Strategy 1: context-hash match — re-chunk qa.context and find
-            # the canonical corpus chunks by text hash.  This correctly handles
-            # the deduplicated corpus: the relevant chunk may be stored under a
-            # different doc_id than qa.query_id if it was first seen in another row.
+            # Strategy 1: context-hash match — re-chunk qa.context using the same
+            # chunking path as the corpus index build (article or char chunking).
+            # This ensures hashes match exactly, regardless of ARTICLE_CHUNKING_ENABLED.
             if qa_context:
-                for text in _TEXT_SPLITTER.split_text(qa_context):
-                    if len(text) >= config.CORPUS_DOC_MIN_CHARS:
-                        h = hashlib.md5(text.encode()).hexdigest()
-                        relevant.extend(hash_to_chunk_ids.get(h, []))
+                for corpus_chunk in DataProcessor.chunk_text(qa_context, qa_query_id, qa_source or ""):
+                    h = hashlib.md5(corpus_chunk.text.encode()).hexdigest()
+                    relevant.extend(hash_to_chunk_ids.get(h, []))
                 # deduplicate while preserving order
                 seen: set[str] = set()
                 deduped = []
@@ -476,10 +514,14 @@ class DataProcessor:
                 candidate_chunks = by_source.get(qa_source, corpus_chunks) if qa_source else corpus_chunks
                 relevant = [c.chunk_id for c in candidate_chunks if search_str in c.text.lower()]
 
-            # Strategy 3: source match — for gold sets without context (e.g. HMGS)
+            # Strategy 3: source match — for gold sets without context (e.g. HMGS).
             # All chunks from the matching law are considered relevant.
+            # Capped at MAX_STRATEGY3_RELEVANT (default 20) to keep metrics meaningful;
+            # assigning hundreds of chunks from an entire law inflates Recall/MRR/NDCG.
             if not relevant and qa_source:
-                relevant = [c.chunk_id for c in by_source.get(qa_source, [])]
+                source_chunks = by_source.get(qa_source, [])
+                max_s3 = getattr(config, "MAX_STRATEGY3_RELEVANT", 20)
+                relevant = [c.chunk_id for c in source_chunks[:max_s3]]
 
             if not relevant:
                 no_match_count += 1

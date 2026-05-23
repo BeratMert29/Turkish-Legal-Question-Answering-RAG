@@ -14,12 +14,15 @@ key (float 0–1).
 
 from __future__ import annotations
 
+import logging
 import random
 import re
 import time
 from typing import Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 # Internal helpers
@@ -36,6 +39,7 @@ def _parse_score(text: str) -> float:
                 return max(0.0, min(1.0, val))
             except ValueError:
                 pass
+    logger.warning("LLM judge _parse_score: could not parse score from response: %s", text[:100])
     return 0.5
 
 
