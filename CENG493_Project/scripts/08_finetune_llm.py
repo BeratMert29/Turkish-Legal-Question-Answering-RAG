@@ -80,6 +80,12 @@ def load_jsonl(path: Path) -> list[dict]:
 
 
 def format_as_chat(example: dict, tokenizer) -> str:
+    if "messages" in example:
+        return tokenizer.apply_chat_template(
+            example["messages"],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
     question = example.get("question", "")
     ctx = example.get("context_str", "") or example.get("context", "")
     context = ctx
