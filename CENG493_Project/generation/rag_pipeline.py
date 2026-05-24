@@ -88,10 +88,15 @@ class ChunkExpander:
         overlap = config.CHUNK_OVERLAP
         merged = texts[0]
         for t in texts[1:]:
-            if overlap and merged.endswith(t[:overlap]):
-                merged = merged + t[overlap:]
-            elif merged.endswith(t[:min(overlap, len(t))]):
-                merged = merged + t[min(overlap, len(t)):]
+            # Find actual overlap by checking decreasing lengths
+            actual_overlap = 0
+            max_check = min(overlap * 2, len(merged), len(t)) if overlap else 0
+            for olen in range(max_check, 0, -1):
+                if merged[-olen:] == t[:olen]:
+                    actual_overlap = olen
+                    break
+            if actual_overlap > 0:
+                merged = merged + t[actual_overlap:]
             else:
                 merged = merged + "\n" + t
         return merged

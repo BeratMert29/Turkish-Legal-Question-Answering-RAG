@@ -44,8 +44,8 @@ TRAINING_CONFIG = {
     "eval_split": 0.05,
     "loss": "MultipleNegativesRankingLoss",
     "notes": (
-        "anchor+positive+negative triplets; first hard negative per triplet (rank 5 from FAISS) "
-        "is passed as the `negative` column. MNRL also uses remaining in-batch samples as negatives."
+        "anchor+positive+ALL hard negatives; up to 7 hard negatives per triplet are passed as "
+        "negative, negative_1, ..., negative_6 columns. MNRL uses these plus in-batch negatives."
     ),
 }
 
@@ -81,8 +81,9 @@ def main() -> None:
     print(f"  {len(raw):,} triplets loaded.")
 
     # ── Build HuggingFace Dataset ────────────────────────────────────────────
-    # Build triplets: anchor + positive + first hard negative (if available).
-    # MNRL accepts an optional `negative` column alongside anchor and positive.
+    # Build triplets: anchor + positive + ALL hard negatives.
+    # sentence-transformers v3+ MultipleNegativesRankingLoss supports multiple
+    # negative columns: "negative", "negative_1", "negative_2", ...
     records = []
     for t in raw:
         record = {
@@ -90,8 +91,9 @@ def main() -> None:
             "positive": t["pos"][0],
         }
         negs = t.get("neg", [])
-        if negs:
-            record["negative"] = negs[0]  # use the hardest negative (rank 5 from FAISS)
+        for neg_i, neg_text in enumerate(negs):
+            col_name = "negative" if neg_i == 0 else f"negative_{neg_i}"
+            record[col_name] = neg_text
         records.append(record)
 
     dataset = Dataset.from_list(records)

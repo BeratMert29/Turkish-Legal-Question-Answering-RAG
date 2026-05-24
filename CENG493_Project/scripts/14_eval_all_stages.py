@@ -28,6 +28,7 @@ Available stages:
     hybrid       BGE-M3 base    + hybrid BM25    + qwen2.5:7b
     rrf          BGE-M3 base    + RRF            + qwen2.5:7b
     rrf_rerank   BGE-M3 base    + RRF+rerank     + qwen2.5:7b   ← best retrieval
+    graph        BGE-M3 base    + RRF+rerank+graph + qwen2.5:7b  ← requires graph.json
     llm_ft       BGE-M3 base    + dense          + qwen25-legal-ft (fine-tuned)
     emb_ft       BGE-M3 ft*     + RRF+rerank     + qwen2.5:7b   ← requires emb training
     full         BGE-M3 ft*     + RRF+rerank     + qwen25-legal-ft  ← best overall
@@ -70,6 +71,7 @@ from retrieval.bm25_retriever import BM25Index
 from retrieval.embedder import Embedder
 from retrieval.reranker import Reranker
 from retrieval.retriever import Retriever
+from retrieval.graph_index import GraphIndex
 from utils import check_ollama, inject_citations, set_seeds
 
 
@@ -159,6 +161,8 @@ class StageConfig:
     results_dir: Path
     inject_citations: bool = False   # post-hoc citation injection (for ft LLM)
     requires_emb_ft: bool = False    # skip automatically if emb model dir is empty
+    use_graph: bool = False          # apply graph expansion after reranking
+    requires_graph: bool = False     # skip automatically if graph.json is missing
 
 
 STAGE_REGISTRY: dict[str, StageConfig] = {
@@ -198,6 +202,17 @@ STAGE_REGISTRY: dict[str, StageConfig] = {
         inject_citations=True,
         results_dir=config.RESULTS_DIR_RERANK,
     ),
+    "graph": StageConfig(
+        name="Stage 3b — RRF+Rerank+Graph",
+        embedding="base",
+        retrieval="rrf",
+        use_rerank=True,
+        use_graph=True,
+        requires_graph=True,
+        llm="base",
+        inject_citations=True,
+        results_dir=config.BASE_DIR / "results" / "stage_graph",
+    ),
     "llm_ft": StageConfig(
         name="Stage 4 — Fine-tuned LLM",
         embedding="base",
@@ -230,7 +245,7 @@ STAGE_REGISTRY: dict[str, StageConfig] = {
 }
 
 # ordered list for display / default run
-DEFAULT_STAGE_ORDER = ["base", "hybrid", "rrf", "rrf_rerank", "llm_ft", "emb_ft", "full"]
+DEFAULT_STAGE_ORDER = ["base", "hybrid", "rrf", "rrf_rerank", "graph", "llm_ft", "emb_ft", "full"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -243,8 +258,9 @@ def _retrieve(
     stage: StageConfig,
     bm25: Optional[BM25Index],
     reranker: Optional[Reranker],
+    graph_index: Optional[GraphIndex] = None,
 ) -> list[list[dict]]:
-    """Dispatch to the correct retrieval method and optionally rerank."""
+    """Dispatch to the correct retrieval method and optionally rerank + graph expand."""
     initial_k = config.RERANKER_CANDIDATES if stage.use_rerank else config.TOP_K_RETRIEVAL
 
     t0 = time.time()
@@ -257,6 +273,14 @@ def _retrieve(
 
     if stage.use_rerank and reranker is not None:
         chunks = reranker.batch_rerank(questions, chunks, top_k=config.TOP_K_RETRIEVAL)
+
+    if stage.use_graph and graph_index is not None:
+        chunks = graph_index.expand_batch(
+            chunks,
+            hops=config.GRAPH_HOPS,
+            budget=config.GRAPH_NEIGHBOR_BUDGET,
+            kinds=("adj",),  # use only adjacency edges (safest)
+        )
 
     print(f"    Retrieval done in {time.time()-t0:.1f}s")
     return chunks
@@ -337,14 +361,27 @@ def run_stage(
             reranker_cache["reranker"] = r
         reranker = reranker_cache["reranker"]
 
+    # ── Graph index (shared, loaded once) ────────────────────────────────
+    graph_index: Optional[GraphIndex] = None
+    if stage.use_graph:
+        if "graph_index" not in reranker_cache:
+            graph_path = config.INDEX_DIR / config.GRAPH_FILE
+            meta_path = config.INDEX_DIR / config.METADATA_FILE
+            if graph_path.exists() and meta_path.exists():
+                print(f"  Loading graph index: {graph_path}")
+                reranker_cache["graph_index"] = GraphIndex(graph_path, meta_path)
+            else:
+                print(f"  WARNING: graph.json not found at {graph_path}")
+        graph_index = reranker_cache.get("graph_index")
+
     # ── LLM selection ──────────────────────────────────────────────────────
     llm_model = config.LLM_FINETUNED_MODEL if stage.llm == "finetuned" else config.LLM_MODEL
 
     # ── Retrieval metrics ──────────────────────────────────────────────────
-    print(f"  Retrieval ({stage.retrieval}, rerank={stage.use_rerank}) …")
+    print(f"  Retrieval ({stage.retrieval}, rerank={stage.use_rerank}, graph={stage.use_graph}) …")
     questions = [qa.question for qa in qa_examples]
 
-    retrieved_all = _retrieve(retriever, questions, stage, bm25, reranker)
+    retrieved_all = _retrieve(retriever, questions, stage, bm25, reranker, graph_index)
 
     metric_input = []
     full_retrieved: dict[str, list] = {}
@@ -688,6 +725,13 @@ def main() -> None:
             print(f"WARNING: Unknown stage '{key}' — skipping.")
             continue
         stage = STAGE_REGISTRY[key]
+        if stage.requires_graph:
+            graph_path = config.INDEX_DIR / config.GRAPH_FILE
+            if not graph_path.exists():
+                print(f"INFO: Stage '{key}' skipped — "
+                      f"graph.json not found at {graph_path}\n"
+                      f"  Run: python scripts/15_build_graph.py first.")
+                continue
         if stage.requires_emb_ft:
             emb_dir = Path(config.FINETUNED_EMBEDDING_MODEL)
             if not emb_dir.exists() or not any(emb_dir.iterdir()):

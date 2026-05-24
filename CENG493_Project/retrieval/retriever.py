@@ -246,10 +246,10 @@ class Retriever:
             dense_ranking: dict[int, int] = {}
             for rank, idx in enumerate(dense_indices_all[q_idx]):
                 if idx != -1:
-                    dense_ranking[int(idx)] = rank
+                    dense_ranking[int(idx)] = rank + 1  # 1-indexed for RRF
 
             bm25_top = bm25_index.get_top_k(query, k=candidate_pool)
-            bm25_ranking = {idx: rank for rank, (idx, _score) in enumerate(bm25_top)}
+            bm25_ranking = {idx: rank + 1 for rank, (idx, _score) in enumerate(bm25_top)}
 
             candidates = set(dense_ranking) | set(bm25_ranking)
             rrf_scores: dict[int, float] = {}

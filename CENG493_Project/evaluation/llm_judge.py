@@ -28,17 +28,34 @@ logger = logging.getLogger(__name__)
 # Internal helpers
 
 def _parse_score(text: str) -> float:
-    """Extract first float in [0,1] from text. Returns 0.5 on failure."""
+    """Extract a score in [0,1] from text. Handles N/10, N/5, and direct floats. Returns 0.5 on failure."""
     text = text.strip()
-    # Try exact float/int
-    for pattern in [r"^\s*([01](?:\.\d+)?)\s*$", r"([01](?:\.\d+)?)"]:
-        m = re.search(pattern, text)
-        if m:
-            try:
-                val = float(m.group(1))
-                return max(0.0, min(1.0, val))
-            except ValueError:
-                pass
+
+    # 1. Try exact standalone float in [0,1] (e.g. "0.7", "1", "0.85")
+    m = re.match(r'^([01](?:\.\d+)?)\s*$', text)
+    if m:
+        return max(0.0, min(1.0, float(m.group(1))))
+
+    # 2. Try N/10 format (e.g. "7/10", "8.5/10")
+    m = re.search(r'(\d+(?:\.\d+)?)\s*/\s*10', text)
+    if m:
+        return max(0.0, min(1.0, float(m.group(1)) / 10.0))
+
+    # 3. Try N/5 format (e.g. "4/5")
+    m = re.search(r'(\d+(?:\.\d+)?)\s*/\s*5', text)
+    if m:
+        return max(0.0, min(1.0, float(m.group(1)) / 5.0))
+
+    # 4. Try standalone decimal in [0,1] anywhere in text (anchored by word boundary)
+    m = re.search(r'(?<!\d)(?<![/\d])([01]\.\d+)(?!\s*/)', text)
+    if m:
+        return max(0.0, min(1.0, float(m.group(1))))
+
+    # 5. Try standalone "0" or "1" not part of larger number
+    m = re.search(r'(?<!\d)([01])(?!\d|\.?\d)', text)
+    if m:
+        return float(m.group(1))
+
     logger.warning("LLM judge _parse_score: could not parse score from response: %s", text[:100])
     return 0.5
 

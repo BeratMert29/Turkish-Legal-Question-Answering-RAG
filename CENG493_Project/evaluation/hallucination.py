@@ -62,8 +62,9 @@ def evaluate_faithfulness(answer: str, context: str, nli_model) -> dict:
     logit_vec = logits[0]
     probs = scipy_softmax(logit_vec)
     entailment_idx = 1
-    if hasattr(nli_model, 'config') and hasattr(nli_model.config, 'id2label'):
-        id2label = nli_model.config.id2label
+    _model_config = getattr(nli_model, 'config', None) or getattr(getattr(nli_model, 'model', None), 'config', None)
+    if _model_config is not None and hasattr(_model_config, 'id2label'):
+        id2label = _model_config.id2label
         label2id = {v.lower(): k for k, v in id2label.items()}
         entailment_idx = label2id.get('entailment', 1)
     entailment_prob = float(probs[entailment_idx])
@@ -79,8 +80,9 @@ def run_hallucination_analysis(
     import numpy as np
 
     entailment_idx = 1
-    if hasattr(nli_model, 'config') and hasattr(nli_model.config, 'id2label'):
-        id2label = nli_model.config.id2label
+    _model_config = getattr(nli_model, 'config', None) or getattr(getattr(nli_model, 'model', None), 'config', None)
+    if _model_config is not None and hasattr(_model_config, 'id2label'):
+        id2label = _model_config.id2label
         label2id = {v.lower(): k for k, v in id2label.items()}
         entailment_idx = int(label2id.get('entailment', 1))
 

@@ -1,4 +1,5 @@
 """BM25 retrieval for hybrid dense+sparse search."""
+import re
 import numpy as np
 from rank_bm25 import BM25Okapi
 from utils import normalize_turkish
@@ -25,7 +26,10 @@ except LookupError:
 
 
 def tokenize(text: str) -> list[str]:
-    return [_stem(w) for w in normalize_turkish(text).split() if len(w) >= config.BM25_MIN_TOKEN_LENGTH and w not in _STOPWORDS]
+    normalized = normalize_turkish(text)
+    # Strip punctuation so tokens like "madde," match "madde"
+    normalized = re.sub(r'[^\w\s]', ' ', normalized)
+    return [_stem(w) for w in normalized.split() if len(w) >= config.BM25_MIN_TOKEN_LENGTH and w not in _STOPWORDS]
 
 
 class BM25Index:
@@ -42,9 +46,13 @@ class BM25Index:
         """Return min-max normalized BM25 scores for all documents."""
         tokens = tokenize(query)
         scores = self.bm25.get_scores(tokens)
+        min_s = scores.min()
         max_s = scores.max()
-        if max_s > 0:
-            scores = scores / max_s
+        range_s = max_s - min_s
+        if range_s > 0:
+            scores = (scores - min_s) / range_s
+        else:
+            scores = np.zeros_like(scores)
         return scores.astype(np.float32)
 
     def get_top_k(self, query: str, k: int = 100) -> list[tuple[int, float]]:
