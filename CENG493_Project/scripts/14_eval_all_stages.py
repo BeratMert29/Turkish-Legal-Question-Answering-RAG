@@ -707,7 +707,18 @@ def main() -> None:
         help="Path to external rag_eval.json or gold_benchmark.json. "
              "Auto-detects format. Overrides --dataset.",
     )
+    parser.add_argument(
+        "--docs-path",
+        type=str,
+        default=None,
+        dest="docs_path",
+        help="Directory of .txt/.pdf documents to chunk and index. "
+             "Mutually exclusive with --corpus.",
+    )
     args = parser.parse_args()
+
+    if args.corpus and args.docs_path:
+        parser.error("--corpus and --docs-path are mutually exclusive")
 
     if args.list_stages:
         print("\nAvailable stages:")
@@ -767,10 +778,15 @@ def main() -> None:
     # ── Load data (shared) ────────────────────────────────────────────────
     print("Loading data …")
 
-    # External evaluator format (--corpus / --eval-data)
+    # External evaluator format (--corpus / --eval-data / --docs-path)
     if args.corpus:
         print(f"  Corpus source : {args.corpus} (external evaluator format)")
         corpus_chunks = _load_external_corpus(Path(args.corpus))
+    elif args.docs_path:
+        from data.corpus_loader import resolve_corpus
+        corpus_path = resolve_corpus(None, args.docs_path)
+        print(f"  Chunking/loading corpus from {args.docs_path} …")
+        corpus_chunks = _load_external_corpus(Path(corpus_path))
     else:
         processor = DataProcessor(config.RAW_DATA_PATH)
         processor.load_and_validate()

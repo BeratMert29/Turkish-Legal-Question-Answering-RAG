@@ -347,6 +347,14 @@ def main() -> None:
         help="Path to external rag_eval.json or gold_benchmark.json. "
              "Auto-detects format. Mutually exclusive with --hmgs.",
     )
+    parser.add_argument(
+        "--docs-path",
+        type=str,
+        default=None,
+        dest="docs_path",
+        help="Directory of .txt/.pdf documents to chunk and index. "
+             "Mutually exclusive with --corpus.",
+    )
     args = parser.parse_args()
 
     if args.hybrid and args.rrf:
@@ -354,6 +362,9 @@ def main() -> None:
 
     if args.hmgs and args.eval_data:
         parser.error("--hmgs and --eval-data are mutually exclusive")
+
+    if args.corpus and args.docs_path:
+        parser.error("--corpus and --docs-path are mutually exclusive")
 
     if args.graph:
         config.GRAPH_EXPANSION_ENABLED = True
@@ -367,6 +378,12 @@ def main() -> None:
     if args.corpus:
         log.info("Loading external corpus from %s …", args.corpus)
         corpus_chunks: list[CorpusChunk] = _load_external_corpus(args.corpus)
+        log.info("  %d corpus chunks loaded", len(corpus_chunks))
+    elif args.docs_path:
+        from data.corpus_loader import resolve_corpus
+        corpus_path = resolve_corpus(None, args.docs_path)
+        log.info("Loading chunked corpus from %s …", corpus_path)
+        corpus_chunks: list[CorpusChunk] = _load_external_corpus(corpus_path)
         log.info("  %d corpus chunks loaded", len(corpus_chunks))
     else:
         log.info("Loading data from %s …", config.RAW_DATA_PATH)
