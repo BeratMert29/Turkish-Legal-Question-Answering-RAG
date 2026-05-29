@@ -88,9 +88,10 @@ def main() -> None:
     for t in raw:
         record = {
             "anchor": t["query"],
-            "positive": t["pos"][0],
+            "positive": t["positive_passage"],
         }
-        negs = t.get("neg", [])
+        neg = t.get("negative_passage")
+        negs = [neg] if neg else []
         for neg_i, neg_text in enumerate(negs):
             col_name = "negative" if neg_i == 0 else f"negative_{neg_i}"
             record[col_name] = neg_text

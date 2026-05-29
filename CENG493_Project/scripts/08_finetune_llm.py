@@ -81,8 +81,12 @@ def load_jsonl(path: Path) -> list[dict]:
 
 def format_as_chat(example: dict, tokenizer) -> str:
     if "messages" in example:
+        import ast
+        msgs = example["messages"]
+        if isinstance(msgs, str):
+            msgs = ast.literal_eval(msgs)
         return tokenizer.apply_chat_template(
-            example["messages"],
+            msgs,
             tokenize=False,
             add_generation_prompt=False,
         )
