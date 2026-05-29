@@ -98,7 +98,7 @@ def run_hallucination_analysis(
 
     grounding_pairs = [(ctx, pred) for _, pred, ctx, _, _ in ordered_items]
     if grounding_pairs:
-        grounding_logits = nli_model.predict(grounding_pairs, batch_size=32)
+        grounding_logits = nli_model.predict(grounding_pairs, batch_size=8)
         if grounding_logits.ndim == 1:
             grounding_logits = grounding_logits.reshape(1, -1)
     else:
@@ -111,7 +111,7 @@ def run_hallucination_analysis(
         if has
     ]
     if faith_pairs:
-        faith_logits = nli_model.predict(faith_pairs, batch_size=32)
+        faith_logits = nli_model.predict(faith_pairs, batch_size=8)
         if faith_logits.ndim == 1:
             faith_logits = faith_logits.reshape(1, -1)
     else:

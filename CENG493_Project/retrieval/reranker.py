@@ -18,7 +18,11 @@ class Reranker:
         self.model: CrossEncoder | None = None
 
     def load_model(self) -> None:
-        self.model = CrossEncoder(self.model_name, device=self.device)
+        try:
+            self.model = CrossEncoder(self.model_name, device=self.device)
+        except torch.cuda.OutOfMemoryError:
+            self.device = "cpu"
+            self.model = CrossEncoder(self.model_name, device="cpu")
 
     def rerank(self, query: str, chunks: list[dict],
                top_k: int = None) -> list[dict]:

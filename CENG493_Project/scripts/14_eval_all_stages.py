@@ -490,8 +490,25 @@ def run_stage(
 
     # ── Hallucination ──────────────────────────────────────────────────────
     print(f"  Hallucination analysis …")
+    import gc
     import torch
     from sentence_transformers import CrossEncoder
+    # Free CUDA memory held by perplexity HF model and unload Ollama LLM before
+    # loading NLI model — Ollama keeps the generation model in VRAM indefinitely.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:
+        import requests as _req
+        from urllib.parse import urlparse as _urlparse
+        _ollama_base = "{0}://{1}".format(*_urlparse(config.LLM_BASE_URL)[:2])
+        _req.post(
+            _ollama_base + "/api/generate",
+            json={"model": llm_model, "keep_alive": 0},
+            timeout=10,
+        )
+    except Exception:
+        pass
     if torch.cuda.is_available():
         _nli_device = "cuda"
     elif torch.backends.mps.is_available():
@@ -500,7 +517,10 @@ def run_stage(
         _nli_device = "cpu"
     if not hasattr(run_stage, "_nli_model"):
         print("    Loading NLI model …")
-        run_stage._nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small", device=_nli_device)
+        try:
+            run_stage._nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small", device=_nli_device)
+        except torch.cuda.OutOfMemoryError:
+            run_stage._nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small", device="cpu")
     nli_model = run_stage._nli_model  # reuse across stages
 
     sample = stratified_sample(predictions, config.HALLUCINATION_SAMPLE_SIZE)
@@ -845,6 +865,10 @@ def main() -> None:
             print(f"\n  ERROR in stage '{key}': {exc}")
             import traceback
             traceback.print_exc()
+            import gc, torch as _torch
+            gc.collect()
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
             print("  Continuing with next stage …")
 
     # ── Ablation table ─────────────────────────────────────────────────────
