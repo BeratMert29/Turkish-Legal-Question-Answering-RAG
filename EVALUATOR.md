@@ -18,7 +18,41 @@ Ollama: https://ollama.com/download
 
 ---
 
-## Full evaluation
+## Fine-Tuned Models (Optional — required for emb_ft, llm_ft, full stages)
+
+To run all pipeline stages including fine-tuned components, download the pre-trained models:
+
+### 1. Fine-Tuned Embedding Model (BGE-M3 Turkish Legal)
+
+```bash
+pip install huggingface_hub
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('Whis29/bge-m3-turkish-legal', local_dir='models/bge-m3-turkish-legal')
+print('Embedding model ready.')
+"
+```
+
+### 2. Fine-Tuned LLM (qwen25-legal-ft) — register in Ollama
+
+```bash
+# Download GGUF and Modelfile
+python -c "
+from huggingface_hub import hf_hub_download
+hf_hub_download('Whis29/qwen25-legal-ft', 'qwen25-legal-ft.gguf', local_dir='models/')
+hf_hub_download('Whis29/qwen25-legal-ft', 'Modelfile', local_dir='models/')
+print('LLM downloaded.')
+"
+
+# Register in Ollama
+ollama create qwen25-legal-ft -f models/Modelfile
+```
+
+After these steps, **all 6 stages** (including `emb_ft`, `llm_ft`, `full`) will be available.
+
+---
+
+## Full Evaluation (All Stages)
 
 **Required:** use **`--corpus` AND `--eval-data` together.**
 
@@ -30,7 +64,7 @@ cd CENG493_Project
 PYTHONUTF8=1 python scripts/14_eval_all_stages.py \
   --corpus /path/to/corpus.jsonl \
   --eval-data /path/to/gold_benchmark.json \
-  --stages base,rrf_rerank,emb_ft
+  --stages base,rrf_rerank,emb_ft,llm_ft,full
 ```
 
 ### Windows (PowerShell)
@@ -42,12 +76,21 @@ $env:PYTHONUTF8="1"
 python scripts/14_eval_all_stages.py `
   --corpus "C:\path\to\corpus.jsonl" `
   --eval-data "C:\path\to\gold_benchmark.json" `
-  --stages base,rrf_rerank,emb_ft
+  --stages base,rrf_rerank,emb_ft,llm_ft,full
+```
+
+**Without fine-tuned models** (base stages only — always works):
+
+```powershell
+python scripts/14_eval_all_stages.py `
+  --corpus "C:\path\to\corpus.jsonl" `
+  --eval-data "C:\path\to\gold_benchmark.json" `
+  --stages base,rrf_rerank
 ```
 
 ---
 
-## Reference dataset format
+## Reference Dataset Format
 
 See `Datasets_Ceng493_legal_rag/` in this repository:
 
@@ -67,17 +110,17 @@ $DS = "..\Datasets_Ceng493_legal_rag"
 python scripts/14_eval_all_stages.py `
   --corpus "$DS\corpus.jsonl" `
   --eval-data "$DS\gold_benchmark.json" `
-  --stages base,rrf_rerank
+  --stages base,rrf_rerank,emb_ft,llm_ft,full
 ```
 
 ---
 
-## Quick smoke test (5 questions)
+## Quick Smoke Test (5 questions)
 
 ```bash
 cd CENG493_Project
 
-python scripts/14_eval_all_stages.py \
+PYTHONUTF8=1 python scripts/14_eval_all_stages.py \
   --corpus /path/to/corpus.jsonl \
   --eval-data /path/to/gold_benchmark.json \
   --stages base \
@@ -95,7 +138,9 @@ CENG493_Project/results/
 ├── ablation_summary.json
 ├── stage_base/
 ├── stage_reranker/          # rrf_rerank
-└── ...
+├── stage_emb_finetuned/     # emb_ft
+├── stage_llm_finetuned/     # llm_ft
+└── stage_full_optimized/    # full
 ```
 
 Each stage folder contains `baseline_metrics.json` (retrieval, QA, faithfulness, rubric scenario scores).
@@ -107,11 +152,11 @@ Each stage folder contains `baseline_metrics.json` (retrieval, QA, faithfulness,
 1. **`--corpus` and `--eval-data` must be used together.** If only `--eval-data` is given, the system falls back to the default training corpus instead of your documents.
 2. Use **`scripts/14_eval_all_stages.py` only** for custom evaluation. Do **not** use `demo.py`, `scripts/03_evaluate_retrieval.py`, or `scripts/04_generate_answers.py` for instructor-provided data.
 3. Alternative corpus input: **`--docs-path /path/to/folder`** with `.txt` or `.pdf` files (requires `pip install pypdf` for PDF). Mutually exclusive with `--corpus`.
-4. Fine-tuned stages (`emb_ft`, `llm_ft`, `full`) require locally trained models and/or Ollama model `qwen25-legal-ft`; if missing, those stages are skipped automatically. **`base` and `rrf_rerank` always work** with the base embedding model.
+4. Fine-tuned stages (`emb_ft`, `llm_ft`, `full`) require the models downloaded in the **Fine-Tuned Models** section above. If missing, those stages are skipped automatically and a warning is printed.
 
 ---
 
-## Accepted file formats
+## Accepted File Formats
 
 **Corpus (`--corpus`):** JSONL, one chunk per line. Native schema or evaluator schema (`id` + `metadata.chunk_id`).
 
