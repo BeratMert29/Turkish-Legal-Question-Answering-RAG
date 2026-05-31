@@ -56,14 +56,16 @@ After these steps, **all 6 stages** (including `emb_ft`, `llm_ft`, `full`) will 
 
 **Required:** use **`--corpus` AND `--eval-data` together.**
 
+Place the dataset folder (`Datasets_Ceng493_legal_rag`) next to the `CENG493_Project` folder after cloning. A placeholder folder already exists in the repository to indicate the correct location.
+
 ### Linux / macOS
 
 ```bash
 cd CENG493_Project
 
 PYTHONUTF8=1 python scripts/14_eval_all_stages.py \
-  --corpus /path/to/corpus.jsonl \
-  --eval-data /path/to/gold_benchmark.json \
+  --corpus ../Datasets_Ceng493_legal_rag/corpus.jsonl \
+  --eval-data ../Datasets_Ceng493_legal_rag/gold_benchmark.json \
   --stages base,rrf_rerank,emb_ft,llm_ft,full
 ```
 
@@ -74,8 +76,8 @@ cd CENG493_Project
 $env:PYTHONUTF8="1"
 
 python scripts/14_eval_all_stages.py `
-  --corpus "C:\path\to\corpus.jsonl" `
-  --eval-data "C:\path\to\gold_benchmark.json" `
+  --corpus "..\Datasets_Ceng493_legal_rag\corpus.jsonl" `
+  --eval-data "..\Datasets_Ceng493_legal_rag\gold_benchmark.json" `
   --stages base,rrf_rerank,emb_ft,llm_ft,full
 ```
 
@@ -83,8 +85,8 @@ python scripts/14_eval_all_stages.py `
 
 ```powershell
 python scripts/14_eval_all_stages.py `
-  --corpus "C:\path\to\corpus.jsonl" `
-  --eval-data "C:\path\to\gold_benchmark.json" `
+  --corpus "..\Datasets_Ceng493_legal_rag\corpus.jsonl" `
+  --eval-data "..\Datasets_Ceng493_legal_rag\gold_benchmark.json" `
   --stages base,rrf_rerank
 ```
 
@@ -105,11 +107,10 @@ Example with the bundled reference folder (from repo root):
 ```powershell
 cd CENG493_Project
 $env:PYTHONUTF8="1"
-$DS = "..\Datasets_Ceng493_legal_rag"
 
 python scripts/14_eval_all_stages.py `
-  --corpus "$DS\corpus.jsonl" `
-  --eval-data "$DS\gold_benchmark.json" `
+  --corpus "..\Datasets_Ceng493_legal_rag\corpus.jsonl" `
+  --eval-data "..\Datasets_Ceng493_legal_rag\gold_benchmark.json" `
   --stages base,rrf_rerank,emb_ft,llm_ft,full
 ```
 
