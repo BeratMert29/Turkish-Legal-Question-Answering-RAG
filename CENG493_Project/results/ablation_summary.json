@@ -1,11 +1,11 @@
 {
-  "full": {
+  "base": {
     "hyperparameters": {
-      "stage": "full",
-      "stage_name": "Stage 5 — Full Optimized",
-      "embedding_model": "C:\\Users\\USER\\OneDrive\\Desktop\\CENG493_Project\\CENG493_Project\\models\\bge-m3-turkish-legal",
-      "retrieval_mode": "rrf_rerank",
-      "llm_model": "qwen25-legal-ft",
+      "stage": "base",
+      "stage_name": "Stage 1 — Base RAG",
+      "embedding_model": "BAAI/bge-m3",
+      "retrieval_mode": "dense",
+      "llm_model": "qwen2.5:14b",
       "inject_citations": true,
       "chunk_size": 1400,
       "chunk_overlap": 180,
@@ -13,63 +13,82 @@
       "top_k_for_generation": 5
     },
     "retrieval_metrics": {
-      "recall_at_5": 0.015249008436144101,
-      "recall_at_10": 0.025061546050263207,
-      "mrr": 0.8828847481021395,
-      "ndcg_at_10": 0.6729981389753809,
-      "source_hit_at_5": 0.9440993788819876,
-      "source_hit_at_10": 0.9565217391304348,
-      "capped_recall_at_5": 0.7403726708074527,
-      "capped_recall_at_10": 0.6186335403726708,
-      "precision_at_5": 0.7403726708074527,
-      "precision_at_10": 0.6186335403726708,
-      "num_queries": 161
+      "recall_at_5": 0.808,
+      "recall_at_10": 0.844,
+      "mrr": 0.7226222222222223,
+      "ndcg_at_10": 0.7523015377855876,
+      "source_hit_at_5": 0.808,
+      "source_hit_at_10": 0.844,
+      "capped_recall_at_5": 0.808,
+      "capped_recall_at_10": 0.844,
+      "precision_at_5": 0.16159999999999936,
+      "precision_at_10": 0.08439999999999948,
+      "num_queries": 1000,
+      "total_queries": 1000
     },
     "qa_metrics": {
       "em": 0.0,
-      "f1": 0.05086626645837136,
-      "rouge_l": 0.08171677325299091,
-      "bleu": 0.0024270458228610255,
-      "citation_accuracy": 0.8881987577639752,
-      "source_in_context_rate": 0.9503105590062112,
-      "citation_presence_rate": 0.9751552795031055,
-      "num_samples": 161
+      "f1": 0.33619121436450755,
+      "rouge_l": 0.3390805574298985,
+      "bleu": 0.09247047432535681,
+      "citation_accuracy": 0.939,
+      "source_in_context_rate": 0.998,
+      "citation_presence_rate": 0.947,
+      "num_samples": 1000
     },
     "hallucination_summary": {
       "total": 150,
-      "faithful_count": 141,
-      "faithful_rate": 0.94,
+      "context_grounding_count": 137,
+      "context_grounding_rate": 0.9133333333333333,
+      "answer_faithfulness_count": 111,
+      "answer_faithfulness_total": 150,
+      "answer_faithfulness_rate": 0.74,
       "by_category": {
         "hits": {
-          "total": 50,
-          "faithful": 45
+          "total": 67,
+          "context_grounded": 61,
+          "answer_faithful": 44
         },
         "partial": {
-          "total": 50,
-          "faithful": 48
+          "total": 67,
+          "context_grounded": 60,
+          "answer_faithful": 55
         },
         "misses": {
-          "total": 50,
-          "faithful": 48
+          "total": 16,
+          "context_grounded": 16,
+          "answer_faithful": 12
         }
       },
+      "context_grounding_score_stats": {
+        "mean": 0.806843731974562,
+        "min": 0.01652173325419426,
+        "max": 0.9830613732337952,
+        "std": 0.18643560446651122
+      },
+      "answer_faithfulness_score_stats": {
+        "mean": 0.6759099473928412,
+        "min": 0.011270069517195225,
+        "max": 0.9787980914115906,
+        "std": 0.31302276630188997
+      },
       "score_stats": {
-        "mean": 0.8101068584124247,
-        "min": 0.01694798842072487,
-        "max": 0.9700237512588501,
-        "std": 0.1710414574681478
+        "mean": 0.806843731974562,
+        "min": 0.01652173325419426,
+        "max": 0.9830613732337952,
+        "std": 0.18643560446651122
       }
     },
-    "faithfulness_rate": 0.94,
-    "llm_judge_score": 0.11499999999999999,
-    "llm_faithfulness_score": 0.9349999999999999,
-    "llm_relevancy_score": 0.6475,
-    "llm_coherence_score": 0.2975,
-    "semantic_similarity": 0.414289963541564,
-    "scenario1_score": 0.563106,
-    "scenario2_score": 0.159893,
-    "scenario3_score": 0.626667,
-    "perplexity": 9.3937,
+    "faithfulness_rate": 0.74,
+    "llm_judge_score": 0.5,
+    "llm_faithfulness_score": 0.5,
+    "llm_relevancy_score": 0.5,
+    "llm_coherence_score": 0.5,
+    "semantic_similarity": 0.7597352756559849,
+    "scenario1_score": 0.512394,
+    "scenario2_score": 0.463254,
+    "scenario3_score": 0.5,
+    "perplexity": null,
     "ragas_scores": {}
   }
 }
