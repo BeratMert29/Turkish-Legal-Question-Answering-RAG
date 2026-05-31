@@ -12,6 +12,8 @@ if _project_root not in sys.path:
     sys.path.append(_project_root)
 import config
 from data.data_processor import DataProcessor
+from data.qa_loader import resolve_qa_set
+from data.corpus_loader import resolve_corpus, load_corpus_jsonl
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever
 from generation.rag_pipeline import RAGPipeline, ChunkExpander
@@ -59,10 +61,13 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset",
-        choices=["kaggle", "hmgs"],
+        choices=["kaggle", "hmgs", "custom"],
         default="kaggle",
         help="Evaluation dataset to use (default: kaggle)",
     )
+    parser.add_argument("--qa-file", default=None, dest="qa_file", help="Path to custom benchmark JSONL")
+    parser.add_argument("--corpus", default=None, help="Path to custom corpus JSONL for BM25")
+    parser.add_argument("--docs-path", default=None, dest="docs_path", help="Directory of docs for BM25 corpus")
     return parser.parse_args()
 
 def main():
@@ -71,15 +76,8 @@ def main():
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Load eval set
-    if args.dataset == "hmgs":
-        eval_path = config.PROCESSED_DIR / config.HMGS_GOLD_FILE
-        short_answer_mode = True
-        predictions_path = config.RESULTS_DIR / f"qa_predictions_{args.mode}_hmgs.jsonl"
-    else:
-        eval_path = config.PROCESSED_DIR / config.QA_GOLD_FILE
-        short_answer_mode = False
-        predictions_path = config.RESULTS_DIR / f"qa_predictions_{args.mode}.jsonl"
-    eval_set = DataProcessor.load_jsonl(eval_path)
+    eval_set, short_answer_mode, suffix = resolve_qa_set(args.dataset, args.qa_file)
+    predictions_path = config.RESULTS_DIR / f"qa_predictions_{args.mode}{suffix}.jsonl"
     print(f"Loaded {len(eval_set)} QA examples")
 
     # Checkpoint/resume
@@ -104,12 +102,11 @@ def main():
     needs_bm25 = args.mode in ("hybrid", "rrf", "hybrid_rerank", "rrf_rerank")
     if needs_bm25:
         from retrieval.bm25_retriever import BM25Index
-        processor = DataProcessor(config.RAW_DATA_PATH)
-        processor.load_and_validate()
-        corpus_chunks = list(processor.build_corpus_chunks())
+        corpus_path = resolve_corpus(args.corpus, args.docs_path)
+        corpus_chunks = load_corpus_jsonl(corpus_path)  # auto-normalizes evaluator format
         print(f"Building BM25 index over {len(corpus_chunks)} chunks...")
         bm25_index = BM25Index()
-        bm25_index.build([{"text": c.text, "chunk_id": c.chunk_id} for c in corpus_chunks])
+        bm25_index.build([{"text": c["text"], "chunk_id": c["chunk_id"]} for c in corpus_chunks])
 
     # Load reranker if needed
     reranker = None

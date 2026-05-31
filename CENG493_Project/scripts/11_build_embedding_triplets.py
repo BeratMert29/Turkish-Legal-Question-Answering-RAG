@@ -27,6 +27,7 @@ NUM_HARD_NEGATIVES = 7        # target negatives per query
 HARD_NEG_TOP_K = 30           # search pool size for hard negative mining
 MIN_POSITIVE_SCORE = 0.3      # skip query if best chunk similarity is below this
 HARD_NEG_START_RANK = 4       # skip ranks 0-3 (too close to positive) — 0-indexed
+MIN_GT_OVERLAP = 0.3          # minimum Jaccard overlap to accept a ground-truth positive
 RANDOM_SEED = 42
 
 QA_PATH = config.PROCESSED_DIR / "qa_train.jsonl"
@@ -37,6 +38,29 @@ OUTPUT_PATH = config.PROCESSED_DIR / "embedding_triplets.jsonl"
 def load_jsonl(path: Path) -> list[dict]:
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
+
+
+def _jaccard_tokens(a: str, b: str) -> float:
+    """Token-level Jaccard similarity between two strings."""
+    tokens_a = set(a.lower().split())
+    tokens_b = set(b.lower().split())
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = tokens_a & tokens_b
+    union = tokens_a | tokens_b
+    return len(intersection) / len(union)
+
+
+def _find_gt_positive(context: str, chunk_texts: list[str]) -> tuple[int | None, float]:
+    """Find corpus chunk with highest Jaccard overlap to ground-truth context."""
+    best_idx = None
+    best_score = 0.0
+    for idx, text in enumerate(chunk_texts):
+        score = _jaccard_tokens(context, text)
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    return best_idx, best_score
 
 
 def main() -> None:
@@ -84,15 +108,25 @@ def main() -> None:
     skipped_low_score = 0
 
     for i, qa in enumerate(qa_pairs):
-        pos_idx = int(indices_all[i][0])
-        pos_score = float(scores_all[i][0])
+        # Try ground-truth context first (avoids self-distillation errors)
+        gt_context = qa.get("context", "")
+        pos_idx = None
+        pos_text = None
+        if gt_context:
+            gt_idx, gt_overlap = _find_gt_positive(gt_context, chunk_texts)
+            if gt_idx is not None and gt_overlap >= MIN_GT_OVERLAP:
+                pos_idx = gt_idx
+                pos_text = chunk_texts[pos_idx]
 
-        # Skip if the retrieved positive is not convincingly relevant
-        if pos_score < MIN_POSITIVE_SCORE:
-            skipped_low_score += 1
-            continue
+        # Fall back to top-1 FAISS result
+        if pos_idx is None:
+            pos_idx = int(indices_all[i][0])
+            pos_score = float(scores_all[i][0])
+            if pos_score < MIN_POSITIVE_SCORE:
+                skipped_low_score += 1
+                continue
+            pos_text = chunk_texts[pos_idx]
 
-        pos_text = chunk_texts[pos_idx]
         pos_source = corpus[pos_idx].get("source", "")
 
         # Hard negatives: ranks HARD_NEG_START_RANK to HARD_NEG_TOP_K-1
@@ -114,11 +148,16 @@ def main() -> None:
                 break
 
         # Pad with random negatives if the hard negative pool was exhausted
+        # Dedup: don't repeat any already-selected negative or the positive
+        selected_texts = set(hard_negs)
+        selected_texts.add(pos_text)
         pad_attempts = 0
         while len(hard_negs) < NUM_HARD_NEGATIVES and pad_attempts < 1000:
             rand_idx = random.choice(all_indices)
-            if rand_idx != pos_idx:
-                hard_negs.append(chunk_texts[rand_idx])
+            rand_text = chunk_texts[rand_idx]
+            if rand_idx != pos_idx and rand_text not in selected_texts:
+                hard_negs.append(rand_text)
+                selected_texts.add(rand_text)
             pad_attempts += 1
 
         triplets.append({

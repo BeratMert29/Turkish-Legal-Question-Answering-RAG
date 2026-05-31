@@ -9,18 +9,25 @@ from pathlib import Path
 _project_root = str(Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.append(_project_root)
+import argparse
 import config
 from data.data_processor import DataProcessor
+from data.corpus_loader import resolve_corpus, load_corpus_jsonl
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever
 
 def main():
+    parser = argparse.ArgumentParser(description="Build FAISS index from corpus chunks")
+    parser.add_argument("--corpus", default=None, help="Path to pre-chunked corpus JSONL")
+    parser.add_argument("--docs-path", default=None, dest="docs_path", help="Directory of .txt/.pdf docs to chunk and index")
+    args = parser.parse_args()
+
     config.INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
     # Load corpus chunks
-    corpus_path = config.PROCESSED_DIR / "corpus_chunks.jsonl"
+    corpus_path = resolve_corpus(args.corpus, args.docs_path)
     print(f"Loading corpus from {corpus_path}")
-    chunks = DataProcessor.load_jsonl(corpus_path)
+    chunks = load_corpus_jsonl(corpus_path)  # auto-normalizes evaluator format
     texts = [c['text'] for c in chunks]
     metadata = [{'chunk_id': c['chunk_id'], 'doc_id': c['doc_id'], 'source': c['source'], 'text': c['text']} for c in chunks]
     print(f"  Loaded {len(chunks)} chunks")

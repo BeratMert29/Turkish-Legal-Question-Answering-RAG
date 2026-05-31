@@ -6,6 +6,10 @@ BASE_DIR = Path(__file__).parent
 CHUNK_SIZE = 1400
 CHUNK_OVERLAP = 180
 CORPUS_DOC_MIN_CHARS = 180
+# Minimum chunk character length; shared by _char_chunk and _article_chunk
+MIN_CHUNK_CHARS = 180
+ARTICLE_CHUNKING_ENABLED = True  # True → split at MADDE boundaries first
+ARTICLE_REGEX = r'(?=(?:MADDE|Madde)\s+\d+)'
 
 # Data
 QA_EVAL_EXPECTED = 300
@@ -41,17 +45,16 @@ HMGS_SOURCE_MAP = {
     "6102 sayılı Türk Ticaret Kanunu":       "Türk Ticaret Kanunu",
     "2577 sayılı İdari Yargılama Usulü Kanunu": "İdari Yargılama Usulü Kanunu",
     "2004 sayılı İcra ve İflas Kanunu":      "İcra ve İflas Kanunu",
-    "213 sayılı Vergi Usul Kanunu":          "Vergi Usul Kanunu",
     "657 sayılı Devlet Memurları Kanunu":    "Devlet Memurları Kanunu",
 }
-HMGS_EVAL_EXPECTED = 161  # 240 raw - 49 no corpus - 5 VUK (misattributed) - 25 MC-ref
+HMGS_EVAL_EXPECTED = 161  # 240 raw - 49 no corpus - 5 VUK (misattributed) - 25 MC-ref; enforced as soft assertion in build_gold_eval_set
 
 # Embedding
 EMBEDDING_MODEL = "BAAI/bge-m3"
 FINETUNED_EMBEDDING_MODEL = str(BASE_DIR / "models" / "bge-m3-turkish-legal")
 HF_PERPLEXITY_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 EMBEDDING_DIM = 1024
-EMBEDDING_BATCH_SIZE = 32
+EMBEDDING_BATCH_SIZE = 8  # lower = less VRAM; increase to 32 if you have 12GB+ VRAM
 
 # Retrieval
 TOP_K_RETRIEVAL = 10
@@ -60,8 +63,15 @@ CONTEXT_WINDOW_CHARS = 14000
 
 # Re-ranker (Stage 2 retrieval)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
-RERANKER_CANDIDATES = 10   # initial dense/RRF pool before cross-encoder re-ranking
+RERANKER_CANDIDATES = 50   # fetch more candidates than TOP_K so reranker has a real pool to reorder
 RRF_K = 60                 # RRF smoothing constant
+
+GRAPH_FILE = "graph.json"
+GRAPH_EXPANSION_ENABLED = False
+GRAPH_HOPS = 1
+GRAPH_NEIGHBOR_BUDGET = 3
+GRAPH_EDGE_KINDS = ("adj", "intra", "cross")
+GRAPH_DECAY = {"adj": 0.85, "intra": 0.70, "cross": 0.60}
 
 # LLM (Ollama — free, no API key)
 LLM_MODEL = "qwen2.5:14b"
@@ -71,6 +81,9 @@ LLM_API_KEY = "ollama"
 LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 512
 LLM_FINETUNED_MAX_TOKENS = 256  # shorter cap for fine-tuned model to reduce runaway generation
+LLM_JUDGE_MODEL = "llama3.3:70b"   # separate judge model to avoid self-evaluation bias
+
+KAGGLE_MIN_SCORE = 6
 
 # Evaluation
 HALLUCINATION_SAMPLE_SIZE = 150
@@ -84,3 +97,11 @@ BM25_MIN_TOKEN_LENGTH = 2
 
 # Oracle relevance (scripts/03_evaluate_retrieval.py)
 TOP_K_ORACLE = 5
+
+# Maximum number of chunks assigned as relevant by strategy-3 (source-level fallback).
+# Caps the per-query relevant set so MRR/Recall/NDCG remain meaningful for HMGS queries.
+MAX_STRATEGY3_RELEVANT = 20
+
+# Custom corpus / benchmark support
+CUSTOM_CORPUS_FILE = "corpus_chunks_custom.jsonl"
+SUPPORTED_DOC_EXTENSIONS = (".txt", ".pdf")

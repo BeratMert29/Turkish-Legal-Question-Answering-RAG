@@ -150,19 +150,19 @@ Citation   {ascii_bar(qa.get("citation_accuracy"))}
 
 | Metric | Value |
 | --- | ---: |
-| Faithful answers | {hall.get("faithful_count", "N/A")} / {hall.get("total", "N/A")} |
-| Faithfulness rate | {pct(hall.get("faithful_rate"))} |
+| Context-grounded answers | {hall.get("context_grounding_count", "N/A")} / {hall.get("total", "N/A")} |
+| Context-grounding rate | {pct(hall.get("context_grounding_rate"))} |
 
 ### By Retrieval Category
 
-| Category | Faithful | Total | Rate |
+| Category | Context-Grounded | Total | Rate |
 | --- | ---: | ---: | ---: |
-| Hits | {hits.get("faithful", "N/A")} | {hits.get("total", "N/A")} | {pct((hits.get("faithful", 0) / hits.get("total", 1)) if hits.get("total") else None)} |
-| Partial | {partial.get("faithful", "N/A")} | {partial.get("total", "N/A")} | {pct((partial.get("faithful", 0) / partial.get("total", 1)) if partial.get("total") else None)} |
-| Misses | {misses.get("faithful", "N/A")} | {misses.get("total", "N/A")} | {pct((misses.get("faithful", 0) / misses.get("total", 1)) if misses.get("total") else None)} |
+| Hits | {hits.get("context_grounded", "N/A")} | {hits.get("total", "N/A")} | {pct((hits.get("context_grounded", 0) / hits.get("total", 1)) if hits.get("total") else None)} |
+| Partial | {partial.get("context_grounded", "N/A")} | {partial.get("total", "N/A")} | {pct((partial.get("context_grounded", 0) / partial.get("total", 1)) if partial.get("total") else None)} |
+| Misses | {misses.get("context_grounded", "N/A")} | {misses.get("total", "N/A")} | {pct((misses.get("context_grounded", 0) / misses.get("total", 1)) if misses.get("total") else None)} |
 
 ```text
-Faithfulness  {ascii_bar(hall.get("faithful_rate"))}
+Context-grounding  {ascii_bar(hall.get("context_grounding_rate"))}
 ```
 
 ## Hardware Snapshot
@@ -175,7 +175,7 @@ Faithfulness  {ascii_bar(hall.get("faithful_rate"))}
 
 - This file summarizes the saved Step 1 baseline artifact already present in the repo.
 - Retrieval quality is mixed: `MRR` and `nDCG@10` are strong, while `Recall@5/10` is low under the project's strict chunk-level relevance definition.
-- Answer quality is still limited (`EM` and `F1` are low), but citation accuracy ({pct(qa.get("citation_accuracy"))}) and faithfulness ({pct(hall.get("faithful_rate"))}) are strong enough to report that grounding behavior is working.
+- Answer quality is still limited (`EM` and `F1` are low), but citation accuracy ({pct(qa.get("citation_accuracy"))}) and context-grounding rate ({pct(hall.get("context_grounding_rate"))}) are strong enough to report that grounding behavior is working.
 - For future runs, log `nvidia-smi` samples during evaluation if you need report-grade GPU utilization curves.
 """
 

@@ -1,6 +1,7 @@
 from collections import Counter
 import math
 import re
+import warnings
 import evaluate as hf_evaluate
 from utils import normalize_turkish
 
@@ -10,6 +11,12 @@ try:
     _USE_HF_EVALUATE = True
 except Exception:
     _USE_HF_EVALUATE = False
+    warnings.warn(
+        "hf_evaluate not available; using fallback BLEU/ROUGE implementation. "
+        "Scores may differ from standard implementations.",
+        ImportWarning,
+        stacklevel=2,
+    )
 
 _CITATION_PATTERN = re.compile(r"\[\s*kaynak\s+(\d+)\s*\]", re.IGNORECASE)
 _STRIP_CITATION_PATTERN = re.compile(r"\[\s*kaynak\s+\d+\s*\]", re.IGNORECASE)
@@ -45,8 +52,9 @@ def _sentence_bleu_fallback(predicted: str, expected: str, max_order: int = 4) -
             log_precisions.append(math.log(1e-9))
             continue
         overlap = sum(min(count, ref_counts[gram]) for gram, count in pred_counts.items())
-        precision = (overlap + 1.0) / (total + 1.0)
-        log_precisions.append(math.log(precision))
+        # Standard clipped precision — no add-one smoothing (incompatible with BLEU)
+        precision = overlap / total if total > 0 else 0.0
+        log_precisions.append(math.log(precision) if precision > 0 else math.log(1e-9))
 
     pred_len = len(pred_tokens)
     ref_len = len(ref_tokens)
@@ -71,8 +79,9 @@ def _corpus_bleu_fallback(predictions: list[dict], max_order: int = 4) -> float:
             ref_counts = _ngram_counts(ref_tokens, n)
             overlap += sum(min(count, ref_counts[gram]) for gram, count in pred_counts.items())
             total += sum(pred_counts.values())
-        precision = (overlap + 1.0) / (total + 1.0) if total else 1e-9
-        log_precisions.append(math.log(precision))
+        # Standard clipped precision — no add-one smoothing (incompatible with BLEU)
+        precision = overlap / total if total > 0 else 0.0
+        log_precisions.append(math.log(precision) if precision > 0 else math.log(1e-9))
 
     pred_len = sum(len(tokens) for tokens in pred_tokens_all)
     ref_len = sum(len(tokens) for tokens in ref_tokens_all)
@@ -200,12 +209,13 @@ def compute_all_qa_metrics(predictions: list[dict]) -> dict:
     result = {k: sum(m[k] for m in metrics) / len(metrics) for k in keys}
     # Corpus-level BLEU via evaluate
     if _USE_HF_EVALUATE:
-        preds_norm = [normalize_turkish(p["predicted"]) for p in predictions]
+        preds_norm = [normalize_turkish(strip_citations(p["predicted"])) for p in predictions]
         refs_norm = [[normalize_turkish(p["expected"])] for p in predictions]
         bleu_result = _BLEU_METRIC.compute(predictions=preds_norm, references=refs_norm)
         result["bleu"] = float(bleu_result["bleu"])
     else:
-        result["bleu"] = _corpus_bleu_fallback(predictions)
+        stripped = [{**p, "predicted": strip_citations(p["predicted"])} for p in predictions]
+        result["bleu"] = _corpus_bleu_fallback(stripped)
     result["num_samples"] = len(predictions)
     return result
 

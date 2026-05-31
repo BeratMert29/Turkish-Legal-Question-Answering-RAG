@@ -1,25 +1,14 @@
 import random
-import torch
 import config
 from scipy.special import softmax as scipy_softmax
 
-if torch.cuda.is_available():
-    _DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    _DEVICE = "mps"
-else:
-    _DEVICE = "cpu"
-
 
 def _classify_result(result: dict) -> str:
-    """
-    Classify a result as hit/partial/miss based on top-1 retrieved chunk score.
-    Uses result["retrieved_chunks"] — a list of RetrievedChunk dicts.
-    """
+    """Hit/partial/miss from top-1 retrieval score."""
     chunks = result.get("retrieved_chunks", [])
     if not chunks:
         return "miss"
-    top_score = chunks[0]["score"]  # dict access, not attribute
+    top_score = chunks[0]["score"]
     if top_score > config.HALLUCINATION_HIT_THRESHOLD:
         return "hit"
     elif top_score >= config.HALLUCINATION_PARTIAL_THRESHOLD:
@@ -29,48 +18,33 @@ def _classify_result(result: dict) -> str:
 
 
 def stratified_sample(results: list[dict], sample_size: int = config.HALLUCINATION_SAMPLE_SIZE) -> dict:
-    """
-    Stratify results into hits/partial/misses using percentile-based thresholds
-    (scale-invariant across RRF, reranker, and dense scores) and sample up to
-    sample_size//3 from each. Compensates if a category is smaller than target.
-    Returns: {"hits": [...], "partial": [...], "misses": [...]}
-    """
-    random.seed(42)
+    """Sample ~third from each retrieval-score bucket (hit/partial/miss); fills to sample_size."""
+    # Use a local RNG instance to avoid mutating the global random state across runs.
+    rng = random.Random(42)
 
-    scores = []
-    for r in results:
-        chunks = r.get("retrieved_chunks", [])
-        scores.append(chunks[0]["score"] if chunks else float("-inf"))
-
-    sorted_scores = sorted(scores)
-    n = len(sorted_scores)
-    if n >= 3:
-        low_threshold = sorted_scores[n // 3]
-        high_threshold = sorted_scores[2 * n // 3]
-    else:
-        low_threshold = high_threshold = 0.0
+    hit_threshold = config.HALLUCINATION_HIT_THRESHOLD      # 0.7
+    partial_threshold = config.HALLUCINATION_PARTIAL_THRESHOLD  # 0.4
 
     hits, partial, misses = [], [], []
-    for r, score in zip(results, scores):
-        if score >= high_threshold:
+    for r in results:
+        category = _classify_result(r)
+        if category == "hit":
             hits.append(r)
-        elif score >= low_threshold:
+        elif category == "partial":
             partial.append(r)
         else:
             misses.append(r)
 
     target = sample_size // 3
-    h = random.sample(hits, min(target, len(hits)))
-    p = random.sample(partial, min(target, len(partial)))
-    m = random.sample(misses, min(target, len(misses)))
+    h = rng.sample(hits, min(target, len(hits)))
+    p = rng.sample(partial, min(target, len(partial)))
+    m = rng.sample(misses, min(target, len(misses)))
 
-    # Compensate: if a category is short, pull from others
     total = len(h) + len(p) + len(m)
     if total < sample_size:
         sampled_ids = {r.get("query_id") for r in h + p + m if r.get("query_id") is not None}
         pool = [x for x in hits + partial + misses if x.get("query_id") not in sampled_ids]
-        extra = random.sample(pool, min(sample_size - total, len(pool)))
-        # distribute extra evenly across h, p, m
+        extra = rng.sample(pool, min(sample_size - total, len(pool)))
         for i, item in enumerate(extra):
             if i % 3 == 0:
                 h.append(item)
@@ -83,18 +57,14 @@ def stratified_sample(results: list[dict], sample_size: int = config.HALLUCINATI
 
 
 def evaluate_faithfulness(answer: str, context: str, nli_model) -> dict:
-    """
-    Evaluate faithfulness using NLI CrossEncoder.
-    cross-encoder/nli-deberta-v3-small returns logits shape (n_pairs, 3)
-    Label order: [contradiction, entailment, neutral] — index 1 is entailment.
-    """
-    logits = nli_model.predict([(context, answer)])  # shape (1, 3)
-    logit_vec = logits[0]  # shape (3,)
+    """NLI entailment prob (context → answer)."""
+    logits = nli_model.predict([(context, answer)])
+    logit_vec = logits[0]
     probs = scipy_softmax(logit_vec)
-    # Determine entailment index dynamically if model config is available
-    entailment_idx = 1  # default for cross-encoder/nli-deberta-v3-small: [contradiction, entailment, neutral]
-    if hasattr(nli_model, 'config') and hasattr(nli_model.config, 'id2label'):
-        id2label = nli_model.config.id2label
+    entailment_idx = 1
+    _model_config = getattr(nli_model, 'config', None) or getattr(getattr(nli_model, 'model', None), 'config', None)
+    if _model_config is not None and hasattr(_model_config, 'id2label'):
+        id2label = _model_config.id2label
         label2id = {v.lower(): k for k, v in id2label.items()}
         entailment_idx = label2id.get('entailment', 1)
     entailment_prob = float(probs[entailment_idx])
@@ -106,83 +76,125 @@ def run_hallucination_analysis(
     retrieved_results: dict,
     nli_model,
 ) -> dict:
-    """
-    Run faithfulness analysis on stratified sample using batched NLI inference.
-
-    Args:
-        sample_dict: {"hits": [...], "partial": [...], "misses": [...]} from stratified_sample()
-        retrieved_results: {query_id: [RetrievedChunk, ...]} — full chunk list per query
-        nli_model: pre-loaded CrossEncoder instance
-
-    Returns: {"summary": {...}, "per_sample": [...]}
-    """
+    """Batch NLI: context grounding + gold-answer consistency (entailment probs)."""
     import numpy as np
 
-    # Determine entailment index from model config
-    entailment_idx = 1  # default: [contradiction, entailment, neutral]
-    if hasattr(nli_model, 'config') and hasattr(nli_model.config, 'id2label'):
-        id2label = nli_model.config.id2label
+    entailment_idx = 1
+    _model_config = getattr(nli_model, 'config', None) or getattr(getattr(nli_model, 'model', None), 'config', None)
+    if _model_config is not None and hasattr(_model_config, 'id2label'):
+        id2label = _model_config.id2label
         label2id = {v.lower(): k for k, v in id2label.items()}
         entailment_idx = int(label2id.get('entailment', 1))
 
-    # Collect all samples with their metadata
-    ordered_items = []  # (query_id, answer, context, category)
+    ordered_items = []
     for category, items in sample_dict.items():
         for item in items:
             query_id = item.get("query_id", "")
-            answer = item.get("predicted", "")
+            predicted = item.get("predicted", "")
+            gold_answer = item.get("expected", "")
             chunks = retrieved_results.get(query_id, [])
             context = "\n\n".join(c["text"] for c in chunks[:5]) if chunks else ""
-            ordered_items.append((query_id, answer, context, category))
+            ordered_items.append((query_id, predicted, context, gold_answer, category))
 
-    # Batch NLI inference
-    pairs = [(ctx, ans) for _, ans, ctx, _ in ordered_items]
-    if pairs:
-        all_logits = nli_model.predict(pairs, batch_size=32)  # shape (N, 3)
-        if all_logits.ndim == 1:
-            all_logits = all_logits.reshape(1, -1)
+    grounding_pairs = [(ctx, pred) for _, pred, ctx, _, _ in ordered_items]
+    if grounding_pairs:
+        grounding_logits = nli_model.predict(grounding_pairs, batch_size=8)
+        if grounding_logits.ndim == 1:
+            grounding_logits = grounding_logits.reshape(1, -1)
     else:
-        all_logits = np.zeros((0, 3), dtype=np.float32)
+        grounding_logits = np.zeros((0, 3), dtype=np.float32)
+
+    has_gold = [bool(gold) for _, _, _, gold, _ in ordered_items]
+    faith_pairs = [
+        (gold, pred)
+        for (_, pred, _, gold, _), has in zip(ordered_items, has_gold)
+        if has
+    ]
+    if faith_pairs:
+        faith_logits = nli_model.predict(faith_pairs, batch_size=8)
+        if faith_logits.ndim == 1:
+            faith_logits = faith_logits.reshape(1, -1)
+    else:
+        faith_logits = np.zeros((0, 3), dtype=np.float32)
 
     softmax = scipy_softmax
 
     per_sample = []
-    faithful_count = 0
-    by_category = {"hits": {"total": 0, "faithful": 0},
-                   "partial": {"total": 0, "faithful": 0},
-                   "misses": {"total": 0, "faithful": 0}}
+    grounding_count = 0
+    faith_count = 0
+    faith_total = 0
+    by_category = {
+        "hits":    {"total": 0, "context_grounded": 0, "answer_faithful": 0},
+        "partial": {"total": 0, "context_grounded": 0, "answer_faithful": 0},
+        "misses":  {"total": 0, "context_grounded": 0, "answer_faithful": 0},
+    }
 
-    for i, (query_id, answer, context, category) in enumerate(ordered_items):
-        probs = softmax(all_logits[i])
-        entailment_prob = float(probs[entailment_idx])
-        is_faithful = entailment_prob >= 0.5
-        if is_faithful:
-            faithful_count += 1
-            by_category[category]["faithful"] += 1
+    faith_idx = 0
+    for i, (query_id, predicted, context, gold_answer, category) in enumerate(ordered_items):
+        grounding_probs = softmax(grounding_logits[i])
+        grounding_prob = float(grounding_probs[entailment_idx])
+        is_grounded = grounding_prob >= 0.5
+
+        answer_faith_prob = None
+        is_answer_faithful = None
+        if has_gold[i]:
+            faith_probs = softmax(faith_logits[faith_idx])
+            answer_faith_prob = float(faith_probs[entailment_idx])
+            is_answer_faithful = answer_faith_prob >= 0.5
+            faith_idx += 1
+
+        if is_grounded:
+            grounding_count += 1
+            by_category[category]["context_grounded"] += 1
+        if is_answer_faithful:
+            faith_count += 1
+            faith_total += 1
+            by_category[category]["answer_faithful"] += 1
+        elif is_answer_faithful is False:
+            faith_total += 1
+
         by_category[category]["total"] += 1
         per_sample.append({
             "query_id": query_id,
             "category": category,
-            "answer": answer,
-            "faithful": is_faithful,
-            "score": entailment_prob,
+            "predicted": predicted,
+            "context_grounding_score": grounding_prob,
+            "context_grounded": is_grounded,
+            "answer_faithfulness_score": answer_faith_prob,
+            "answer_faithful": is_answer_faithful,
         })
 
     total = sum(c["total"] for c in by_category.values())
-    scores = [s["score"] for s in per_sample]
-    score_stats = {
-        "mean": float(np.mean(scores)) if scores else 0.0,
-        "min": float(np.min(scores)) if scores else 0.0,
-        "max": float(np.max(scores)) if scores else 0.0,
-        "std": float(np.std(scores)) if scores else 0.0,
-    }
+    grounding_scores = [s["context_grounding_score"] for s in per_sample]
+    faith_scores = [s["answer_faithfulness_score"] for s in per_sample if s["answer_faithfulness_score"] is not None]
+
+    def _stats(vals):
+        if not vals:
+            return {"mean": 0.0, "min": 0.0, "max": 0.0, "std": 0.0}
+        return {
+            "mean": float(np.mean(vals)),
+            "min":  float(np.min(vals)),
+            "max":  float(np.max(vals)),
+            "std":  float(np.std(vals)),
+        }
+
+    context_grounding_rate = grounding_count / total if total > 0 else 0.0
+    answer_faithfulness_rate = faith_count / faith_total if faith_total > 0 else None
+
     return {
         "summary": {
             "total": total,
-            "faithful_count": faithful_count,
-            "faithful_rate": faithful_count / total if total > 0 else 0.0,
+            "context_grounding_count": grounding_count,
+            "context_grounding_rate": context_grounding_rate,
+            "answer_faithfulness_count": faith_count,
+            "answer_faithfulness_total": faith_total,
+            "answer_faithfulness_rate": answer_faithfulness_rate,
+            "context_grounding_count": grounding_count,
+            "context_grounding_rate":  context_grounding_rate,
             "by_category": by_category,
-            "score_stats": score_stats,
+            "context_grounding_score_stats":  _stats(grounding_scores),
+            "answer_faithfulness_score_stats": _stats(faith_scores),
+            "score_stats": _stats(grounding_scores),
         },
         "per_sample": per_sample,
     }

@@ -35,6 +35,83 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# External data loaders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_external_corpus(path: Path) -> list[CorpusChunk]:
+    """Load corpus from evaluator-format corpus.jsonl -> list[CorpusChunk]."""
+    from data.corpus_loader import load_corpus_jsonl
+    raw_chunks = load_corpus_jsonl(path)
+    return [
+        CorpusChunk(**{k: r[k] for k in ("chunk_id", "doc_id", "text", "source", "char_len")})
+        for r in raw_chunks
+    ]
+
+
+def _load_external_qa(path: Path) -> tuple[list[QAExample], bool]:
+    """Load QA examples from rag_eval.json or gold_benchmark.json.
+
+    Auto-detects format from first item keys.
+    Attaches gold_source_ids as a dynamic attribute so build_relevant_chunk_map
+    can use exact chunk ID matching when available.
+
+    Returns:
+        A tuple of (qa_examples, short_answer_mode).
+    """
+    import json as _json
+    with open(path, encoding="utf-8") as f:
+        data = _json.load(f)
+
+    if not data:
+        raise ValueError(f"Empty QA file: {path}")
+
+    if isinstance(data, dict):
+        data = list(data.values())
+
+    first = data[0]
+    examples = []
+
+    if "query_id" in first and "query" in first:
+        # rag_eval.json format — open-ended answers, no short-answer mode
+        short_answer_mode = False
+        for item in data:
+            qa = QAExample(
+                query_id=item["query_id"],
+                question=item["query"],
+                answer=item.get("gold_answer_extract", ""),
+                context="",
+                source=item.get("source", ""),
+                data_type="external",
+            )
+            qa.gold_source_ids = item.get("gold_chunk_ids", [])
+            examples.append(qa)
+
+    elif "question_id" in first and "question" in first:
+        # gold_benchmark.json format — exam-style, short answers
+        short_answer_mode = True
+        for item in data:
+            gold_sources = item.get("gold_sources", [])
+            qa = QAExample(
+                query_id=item["question_id"],
+                question=item["question"],
+                answer=item.get("verified_answer", ""),
+                context="",
+                source=gold_sources[0].get("source", "") if gold_sources else "",
+                data_type="external",
+            )
+            qa.gold_source_ids = [s["source_id"] for s in gold_sources]
+            examples.append(qa)
+
+    else:
+        raise ValueError(
+            f"Unrecognised QA file format in {path}. "
+            "Expected rag_eval.json (query_id+query) or gold_benchmark.json (question_id+question)."
+        )
+
+    return examples, short_answer_mode
+
+
 def build_index(processor: DataProcessor, embedder: Embedder, chunks: list[CorpusChunk] = None) -> tuple[Retriever, float]:
     if chunks is None:
         log.info("Building corpus chunks …")
@@ -203,7 +280,7 @@ def run_hallucination_eval(predictions: list[dict]) -> dict:
         nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small", device=_nli_device)
     except Exception as exc:
         log.warning("NLI model unavailable (%s); skipping hallucination analysis", exc)
-        return {"summary": {"faithful_rate": None, "skipped": True}, "per_sample": []}
+        return {"summary": {"context_grounding_rate": None, "skipped": True}, "per_sample": []}
 
     retrieval_results_dict = {
         p["query_id"]: p.get("retrieved_chunks", [])
@@ -245,6 +322,8 @@ def main() -> None:
                         help="Apply cross-encoder reranker after dense retrieval")
     parser.add_argument("--rrf", action="store_true",
                         help="Use RRF (Reciprocal Rank Fusion) of BM25+dense instead of linear blend")
+    parser.add_argument("--graph", action="store_true",
+                        help="Enable graph neighbor expansion after retrieval")
     parser.add_argument("--results-dir", type=Path, default=config.RESULTS_DIR,
                         help="Directory to write baseline_metrics.json")
     parser.add_argument(
@@ -252,29 +331,89 @@ def main() -> None:
         action="store_true",
         help="Use HMGS exam questions instead of Kaggle eval set",
     )
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to external corpus.jsonl (evaluator format). "
+             "When combined with --eval-data, DataProcessor is bypassed entirely.",
+    )
+    parser.add_argument(
+        "--eval-data",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to external rag_eval.json or gold_benchmark.json. "
+             "Auto-detects format. Mutually exclusive with --hmgs.",
+    )
+    parser.add_argument(
+        "--docs-path",
+        type=str,
+        default=None,
+        dest="docs_path",
+        help="Directory of .txt/.pdf documents to chunk and index. "
+             "Mutually exclusive with --corpus.",
+    )
     args = parser.parse_args()
 
     if args.hybrid and args.rrf:
         parser.error("--hybrid and --rrf are mutually exclusive (both are BM25+dense fusion strategies)")
 
+    if args.hmgs and args.eval_data:
+        parser.error("--hmgs and --eval-data are mutually exclusive")
+
+    if args.corpus and args.docs_path:
+        parser.error("--corpus and --docs-path are mutually exclusive")
+
+    if args.graph:
+        config.GRAPH_EXPANSION_ENABLED = True
+
     set_seeds(42)
 
-    log.info("Loading data from %s …", config.RAW_DATA_PATH)
-    processor = DataProcessor(config.RAW_DATA_PATH)
-    summary = processor.load_and_validate()
-    log.info("Dataset summary: %s", summary)
+    # ── Load corpus and QA data ───────────────────────────────────────────
+    short_answer_mode: bool = False
+    processor: DataProcessor | None = None
+
+    if args.corpus:
+        log.info("Loading external corpus from %s …", args.corpus)
+        corpus_chunks: list[CorpusChunk] = _load_external_corpus(args.corpus)
+        log.info("  %d corpus chunks loaded", len(corpus_chunks))
+    elif args.docs_path:
+        from data.corpus_loader import resolve_corpus
+        corpus_path = resolve_corpus(None, args.docs_path)
+        log.info("Loading chunked corpus from %s …", corpus_path)
+        corpus_chunks: list[CorpusChunk] = _load_external_corpus(corpus_path)
+        log.info("  %d corpus chunks loaded", len(corpus_chunks))
+    else:
+        log.info("Loading data from %s …", config.RAW_DATA_PATH)
+        processor = DataProcessor(config.RAW_DATA_PATH)
+        summary = processor.load_and_validate()
+        log.info("Dataset summary: %s", summary)
+        log.info("Building corpus chunks for reuse …")
+        corpus_chunks = list(processor.build_corpus_chunks())
 
     embedder = Embedder()
     embedder.load_model()
 
-    log.info("Building corpus chunks for reuse …")
-    corpus_chunks: list[CorpusChunk] = list(processor.build_corpus_chunks())
-
     index_build_time: float | None = None
     if args.build_index:
-        retriever, index_build_time = build_index(processor, embedder, chunks=corpus_chunks)
+        retriever, index_build_time = build_index(
+            processor, embedder, chunks=corpus_chunks
+        )
     else:
         retriever = load_index(embedder)
+
+    graph_index = None
+    if args.graph:
+        graph_path = config.INDEX_DIR / getattr(config, "GRAPH_FILE", "graph.json")
+        if graph_path.exists():
+            from retrieval.graph_index import GraphIndex
+            graph_index = GraphIndex(graph_path, config.INDEX_DIR / config.METADATA_FILE)
+            log.info("Graph index loaded: %s", graph_path)
+        else:
+            log.warning("--graph set but graph.json not found at %s; run scripts/15_build_graph.py", graph_path)
+    retriever.graph_index = graph_index
 
     if not args.eval and not args.retrieval_only:
         log.info("--eval not specified; exiting after index step.")
@@ -288,10 +427,21 @@ def main() -> None:
         bm25_index = BM25Index()
         bm25_index.build([{"text": c.text, "chunk_id": c.chunk_id} for c in corpus_chunks])
 
-    if args.hmgs:
+    if args.eval_data:
+        log.info("Loading external QA data from %s …", args.eval_data)
+        qa_examples, short_answer_mode = _load_external_qa(args.eval_data)
+        log.info("  %d QA examples loaded (short_answer_mode=%s)", len(qa_examples), short_answer_mode)
+    elif args.hmgs:
+        if processor is None:
+            processor = DataProcessor(config.RAW_DATA_PATH)
+            processor.load_and_validate()
         qa_examples = processor.build_gold_eval_set()
+        short_answer_mode = True
         log.info("Using HMGS eval set: %d examples", len(qa_examples))
     else:
+        if processor is None:
+            processor = DataProcessor(config.RAW_DATA_PATH)
+            processor.load_and_validate()
         qa_examples = processor.build_qa_eval_set()
 
     # Determine retrieval mode label
@@ -334,7 +484,7 @@ def main() -> None:
                 config.LLM_BASE_URL, config.LLM_MODEL,
             )
         else:
-            pipeline = RAGPipeline(retriever, short_answer_mode=args.hmgs)
+            pipeline = RAGPipeline(retriever, short_answer_mode=short_answer_mode)
             qa_metrics, predictions = run_generation_eval(
                 pipeline, qa_examples,
                 use_hybrid=args.hybrid, use_rerank=args.rerank, bm25_index=bm25_index,
@@ -359,11 +509,12 @@ def main() -> None:
             "retrieval_mode": retrieval_mode,
             "device": embedder.device,
             "index_build_time_s": index_build_time,
+            "dataset": str(args.eval_data) if args.eval_data else str(config.RAW_DATA_PATH),
         },
         "retrieval_metrics": retrieval_metrics,
         "qa_metrics": qa_metrics,
         "hallucination_summary": hallucination.get("summary", {}),
-        "faithfulness_rate": hallucination.get("summary", {}).get("faithful_rate"),
+        "faithfulness_rate": hallucination.get("summary", {}).get("context_grounding_rate"),
     }
     save_results(final_results, args.results_dir)
 

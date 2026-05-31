@@ -1,0 +1,123 @@
+# Evaluator Note (Instructor / Grader)
+
+How to run **custom document + benchmark** evaluation for CENG493 Term Project (Moodle items 3–4).
+
+All commands must be run from the **`CENG493_Project/`** directory.
+
+---
+
+## Prerequisites
+
+```bash
+pip install -r requirements.txt
+ollama pull qwen2.5:14b
+ollama serve
+```
+
+Ollama: https://ollama.com/download
+
+---
+
+## Full evaluation
+
+**Required:** use **`--corpus` AND `--eval-data` together.**
+
+### Linux / macOS
+
+```bash
+cd CENG493_Project
+
+PYTHONUTF8=1 python scripts/14_eval_all_stages.py \
+  --corpus /path/to/corpus.jsonl \
+  --eval-data /path/to/gold_benchmark.json \
+  --stages base,rrf_rerank,emb_ft
+```
+
+### Windows (PowerShell)
+
+```powershell
+cd CENG493_Project
+$env:PYTHONUTF8="1"
+
+python scripts/14_eval_all_stages.py `
+  --corpus "C:\path\to\corpus.jsonl" `
+  --eval-data "C:\path\to\gold_benchmark.json" `
+  --stages base,rrf_rerank,emb_ft
+```
+
+---
+
+## Reference dataset format
+
+See `Datasets_Ceng493_legal_rag/` in this repository:
+
+| File | Role |
+|------|------|
+| `corpus.jsonl` | Pre-chunked document collection (7,579 chunks) |
+| `gold_benchmark.json` | 240 questions with gold answers + chunk IDs |
+| `rag_eval.json` | 1,000 questions (alternative benchmark) |
+
+Example with the bundled reference folder (from repo root):
+
+```powershell
+cd CENG493_Project
+$env:PYTHONUTF8="1"
+$DS = "..\Datasets_Ceng493_legal_rag"
+
+python scripts/14_eval_all_stages.py `
+  --corpus "$DS\corpus.jsonl" `
+  --eval-data "$DS\gold_benchmark.json" `
+  --stages base,rrf_rerank
+```
+
+---
+
+## Quick smoke test (5 questions)
+
+```bash
+cd CENG493_Project
+
+python scripts/14_eval_all_stages.py \
+  --corpus /path/to/corpus.jsonl \
+  --eval-data /path/to/gold_benchmark.json \
+  --stages base \
+  --limit 5
+```
+
+---
+
+## Output
+
+Results are written under:
+
+```
+CENG493_Project/results/
+├── ablation_summary.json
+├── stage_base/
+├── stage_reranker/          # rrf_rerank
+└── ...
+```
+
+Each stage folder contains `baseline_metrics.json` (retrieval, QA, faithfulness, rubric scenario scores).
+
+---
+
+## Important
+
+1. **`--corpus` and `--eval-data` must be used together.** If only `--eval-data` is given, the system falls back to the default training corpus instead of your documents.
+2. Use **`scripts/14_eval_all_stages.py` only** for custom evaluation. Do **not** use `demo.py`, `scripts/03_evaluate_retrieval.py`, or `scripts/04_generate_answers.py` for instructor-provided data.
+3. Alternative corpus input: **`--docs-path /path/to/folder`** with `.txt` or `.pdf` files (requires `pip install pypdf` for PDF). Mutually exclusive with `--corpus`.
+4. Fine-tuned stages (`emb_ft`, `llm_ft`, `full`) require locally trained models and/or Ollama model `qwen25-legal-ft`; if missing, those stages are skipped automatically. **`base` and `rrf_rerank` always work** with the base embedding model.
+
+---
+
+## Accepted file formats
+
+**Corpus (`--corpus`):** JSONL, one chunk per line. Native schema or evaluator schema (`id` + `metadata.chunk_id`).
+
+**Benchmark (`--eval-data`):** JSON array.
+
+- **gold_benchmark.json:** `question_id`, `question`, `verified_answer`, `gold_sources[].source_id`
+- **rag_eval.json:** `query_id`, `query`, `gold_answer_extract`, `gold_chunk_ids`
+
+See `README.md` → *Custom Data Evaluation (for Evaluators)* for examples.

@@ -12,16 +12,23 @@ Prerequisites:
   - Fine-tuned embedding (optional): python scripts/12_finetune_embeddings.py
 
 Usage:
-    python scripts/14_eval_all_stages.py                           # all available stages
+    python scripts/14_eval_all_stages.py                           # all available stages (CSV format)
     python scripts/14_eval_all_stages.py --stages base,rrf_rerank,llm_ft
     python scripts/14_eval_all_stages.py --stages base --dataset hmgs
     python scripts/14_eval_all_stages.py --list-stages
+    python scripts/14_eval_all_stages.py \
+        --corpus /content/datasets/corpus.jsonl \
+        --eval-data /content/datasets/gold_benchmark.json          # external evaluator format
+    python scripts/14_eval_all_stages.py \
+        --corpus /content/datasets/corpus.jsonl \
+        --eval-data /content/datasets/rag_eval.json                # external rag eval
 
 Available stages:
     base         BGE-M3 base    + dense          + qwen2.5:7b
     hybrid       BGE-M3 base    + hybrid BM25    + qwen2.5:7b
     rrf          BGE-M3 base    + RRF            + qwen2.5:7b
     rrf_rerank   BGE-M3 base    + RRF+rerank     + qwen2.5:7b   ← best retrieval
+    graph        BGE-M3 base    + RRF+rerank+graph + qwen2.5:7b  ← requires graph.json
     llm_ft       BGE-M3 base    + dense          + qwen25-legal-ft (fine-tuned)
     emb_ft       BGE-M3 ft*     + RRF+rerank     + qwen2.5:7b   ← requires emb training
     full         BGE-M3 ft*     + RRF+rerank     + qwen25-legal-ft  ← best overall
@@ -45,7 +52,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import config
-from data.data_processor import DataProcessor
+from data.data_processor import DataProcessor, CorpusChunk, QAExample
 from evaluation.hallucination import run_hallucination_analysis, stratified_sample
 from evaluation.qa_metrics import compute_all_qa_metrics_with_citation
 from evaluation.retrieval_metrics import compute_all_metrics
@@ -64,7 +71,80 @@ from retrieval.bm25_retriever import BM25Index
 from retrieval.embedder import Embedder
 from retrieval.reranker import Reranker
 from retrieval.retriever import Retriever
+from retrieval.graph_index import GraphIndex
 from utils import check_ollama, inject_citations, set_seeds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# External data loaders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_external_corpus(path: Path) -> list:
+    """Load corpus from evaluator-format corpus.jsonl -> list[CorpusChunk]."""
+    from data.corpus_loader import load_corpus_jsonl
+    raw_chunks = load_corpus_jsonl(path)
+    return [
+        CorpusChunk(**{k: r[k] for k in ("chunk_id", "doc_id", "text", "source", "char_len")})
+        for r in raw_chunks
+    ]
+
+
+def _load_external_qa(path: Path) -> tuple[list, bool]:
+    """Load QA examples from rag_eval.json or gold_benchmark.json.
+
+    Auto-detects format from first item keys.
+    Attaches gold_source_ids as a dynamic attribute so build_relevant_chunk_map
+    Strategy 0 (exact chunk ID match) works correctly.
+
+    Returns (qa_examples, short_answer_mode).
+    """
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not data:
+        raise ValueError(f"Empty QA file: {path}")
+
+    first = data[0]
+    examples = []
+
+    if "query_id" in first and "query" in first:
+        # rag_eval.json format — open-ended answers, no short-answer mode
+        short_answer_mode = False
+        for item in data:
+            qa = QAExample(
+                query_id=item["query_id"],
+                question=item["query"],
+                answer=item.get("gold_answer_extract", ""),
+                context="",
+                source=item.get("source", ""),
+                data_type="",
+            )
+            qa.gold_source_ids = item.get("gold_chunk_ids", [])
+            examples.append(qa)
+
+    elif "question_id" in first and "question" in first:
+        # gold_benchmark.json format — exam-style, short answers
+        short_answer_mode = True
+        for item in data:
+            gold_sources = item.get("gold_sources", [])
+            qa = QAExample(
+                query_id=item["question_id"],
+                question=item["question"],
+                answer=item.get("verified_answer", ""),
+                context="",
+                source=gold_sources[0].get("source", "") if gold_sources else "",
+                data_type="",
+            )
+            qa.gold_source_ids = [s["source_id"] for s in gold_sources]
+            examples.append(qa)
+
+    else:
+        raise ValueError(
+            f"Unrecognised QA file format in {path}. "
+            "Expected rag_eval.json (query_id+query) or gold_benchmark.json (question_id+question)."
+        )
+
+    return examples, short_answer_mode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -81,6 +161,8 @@ class StageConfig:
     results_dir: Path
     inject_citations: bool = False   # post-hoc citation injection (for ft LLM)
     requires_emb_ft: bool = False    # skip automatically if emb model dir is empty
+    use_graph: bool = False          # apply graph expansion after reranking
+    requires_graph: bool = False     # skip automatically if graph.json is missing
 
 
 STAGE_REGISTRY: dict[str, StageConfig] = {
@@ -120,6 +202,17 @@ STAGE_REGISTRY: dict[str, StageConfig] = {
         inject_citations=True,
         results_dir=config.RESULTS_DIR_RERANK,
     ),
+    "graph": StageConfig(
+        name="Stage 3b — RRF+Rerank+Graph",
+        embedding="base",
+        retrieval="rrf",
+        use_rerank=True,
+        use_graph=True,
+        requires_graph=True,
+        llm="base",
+        inject_citations=True,
+        results_dir=config.BASE_DIR / "results" / "stage_graph",
+    ),
     "llm_ft": StageConfig(
         name="Stage 4 — Fine-tuned LLM",
         embedding="base",
@@ -152,7 +245,7 @@ STAGE_REGISTRY: dict[str, StageConfig] = {
 }
 
 # ordered list for display / default run
-DEFAULT_STAGE_ORDER = ["base", "hybrid", "rrf", "rrf_rerank", "llm_ft", "emb_ft", "full"]
+DEFAULT_STAGE_ORDER = ["base", "hybrid", "rrf", "rrf_rerank", "graph", "llm_ft", "emb_ft", "full"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,8 +258,9 @@ def _retrieve(
     stage: StageConfig,
     bm25: Optional[BM25Index],
     reranker: Optional[Reranker],
+    graph_index: Optional[GraphIndex] = None,
 ) -> list[list[dict]]:
-    """Dispatch to the correct retrieval method and optionally rerank."""
+    """Dispatch to the correct retrieval method and optionally rerank + graph expand."""
     initial_k = config.RERANKER_CANDIDATES if stage.use_rerank else config.TOP_K_RETRIEVAL
 
     t0 = time.time()
@@ -179,6 +273,14 @@ def _retrieve(
 
     if stage.use_rerank and reranker is not None:
         chunks = reranker.batch_rerank(questions, chunks, top_k=config.TOP_K_RETRIEVAL)
+
+    if stage.use_graph and graph_index is not None:
+        chunks = graph_index.expand_batch(
+            chunks,
+            hops=config.GRAPH_HOPS,
+            budget=config.GRAPH_NEIGHBOR_BUDGET,
+            kinds=("adj",),  # use only adjacency edges (safest)
+        )
 
     print(f"    Retrieval done in {time.time()-t0:.1f}s")
     return chunks
@@ -259,14 +361,27 @@ def run_stage(
             reranker_cache["reranker"] = r
         reranker = reranker_cache["reranker"]
 
+    # ── Graph index (shared, loaded once) ────────────────────────────────
+    graph_index: Optional[GraphIndex] = None
+    if stage.use_graph:
+        if "graph_index" not in reranker_cache:
+            graph_path = config.INDEX_DIR / config.GRAPH_FILE
+            meta_path = config.INDEX_DIR / config.METADATA_FILE
+            if graph_path.exists() and meta_path.exists():
+                print(f"  Loading graph index: {graph_path}")
+                reranker_cache["graph_index"] = GraphIndex(graph_path, meta_path)
+            else:
+                print(f"  WARNING: graph.json not found at {graph_path}")
+        graph_index = reranker_cache.get("graph_index")
+
     # ── LLM selection ──────────────────────────────────────────────────────
     llm_model = config.LLM_FINETUNED_MODEL if stage.llm == "finetuned" else config.LLM_MODEL
 
     # ── Retrieval metrics ──────────────────────────────────────────────────
-    print(f"  Retrieval ({stage.retrieval}, rerank={stage.use_rerank}) …")
+    print(f"  Retrieval ({stage.retrieval}, rerank={stage.use_rerank}, graph={stage.use_graph}) …")
     questions = [qa.question for qa in qa_examples]
 
-    retrieved_all = _retrieve(retriever, questions, stage, bm25, reranker)
+    retrieved_all = _retrieve(retriever, questions, stage, bm25, reranker, graph_index)
 
     metric_input = []
     full_retrieved: dict[str, list] = {}
@@ -333,6 +448,13 @@ def run_stage(
                 "retrieved_chunks": [],
             })
 
+    # Filter out failed generations (empty predicted) to match 05_evaluate_qa.py behavior.
+    # Without this, empty strings from exceptions would suppress F1/BLEU/ROUGE scores.
+    failed = [p for p in predictions if not p.get("predicted")]
+    predictions = [p for p in predictions if p.get("predicted")]
+    if failed:
+        print(f"    Filtered {len(failed)} failed generation(s) from QA metrics.")
+
     qa_metrics = compute_all_qa_metrics_with_citation(predictions)
     print(f"    F1={qa_metrics.get('f1',0):.4f}  "
           f"ROUGE-L={qa_metrics.get('rouge_l',0):.4f}  "
@@ -368,8 +490,25 @@ def run_stage(
 
     # ── Hallucination ──────────────────────────────────────────────────────
     print(f"  Hallucination analysis …")
+    import gc
     import torch
     from sentence_transformers import CrossEncoder
+    # Free CUDA memory held by perplexity HF model and unload Ollama LLM before
+    # loading NLI model — Ollama keeps the generation model in VRAM indefinitely.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:
+        import requests as _req
+        from urllib.parse import urlparse as _urlparse
+        _ollama_base = "{0}://{1}".format(*_urlparse(config.LLM_BASE_URL)[:2])
+        _req.post(
+            _ollama_base + "/api/generate",
+            json={"model": llm_model, "keep_alive": 0},
+            timeout=10,
+        )
+    except Exception:
+        pass
     if torch.cuda.is_available():
         _nli_device = "cuda"
     elif torch.backends.mps.is_available():
@@ -378,12 +517,19 @@ def run_stage(
         _nli_device = "cpu"
     if not hasattr(run_stage, "_nli_model"):
         print("    Loading NLI model …")
-        run_stage._nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small", device=_nli_device)
+        try:
+            run_stage._nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small", device=_nli_device)
+        except torch.cuda.OutOfMemoryError:
+            run_stage._nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small", device="cpu")
     nli_model = run_stage._nli_model  # reuse across stages
 
     sample = stratified_sample(predictions, config.HALLUCINATION_SAMPLE_SIZE)
     hall = run_hallucination_analysis(sample, full_retrieved, nli_model)
-    faithful_rate = hall["summary"].get("faithful_rate", 0.0)
+    # Prefer answer_faithfulness_rate (gold→predicted entailment) for scenario scoring;
+    # fall back to context_grounding_rate when gold answers are absent.
+    # Use an explicit None-check so a genuine 0.0 faithfulness rate is never discarded.
+    afr = hall["summary"].get("answer_faithfulness_rate")
+    faithful_rate = afr if afr is not None else hall["summary"].get("context_grounding_rate", 0.0)
     print(f"    Faithfulness={faithful_rate:.4f}")
 
     # ── LLM Judge (sampled) ───────────────────────────────────────────────
@@ -400,10 +546,10 @@ def run_stage(
             )}
             for p in predictions
         ]
-        judge_result     = llm_judge_answer(judge_preds, config.LLM_BASE_URL, config.LLM_MODEL, sample_size=20)
-        faith_result     = llm_judge_faithfulness(predictions, config.LLM_BASE_URL, config.LLM_MODEL, sample_size=20)
-        relev_result     = llm_judge_relevancy(judge_preds, config.LLM_BASE_URL, config.LLM_MODEL, sample_size=20)
-        coher_result     = llm_judge_coherence(predictions, config.LLM_BASE_URL, config.LLM_MODEL, sample_size=20)
+        judge_result     = llm_judge_answer(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
+        faith_result     = llm_judge_faithfulness(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
+        relev_result     = llm_judge_relevancy(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
+        coher_result     = llm_judge_coherence(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
         llm_judge_score          = judge_result["score"]
         llm_faithfulness_score   = faith_result["score"]
         llm_relevancy_score      = relev_result["score"]
@@ -568,7 +714,31 @@ def main() -> None:
         default=None,
         help="Limit QA examples per stage for quick testing (e.g. --limit 30).",
     )
+    parser.add_argument(
+        "--corpus",
+        type=str,
+        default=None,
+        help="Path to external corpus.jsonl (evaluator format). Overrides DataProcessor corpus loading.",
+    )
+    parser.add_argument(
+        "--eval-data",
+        type=str,
+        default=None,
+        help="Path to external rag_eval.json or gold_benchmark.json. "
+             "Auto-detects format. Overrides --dataset.",
+    )
+    parser.add_argument(
+        "--docs-path",
+        type=str,
+        default=None,
+        dest="docs_path",
+        help="Directory of .txt/.pdf documents to chunk and index. "
+             "Mutually exclusive with --corpus.",
+    )
     args = parser.parse_args()
+
+    if args.corpus and args.docs_path:
+        parser.error("--corpus and --docs-path are mutually exclusive")
 
     if args.list_stages:
         print("\nAvailable stages:")
@@ -586,6 +756,13 @@ def main() -> None:
             print(f"WARNING: Unknown stage '{key}' — skipping.")
             continue
         stage = STAGE_REGISTRY[key]
+        if stage.requires_graph:
+            graph_path = config.INDEX_DIR / config.GRAPH_FILE
+            if not graph_path.exists():
+                print(f"INFO: Stage '{key}' skipped — "
+                      f"graph.json not found at {graph_path}\n"
+                      f"  Run: python scripts/15_build_graph.py first.")
+                continue
         if stage.requires_emb_ft:
             emb_dir = Path(config.FINETUNED_EMBEDDING_MODEL)
             if not emb_dir.exists() or not any(emb_dir.iterdir()):
@@ -619,16 +796,37 @@ def main() -> None:
         )
 
     # ── Load data (shared) ────────────────────────────────────────────────
-    short_answer_mode = (args.dataset == "hmgs")
     print("Loading data …")
-    processor = DataProcessor(config.RAW_DATA_PATH)
-    processor.load_and_validate()
-    corpus_chunks = list(processor.build_corpus_chunks())
 
-    if args.dataset == "hmgs":
-        qa_examples = DataProcessor.build_gold_eval_set()
+    # External evaluator format (--corpus / --eval-data / --docs-path)
+    if args.corpus:
+        print(f"  Corpus source : {args.corpus} (external evaluator format)")
+        corpus_chunks = _load_external_corpus(Path(args.corpus))
+    elif args.docs_path:
+        from data.corpus_loader import resolve_corpus
+        corpus_path = resolve_corpus(None, args.docs_path)
+        print(f"  Chunking/loading corpus from {args.docs_path} …")
+        corpus_chunks = _load_external_corpus(Path(corpus_path))
     else:
-        qa_examples = processor.build_qa_eval_set()
+        processor = DataProcessor(config.RAW_DATA_PATH)
+        processor.load_and_validate()
+        corpus_chunks = list(processor.build_corpus_chunks())
+
+    if args.eval_data:
+        print(f"  QA source     : {args.eval_data} (external evaluator format)")
+        qa_examples, short_answer_mode = _load_external_qa(Path(args.eval_data))
+    else:
+        short_answer_mode = (args.dataset == "hmgs")
+        if args.dataset == "hmgs":
+            qa_examples = DataProcessor.build_gold_eval_set()
+        else:
+            if not args.corpus:
+                pass  # processor already initialised above
+            else:
+                processor = DataProcessor(config.RAW_DATA_PATH)
+                processor.load_and_validate()
+            qa_examples = processor.build_qa_eval_set()
+
     if args.limit:
         qa_examples = qa_examples[:args.limit]
         print(f"  [--limit {args.limit}] Evaluating first {args.limit} examples only.")
@@ -667,6 +865,10 @@ def main() -> None:
             print(f"\n  ERROR in stage '{key}': {exc}")
             import traceback
             traceback.print_exc()
+            import gc, torch as _torch
+            gc.collect()
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
             print("  Continuing with next stage …")
 
     # ── Ablation table ─────────────────────────────────────────────────────
@@ -675,6 +877,9 @@ def main() -> None:
 
         summary_path = config.BASE_DIR / "results" / "ablation_summary.json"
         summary_path.parent.mkdir(parents=True, exist_ok=True)
+        if args.limit:
+            all_results["limit_applied"] = True
+            all_results["limit_value"] = args.limit
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(all_results, f, ensure_ascii=False, indent=2)
         print(f"Full results saved to: {summary_path}")
