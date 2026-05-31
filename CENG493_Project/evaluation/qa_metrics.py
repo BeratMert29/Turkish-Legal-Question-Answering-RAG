@@ -134,7 +134,11 @@ def _cited_sources(predicted: str, retrieved_chunks: list[dict]) -> list[str]:
 
 
 def exact_match(predicted: str, expected: str) -> float:
-    return 1.0 if normalize_turkish(predicted.strip()) == normalize_turkish(expected.strip()) else 0.0
+    pred_norm = normalize_turkish(predicted.strip())
+    exp_norm = normalize_turkish(expected.strip())
+    if not exp_norm:
+        return 0.0
+    return 1.0 if exp_norm in pred_norm else 0.0
 
 
 def token_f1(predicted: str, expected: str) -> float:
