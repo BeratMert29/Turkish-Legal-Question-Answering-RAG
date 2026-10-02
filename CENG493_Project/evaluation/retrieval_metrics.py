@@ -1,7 +1,63 @@
-from ranx import Qrels, Run, evaluate as ranx_evaluate
+def compute_source_hit_metrics(results: list[dict]) -> dict:
+    """Compute law-level source-hit and source-precision metrics.
+
+    These metrics apply to **all** queries that have a known gold source law,
+    regardless of whether the query has article-level ground-truth relevance.
+    They answer: "did the retriever bring back at least one chunk from the
+    correct law?" — useful for HMGS queries where article-level labels are
+    mostly unavailable.
+
+    Args:
+        results: list of dicts with keys:
+            "query_id"          : str
+            "source_law"        : str — gold law name (empty string = unknown, skipped)
+            "retrieved_sources" : list[str] — source field of each retrieved chunk,
+                                  in retrieval-rank order
+
+    Returns:
+        Dict with keys:
+            source_hit_at_5_all      : fraction of source-known queries with a
+                                       top-5 chunk from the gold law
+            source_hit_at_10_all     : same for top-10
+            source_precision_at_5_all: mean fraction of top-5 chunks from gold law
+            source_precision_at_10_all: mean fraction of top-10 chunks
+            source_labeled_queries   : number of queries with a known source law
+            total_queries            : total queries passed in
+    """
+    hit5 = hit10 = 0
+    prec5_sum = prec10_sum = 0.0
+    source_labeled = 0
+    total = len(results)
+
+    for r in results:
+        law = (r.get("source_law") or "").strip()
+        if not law:
+            continue
+        source_labeled += 1
+        srcs = r.get("retrieved_sources", [])
+        top5  = srcs[:5]
+        top10 = srcs[:10]
+        hits5  = sum(1 for s in top5  if s == law)
+        hits10 = sum(1 for s in top10 if s == law)
+        if hits5:
+            hit5 += 1
+        if hits10:
+            hit10 += 1
+        prec5_sum  += hits5  / max(len(top5),  1)
+        prec10_sum += hits10 / max(len(top10), 1)
+
+    n = source_labeled or 1  # avoid div-by-zero; metrics will be 0.0
+    return {
+        "source_hit_at_5_all":       hit5  / n,
+        "source_hit_at_10_all":      hit10 / n,
+        "source_precision_at_5_all": prec5_sum  / n,
+        "source_precision_at_10_all":prec10_sum / n,
+        "source_labeled_queries":    source_labeled,
+        "total_queries":             total,
+    }
 
 
-def compute_all_metrics(results: list[dict]) -> dict:
+def compute_all_metrics(results: list[dict]) -> dict:  # noqa: C901
     """
     Compute retrieval metrics using ranx.
 
@@ -35,6 +91,7 @@ def compute_all_metrics(results: list[dict]) -> dict:
     if not qrels_dict:
         return {"recall_at_5": 0.0, "recall_at_10": 0.0, "mrr": 0.0, "ndcg_at_10": 0.0, "source_hit_at_5": 0.0, "source_hit_at_10": 0.0, "capped_recall_at_5": 0.0, "capped_recall_at_10": 0.0, "precision_at_5": 0.0, "precision_at_10": 0.0, "num_queries": 0, "total_queries": total_queries}
 
+    from ranx import Qrels, Run, evaluate as ranx_evaluate  # lazy import; ranx optional
     qrels = Qrels(qrels_dict)
     run = Run(run_dict)
 

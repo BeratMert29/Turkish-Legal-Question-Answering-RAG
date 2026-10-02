@@ -55,7 +55,7 @@ import config
 from data.data_processor import DataProcessor, CorpusChunk, QAExample
 from evaluation.hallucination import run_hallucination_analysis, stratified_sample
 from evaluation.qa_metrics import compute_all_qa_metrics_with_citation
-from evaluation.retrieval_metrics import compute_all_metrics
+from evaluation.retrieval_metrics import compute_all_metrics, compute_source_hit_metrics
 from evaluation.llm_judge import (
     llm_judge_answer,
     llm_judge_faithfulness,
@@ -303,6 +303,7 @@ def run_stage(
     relevant_map: dict,
     short_answer_mode: bool,
     eval_set_name: str = "hmgs",
+    labeling_coverage: Optional[dict] = None,
 ) -> dict:
     """Run a single stage. Returns the final_results dict (same schema as run_baseline)."""
 
@@ -397,14 +398,23 @@ def run_stage(
             "query_id": qa.query_id,
             "relevant": relevant_map.get(qa.query_id, []),
             "retrieved": deduped,
+            # source_law + retrieved_sources enable law-level metrics for ALL queries
+            # (including HMGS queries that are unlabeled at article level)
+            "source_law": qa.source,
+            "retrieved_sources": [c.get("source", "") for c in chunks],
         })
         full_retrieved[qa.query_id] = chunks
 
     retrieval_metrics = compute_all_metrics(metric_input)
+    source_metrics = compute_source_hit_metrics(metric_input)
     print(f"    R@5={retrieval_metrics.get('recall_at_5',0):.4f}  "
           f"R@10={retrieval_metrics.get('recall_at_10',0):.4f}  "
           f"MRR={retrieval_metrics.get('mrr',0):.4f}  "
           f"nDCG@10={retrieval_metrics.get('ndcg_at_10',0):.4f}")
+    print(f"    SourceHit@5={source_metrics.get('source_hit_at_5_all',0):.4f}  "
+          f"SourceHit@10={source_metrics.get('source_hit_at_10_all',0):.4f}  "
+          f"SourcePrec@5={source_metrics.get('source_precision_at_5_all',0):.4f}  "
+          f"[n_src={source_metrics.get('source_labeled_queries',0)}]")
 
     # ── Generation ─────────────────────────────────────────────────────────
     print(f"  Generation with {llm_model} …")
@@ -627,6 +637,8 @@ def run_stage(
             "top_k_for_generation": config.TOP_K_FOR_GENERATION,
         },
         "retrieval_metrics": retrieval_metrics,
+        "source_hit_metrics": source_metrics,
+        "labeling_coverage": labeling_coverage,
         "qa_metrics": qa_metrics,
         "hallucination_summary": hall.get("summary", {}),
         "faithfulness_rate": faithful_rate,
@@ -863,7 +875,14 @@ def main() -> None:
     print(f"  Corpus: {len(corpus_chunks)} chunks  |  QA: {len(qa_examples)} examples")
 
     # ── Ground-truth relevance map (shared) ───────────────────────────────
-    relevant_map = DataProcessor.build_relevant_chunk_map(corpus_chunks, qa_examples)
+    relevant_map, labeling_coverage = DataProcessor.build_relevant_chunk_map(
+        corpus_chunks, qa_examples, return_coverage=True
+    )
+    print(
+        f"  Labeling coverage: {labeling_coverage['labeled']}/{labeling_coverage['total']} labeled "
+        f"(unlabeled={labeling_coverage['unlabeled']}) "
+        f"by_strategy={labeling_coverage['by_strategy']}"
+    )
 
     # ── Shared caches (avoid reloading models between stages) ─────────────
     embedder_cache: dict = {}
@@ -886,6 +905,7 @@ def main() -> None:
                 relevant_map=relevant_map,
                 short_answer_mode=short_answer_mode,
                 eval_set_name=args.eval_set if not args.eval_data else "external",
+                labeling_coverage=labeling_coverage,
             )
             all_results[key] = result
         except KeyboardInterrupt:

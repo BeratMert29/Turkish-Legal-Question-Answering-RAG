@@ -107,4 +107,12 @@ MAX_STRATEGY3_RELEVANT = 20
 
 # Custom corpus / benchmark support
 CUSTOM_CORPUS_FILE = "corpus_chunks_custom.jsonl"
+
+# Silver lexical labeling (strategy 3.5) — off by default.
+# When True, queries with no article-level label receive up to SILVER_TOP_M
+# chunks scored by normalized token overlap with (question + answer), restricted
+# to the gold source law and above SILVER_THRESHOLD.  Tagged label_strategy="silver_lexical".
+RELEVANCE_SILVER_LEXICAL: bool = False
+SILVER_TOP_M: int = 3
+SILVER_THRESHOLD: float = 0.10
 SUPPORTED_DOC_EXTENSIONS = (".txt", ".pdf")

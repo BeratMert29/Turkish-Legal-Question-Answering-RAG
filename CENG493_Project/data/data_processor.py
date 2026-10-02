@@ -89,6 +89,45 @@ def _chunk_matches_article(chunk: "CorpusChunk", madde_no: int) -> bool:
     return False
 
 
+# Turkish-aware tokenizer for silver lexical scoring.
+# İ→i and I→ı to handle Turkish case-folding correctly (avoiding ASCII lowercasing
+# that would map İ→i but leave I as i, conflating two different letters).
+_TR_UPPER_MAP = str.maketrans("İIĞÜŞÖÇ", "iığüşöç")
+_SILVER_STOPWORDS = frozenset(
+    "bir bu o ve ya da ile de mi ne için bir de ya olan olan olan olan".split()
+)
+
+
+def _turkish_tokenize(text: str) -> list[str]:
+    """Tokenize Turkish text with correct case folding (İ→i, I→ı).
+
+    Returns a list of word tokens with length >= 2, excluding common
+    Turkish stopwords that carry little retrieval signal.
+    """
+    lowered = text.translate(_TR_UPPER_MAP).lower()
+    tokens = re.findall(r'\w+', lowered)
+    return [t for t in tokens if len(t) >= 2 and t not in _SILVER_STOPWORDS]
+
+
+def _silver_lexical_score(query_tokens: "list[str]", chunk_text: str) -> float:
+    """Normalized token recall: fraction of query tokens present in chunk text.
+
+    Args:
+        query_tokens: Pre-tokenized query (question + answer tokens).
+        chunk_text:   Raw chunk text (tokenized internally).
+
+    Returns:
+        Float in [0, 1].
+    """
+    if not query_tokens:
+        return 0.0
+    chunk_token_set = set(_turkish_tokenize(chunk_text))
+    if not chunk_token_set:
+        return 0.0
+    matched = sum(1 for t in query_tokens if t in chunk_token_set)
+    return matched / len(query_tokens)
+
+
 @dataclass
 class CorpusChunk:
     chunk_id: str   # f"{source}_{doc_id}_{chunk_index}"
@@ -498,10 +537,11 @@ class DataProcessor:
 
     @staticmethod
     def build_relevant_chunk_map(
-        corpus_chunks: list,          # list[CorpusChunk]
-        qa_examples: list,            # list[QAExample]
-        retriever=None,               # kept for API compatibility, ignored
-    ) -> dict:                        # {query_id: [chunk_id, ...]}
+        corpus_chunks: list,           # list[CorpusChunk]
+        qa_examples: list,             # list[QAExample]
+        retriever=None,                # kept for API compatibility, ignored
+        return_coverage: bool = False, # if True, return (rel_map, coverage_dict)
+    ) -> "dict | tuple[dict, dict]":
         """
         Build ground-truth relevance map using source/doc_id join.
         Model-independent: does NOT use embeddings to define relevance.
@@ -511,9 +551,26 @@ class DataProcessor:
         1. Context hash match: re-chunk qa.context and match by text hash
         2. doc_id match: chunk.doc_id == qa.query_id
         2.5. Answer substring: chunk.text contains a significant portion of qa.answer
-        3. Source match: all chunks from qa.source (for HMGS gold sets)
+        3. Article-level match: extract madde number from question/answer, match chunks
+           whose text starts with "MADDE N" in the gold source law.
+        3.5 Silver lexical (optional, config.RELEVANCE_SILVER_LEXICAL):
+           Within gold source law only, score chunks by normalized token overlap with
+           question+answer; label top-m above threshold.  Tagged as silver.
 
-        Returns dict mapping query_id -> list of relevant chunk_ids.
+        Queries with no match from any strategy are left with an empty relevant list
+        and are excluded from retrieval metrics (compute_all_metrics skips them).
+
+        Args:
+            corpus_chunks:   All CorpusChunk objects in the index.
+            qa_examples:     QAExample objects (or plain dicts) to label.
+            retriever:       Ignored; kept for API compatibility.
+            return_coverage: If True, return a (relevant_map, coverage_dict) tuple
+                             instead of just relevant_map.
+
+        Returns:
+            relevant_map: dict mapping query_id -> list of relevant chunk_ids.
+            coverage_dict (only when return_coverage=True): dict with per-strategy
+                counts and label_strategy breakdown.
         """
         import logging
         log = logging.getLogger(__name__)
@@ -530,9 +587,16 @@ class DataProcessor:
         valid_ids = set(c.chunk_id for c in corpus_chunks)
 
         relevant_map: dict[str, list[str]] = {}
+        # label_strategy tracks how each query was labeled (for coverage reporting)
+        label_strategy_map: dict[str, str] = {}
         # Coverage counters — one per labeling strategy
         labeled_s0 = labeled_s1 = labeled_s2 = labeled_s25 = labeled_s3 = 0
+        labeled_silver = 0
         unlabeled = 0
+        # Silver config (read once for performance)
+        silver_enabled = getattr(config, "RELEVANCE_SILVER_LEXICAL", False)
+        silver_top_m = getattr(config, "SILVER_TOP_M", 3)
+        silver_threshold = getattr(config, "SILVER_THRESHOLD", 0.10)
 
         for qa in qa_examples:
             relevant: list[str] = []
@@ -554,6 +618,7 @@ class DataProcessor:
                 relevant = [gid for gid in gold_ids if gid in valid_ids]
                 if relevant:
                     labeled_s0 += 1
+                    label_strategy_map[qa_query_id] = "gold"
                     relevant_map[qa_query_id] = relevant
                     continue  # Skip remaining strategies — ground truth is exact.
 
@@ -574,12 +639,14 @@ class DataProcessor:
                 relevant = deduped
             if relevant:
                 labeled_s1 += 1
+                label_strategy_map[qa_query_id] = "context_hash"
 
             # Strategy 2: doc_id match — used when context is empty/missing
             if not relevant:
                 relevant = [c.chunk_id for c in corpus_chunks if c.doc_id == qa_query_id]
                 if relevant:
                     labeled_s2 += 1
+                    label_strategy_map[qa_query_id] = "doc_id"
 
             # Strategy 2.5: answer substring match — for gold sets with known answers (e.g. HMGS)
             # Find chunks that contain a significant portion of the answer text.
@@ -590,6 +657,7 @@ class DataProcessor:
                 relevant = [c.chunk_id for c in candidate_chunks if search_str in c.text.lower()]
                 if relevant:
                     labeled_s25 += 1
+                    label_strategy_map[qa_query_id] = "answer_substr"
 
             # Strategy 3: article-level match — extract the madde (article) number from
             # the question and answer text.  Match only corpus chunks that belong to that
@@ -614,17 +682,37 @@ class DataProcessor:
                     ]
                     if relevant:
                         labeled_s3 += 1
+                        label_strategy_map[qa_query_id] = "article"
                 # If madde_no is None: leave relevant=[] → query will be unlabeled
                 # and excluded from retrieval metrics.
 
+            # Strategy 3.5: silver lexical labeling — optional, off by default.
+            # Within the gold source law only, rank chunks by normalized token overlap
+            # with (question + answer) and label the top-m above threshold.
+            # Uses Turkish-aware case folding (İ→i, I→ı).
+            # This is a HEURISTIC: labels are "silver" quality, not gold.
+            # Do NOT use silver labels when precise article-level labels are available.
+            if not relevant and qa_source and silver_enabled:
+                source_chunks = by_source.get(qa_source, [])
+                if source_chunks:
+                    q_tokens = _turkish_tokenize(f"{qa_question} {qa_answer}")
+                    scored = [
+                        (c, _silver_lexical_score(q_tokens, c.text))
+                        for c in source_chunks
+                    ]
+                    scored.sort(key=lambda x: -x[1])
+                    relevant = [
+                        c.chunk_id for c, score in scored[:silver_top_m]
+                        if score >= silver_threshold
+                    ]
+                    if relevant:
+                        labeled_silver += 1
+                        label_strategy_map[qa_query_id] = "silver_lexical"
+
             if not relevant:
                 unlabeled += 1
-                # Do NOT add to relevant_map — retrieval_metrics.py already skips
-                # queries with no ground-truth when qid is absent from qrels.
-                # Explicitly setting an empty list would still cause them to be
-                # included in total_queries but not num_queries, which is the
-                # desired behavior; we keep the key in the map for downstream
-                # consumers that iterate over all query_ids.
+                # Keep the key with empty list — retrieval_metrics.py already
+                # excludes queries with no ground-truth from metric computation.
 
             relevant_map[qa_query_id] = relevant
 
@@ -633,18 +721,38 @@ class DataProcessor:
         log.info(
             "build_relevant_chunk_map coverage: "
             "total=%d  labeled=%d (%.0f%%)  unlabeled=%d  "
-            "[s0=%d s1=%d s2=%d s2.5=%d s3(article)=%d]",
+            "[s0(gold)=%d s1(ctx_hash)=%d s2(doc_id)=%d s2.5(ans_substr)=%d "
+            "s3(article)=%d s3.5(silver_lexical)=%d]",
             n_total, labeled, 100 * labeled / n_total if n_total else 0,
-            unlabeled, labeled_s0, labeled_s1, labeled_s2, labeled_s25, labeled_s3,
+            unlabeled, labeled_s0, labeled_s1, labeled_s2, labeled_s25,
+            labeled_s3, labeled_silver,
         )
         if unlabeled:
             log.warning(
                 "build_relevant_chunk_map: %d/%d queries are unlabeled (no article "
-                "number found and no context/answer match).  These queries are "
-                "excluded from retrieval metrics.",
+                "number found, no context/answer match, silver disabled or below "
+                "threshold).  These queries are excluded from retrieval metrics.",
                 unlabeled, n_total,
             )
-        return relevant_map
+
+        if not return_coverage:
+            return relevant_map
+
+        coverage = {
+            "total": n_total,
+            "labeled": labeled,
+            "unlabeled": unlabeled,
+            "by_strategy": {
+                "gold":          labeled_s0,
+                "context_hash":  labeled_s1,
+                "doc_id":        labeled_s2,
+                "answer_substr": labeled_s25,
+                "article":       labeled_s3,
+                "silver_lexical": labeled_silver,
+            },
+            "label_strategy_per_query": label_strategy_map,
+        }
+        return relevant_map, coverage
 
     # ------------------------------------------------------------------
     # JSONL I/O

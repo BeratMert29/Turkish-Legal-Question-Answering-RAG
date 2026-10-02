@@ -20,6 +20,8 @@ from data.data_processor import (
     DataProcessor,
     _extract_madde_no,
     _chunk_matches_article,
+    _turkish_tokenize,
+    _silver_lexical_score,
 )
 
 
@@ -240,3 +242,181 @@ class TestBuildRelevantChunkMapStrategy3:
         with caplog.at_level(logging.INFO, logger="data.data_processor"):
             DataProcessor.build_relevant_chunk_map(corpus, qa)
         assert any("coverage" in r.message.lower() for r in caplog.records)
+
+    def test_return_coverage_flag(self):
+        """return_coverage=True must return (relevant_map, coverage_dict) tuple."""
+        corpus = self._make_corpus()
+        qa = [_qa("qA", question="madde 44", source="TestLaw")]
+        result = DataProcessor.build_relevant_chunk_map(corpus, qa, return_coverage=True)
+        assert isinstance(result, tuple) and len(result) == 2
+        rel_map, cov = result
+        assert "by_strategy" in cov
+        assert "total" in cov
+        assert "unlabeled" in cov
+        assert cov["total"] == 1
+
+    def test_coverage_by_strategy_keys(self):
+        corpus = self._make_corpus()
+        qa = [
+            _qa("qA", question="madde 44", source="TestLaw"),   # → article
+            _qa("qB", question="no article", source="TestLaw"), # → unlabeled
+        ]
+        _, cov = DataProcessor.build_relevant_chunk_map(corpus, qa, return_coverage=True)
+        assert "article" in cov["by_strategy"]
+        assert "silver_lexical" in cov["by_strategy"]
+        assert cov["by_strategy"]["article"] == 1
+        assert cov["unlabeled"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Turkish tokenizer and silver lexical scoring
+# ---------------------------------------------------------------------------
+
+class TestTurkishTokenize:
+    def test_lowercase_ascii(self):
+        tokens = _turkish_tokenize("Türk Hukuku")
+        assert "türk" in tokens
+        assert "hukuku" in tokens
+
+    def test_uppercase_i_to_dotless(self):
+        # Turkish: uppercase "I" should map to "ı" (dotless i), not "i"
+        tokens = _turkish_tokenize("IŞIK")
+        assert "ışık" in tokens
+
+    def test_uppercase_dotted_i(self):
+        # Turkish: "İ" should map to "i" (dotted i)
+        tokens = _turkish_tokenize("İSTANBUL")
+        assert "istanbul" in tokens
+
+    def test_min_length_filter(self):
+        tokens = _turkish_tokenize("a bb ccc")
+        assert "a" not in tokens
+        assert "bb" in tokens
+        assert "ccc" in tokens
+
+    def test_empty(self):
+        assert _turkish_tokenize("") == []
+
+
+class TestSilverLexicalScore:
+    def test_full_overlap(self):
+        # Use tokens that appear verbatim in the chunk text (no morphological suffix changes)
+        q_tokens = _turkish_tokenize("feshi hükümleri sona")
+        score = _silver_lexical_score(q_tokens, "Sözleşmenin feshi hükümleri sona erer hakkında")
+        assert score == pytest.approx(1.0)
+
+    def test_zero_overlap(self):
+        q_tokens = _turkish_tokenize("trafik kazası tazminat")
+        score = _silver_lexical_score(q_tokens, "MADDE 44 – Miras bırakanın ölümü")
+        assert score == pytest.approx(0.0)
+
+    def test_partial_overlap(self):
+        q_tokens = _turkish_tokenize("taraf feshi miras")
+        score = _silver_lexical_score(q_tokens, "Sözleşmenin feshi hükümleri")
+        assert 0.0 < score < 1.0
+
+    def test_empty_query(self):
+        assert _silver_lexical_score([], "some text") == pytest.approx(0.0)
+
+    def test_empty_chunk(self):
+        q_tokens = _turkish_tokenize("sözleşme")
+        assert _silver_lexical_score(q_tokens, "") == pytest.approx(0.0)
+
+
+class TestSilverLabelingStrategy:
+    """Tests for silver lexical labeling (strategy 3.5)."""
+
+    # Long texts with meaningful content
+    _CHUNK_FESHI = (
+        "MADDE 44 – Sözleşmenin feshi halinde tarafların yükümlülükleri sona erer. "
+        "Taraflardan biri sözleşmeyi haksız yere feshederse tazminat ödemekle yükümlüdür. "
+        "Fesih bildirimi yazılı şekilde yapılmalıdır. Süre kısıtlamaları uygulanır." * 2
+    )
+    _CHUNK_MIRAS = (
+        "MADDE 45 – Miras bırakanın ölümü üzerine mirasçılar hak sahibi olur. "
+        "Yasal mirasçılar ile atanmış mirasçılar arasındaki ilişkiler bu kanunla düzenlenir. "
+        "Miras payları kanunda belirtilen oranlara göre belirlenir." * 2
+    )
+    _CHUNK_GENEL = (
+        "Bu genel hüküm birden fazla konuyu kapsamaktadır. "
+        "Kanunun genel uygulaması bu madde çerçevesinde değerlendirilir. "
+        "Özel hükümler saklı kalmak kaydıyla genel hükümler uygulanır." * 3
+    )
+
+    def _make_corpus(self):
+        return [
+            _chunk("c_feshi", "doc_1", self._CHUNK_FESHI, "TestLaw"),
+            _chunk("c_miras", "doc_2", self._CHUNK_MIRAS, "TestLaw"),
+            _chunk("c_genel", "doc_3", self._CHUNK_GENEL, "TestLaw"),
+        ]
+
+    def test_silver_disabled_by_default(self):
+        """silver labeling must be off by default."""
+        import config as cfg
+        assert getattr(cfg, "RELEVANCE_SILVER_LEXICAL", False) is False
+
+    def test_silver_labels_best_matching_chunk(self, monkeypatch):
+        """With silver enabled, the chunk with most question tokens should be labeled."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "RELEVANCE_SILVER_LEXICAL", True)
+        monkeypatch.setattr(cfg, "SILVER_TOP_M", 1)
+        monkeypatch.setattr(cfg, "SILVER_THRESHOLD", 0.05)
+
+        corpus = self._make_corpus()
+        # question contains "feshi" — should match c_feshi
+        qa = [_qa("q1", question="sözleşmenin feshi tazminat yükümlülük", source="TestLaw")]
+        rel_map = DataProcessor.build_relevant_chunk_map(corpus, qa)
+        assert "c_feshi" in rel_map.get("q1", [])
+
+    def test_silver_below_threshold_unlabeled(self, monkeypatch):
+        """Chunks scoring below SILVER_THRESHOLD must not be labeled."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "RELEVANCE_SILVER_LEXICAL", True)
+        monkeypatch.setattr(cfg, "SILVER_TOP_M", 3)
+        # Use a query with tokens that cannot appear in any chunk (random unique words)
+        monkeypatch.setattr(cfg, "SILVER_THRESHOLD", 0.99)
+
+        corpus = self._make_corpus()
+        # "xyzabc123def" won't be in any chunk — score will be 0.0 < 0.99
+        qa = [_qa("q1", question="xyzabc123def zzznomatch999", source="TestLaw")]
+        rel_map = DataProcessor.build_relevant_chunk_map(corpus, qa)
+        assert rel_map.get("q1", []) == []
+
+    def test_silver_top_m_respected(self, monkeypatch):
+        """Silver must label at most SILVER_TOP_M chunks."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "RELEVANCE_SILVER_LEXICAL", True)
+        monkeypatch.setattr(cfg, "SILVER_TOP_M", 2)
+        monkeypatch.setattr(cfg, "SILVER_THRESHOLD", 0.0)
+
+        corpus = self._make_corpus()
+        qa = [_qa("q1", question="sözleşme miras hüküm", source="TestLaw")]
+        rel_map = DataProcessor.build_relevant_chunk_map(corpus, qa)
+        assert len(rel_map.get("q1", [])) <= 2
+
+    def test_silver_tagged_in_coverage(self, monkeypatch):
+        """return_coverage must count silver-labeled queries in by_strategy."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "RELEVANCE_SILVER_LEXICAL", True)
+        monkeypatch.setattr(cfg, "SILVER_TOP_M", 1)
+        monkeypatch.setattr(cfg, "SILVER_THRESHOLD", 0.0)
+
+        corpus = self._make_corpus()
+        qa = [_qa("q1", question="feshi tazminat", source="TestLaw")]
+        _, cov = DataProcessor.build_relevant_chunk_map(corpus, qa, return_coverage=True)
+        assert cov["by_strategy"]["silver_lexical"] >= 1
+
+    def test_article_label_beats_silver(self, monkeypatch):
+        """When article-level label is available, silver must NOT override it."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "RELEVANCE_SILVER_LEXICAL", True)
+        monkeypatch.setattr(cfg, "SILVER_TOP_M", 3)
+        monkeypatch.setattr(cfg, "SILVER_THRESHOLD", 0.0)
+
+        corpus = self._make_corpus()
+        # Article 44 is in c_feshi
+        qa = [_qa("q1", question="madde 44 feshi tazminat", source="TestLaw")]
+        _, cov = DataProcessor.build_relevant_chunk_map(corpus, qa, return_coverage=True)
+        # Should be labeled as "article", not "silver_lexical"
+        assert cov["by_strategy"]["article"] == 1
+        assert cov["by_strategy"]["silver_lexical"] == 0
