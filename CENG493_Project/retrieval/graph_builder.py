@@ -202,8 +202,12 @@ def build_graph_from_metadata(
     # cinfo: chunk_id → (madde_no, sub_idx)
     cinfo: dict[str, tuple[str | None, int | None]] = {}
 
+    seen_ids: set[str] = set()
     for rec in metadata:
         cid, src, did = rec["chunk_id"], rec["source"], rec["doc_id"]
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
         mn, si = _extract_madde_no(rec)
         cinfo[cid] = (mn, si)
         if mn is not None:
@@ -228,6 +232,8 @@ def build_graph_from_metadata(
                 nxt = numeric_nums[i + 1]
                 for a in mm[mn]:
                     for b in mm[nxt]:
+                        if a == b:
+                            continue
                         edges[a].add((b, "adj"))
                         edges[b].add((a, "adj"))
             # Sub-chunk adjacency within same madde (e.g. long article split into pieces).
@@ -238,11 +244,17 @@ def build_graph_from_metadata(
                     key=lambda c: cinfo[c][1] if cinfo[c][1] is not None else -1,
                 )
                 for j in range(len(ordered) - 1):
+                    if ordered[j] == ordered[j + 1]:
+                        continue
                     edges[ordered[j]].add((ordered[j + 1], "adj"))
                     edges[ordered[j + 1]].add((ordered[j], "adj"))
 
+    done_ids: set[str] = set()
     for rec in metadata:
         cid, src = rec["chunk_id"], rec["source"]
+        if cid in done_ids:
+            continue
+        done_ids.add(cid)
         text = rec.get("text", "")
         if not text:
             continue
@@ -269,7 +281,7 @@ def build_graph_from_metadata(
     }
 
     lookup_ser: dict[str, list[str]] = {
-        f"{s}||{m}": cids for (s, m), cids in src_madde.items()
+        f"{s}||{m}": list(dict.fromkeys(cids)) for (s, m), cids in src_madde.items()
     }
     graph["_source_madde_lookup"] = lookup_ser  # type: ignore[assignment]
 
