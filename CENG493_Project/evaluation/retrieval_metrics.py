@@ -94,6 +94,10 @@ def compute_all_metrics(results: list[dict]) -> dict:  # noqa: C901
         qrels_dict[qid] = {str(doc_id): 1 for doc_id in relevant}
         # Score by inverse rank so ranx sorts correctly
         run_dict[qid] = {str(doc_id): 1.0 / (rank + 1) for rank, doc_id in enumerate(retrieved)}
+        if not run_dict[qid]:
+            # ranx crashes on an empty run entry; a single non-relevant
+            # placeholder doc scores the query as 0 on every metric.
+            run_dict[qid] = {"__no_retrieval__": 1.0}
 
     if not qrels_dict:
         return {"recall_at_5": 0.0, "recall_at_10": 0.0, "mrr": 0.0, "ndcg_at_10": 0.0, "source_hit_at_5": 0.0, "source_hit_at_10": 0.0, "capped_recall_at_5": 0.0, "capped_recall_at_10": 0.0, "precision_at_5": 0.0, "precision_at_10": 0.0, "num_queries": 0, "total_queries": total_queries}

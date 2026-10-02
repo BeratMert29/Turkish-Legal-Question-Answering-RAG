@@ -61,13 +61,12 @@ class TestEdgeCases:
         assert result["num_queries"] == 0
         assert result["total_queries"] == 2
 
-    def test_empty_retrieved_list_raises(self):
-        # ranx Run({qid: {}}) raises ValueError when retrieved is empty;
-        # this documents the current upstream limitation — do not call
-        # compute_all_metrics with an empty retrieved list.
+    def test_empty_retrieved_list_scores_zero(self):
         results = _single("q1", retrieved=[], relevant=["c1"])
-        with pytest.raises((ValueError, Exception)):
-            compute_all_metrics(results)
+        result = compute_all_metrics(results)
+        assert result["num_queries"] == 1
+        assert result["recall_at_5"] == 0.0
+        assert result["mrr"] == 0.0
 
 
 # ---------------------------------------------------------------------------
