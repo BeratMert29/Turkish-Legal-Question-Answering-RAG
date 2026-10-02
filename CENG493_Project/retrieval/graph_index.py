@@ -2,12 +2,49 @@
 
 import json
 import logging
+import re
 from collections import deque
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 _DEFAULT_DECAY: dict[str, float] = {"adj": 0.85, "intra": 0.70, "cross": 0.60}
+
+# ── direct madde lookup patterns ──────────────────────────────────────────
+
+# "5237 sayılı Türk Ceza Kanununda" — captures kanun_no and law name.
+_QUERY_KANUN_RE = re.compile(
+    r"(\d{2,5})\s*sayılı\s+"
+    r"([A-Za-zÇĞİÖŞÜçğıöşü .\-']+?)\s+"
+    r"(?:Kanunu?|Yasası?)[a-zçğıöşü]*",
+)
+
+# "madde 86" / "MADDE 86" — used in the window after a law reference, or standalone.
+_QUERY_MADDE_NUM_RE = re.compile(r"(?:madde|MADDE)\s*(\d{1,4})", re.IGNORECASE)
+
+# Common Turkish law abbreviations → normalized source name.
+_LAW_ABBREVS: dict[str, str] = {
+    "TCK": "Türk Ceza Kanunu",
+    "CMK": "Ceza Muhakemesi Kanunu",
+    "TMK": "Türk Medeni Kanunu",
+    "TBK": "Türk Borçlar Kanunu",
+    "HMK": "Hukuk Muhakemeleri Kanunu",
+    "TTK": "Türk Ticaret Kanunu",
+    "İYUK": "İdari Yargılama Usulü Kanunu",
+    "İİK": "İcra ve İflas Kanunu",
+    "DMK": "Devlet Memurları Kanunu",
+    "Anayasa": "Türkiye Cumhuriyeti Anayasası",
+}
+
+# "TCK madde 86" or "TCK 86. madde"
+_ABBREV_MADDE_RE = re.compile(
+    r"\b(TCK|CMK|TMK|TBK|HMK|TTK|İYUK|İİK|DMK|Anayasa)\b"
+    r"[^\n]{0,60}"
+    r"(?:(?:madde|MADDE)\s*(\d{1,4})|(\d{1,4})\s*\.?\s*madde)",
+    re.IGNORECASE,
+)
+
+_LOOKUP_WINDOW = 250  # chars after law name to search for madde number
 
 
 class GraphIndex:
@@ -16,6 +53,7 @@ class GraphIndex:
     def __init__(self, graph_path: str | Path, metadata_path: str | Path) -> None:
         self._graph: dict[str, list[tuple[str, str]]] = {}
         self._chunk_meta: dict[str, dict] = {}
+        self._source_madde_lookup: dict[str, list[str]] = {}
         self._load_graph(Path(graph_path))
         self._load_metadata(Path(metadata_path))
 
@@ -23,9 +61,15 @@ class GraphIndex:
         with path.open(encoding="utf-8") as fh:
             raw: dict = json.load(fh)
         for key, edges in raw.items():
-            if key.startswith("_"):
-                continue
-            self._graph[key] = [(nb_id, kind) for nb_id, kind in edges]
+            if key == "_source_madde_lookup":
+                # Store lookup table; values may be lists or dicts depending on
+                # serialisation format.
+                self._source_madde_lookup = {
+                    k: (v if isinstance(v, list) else list(v))
+                    for k, v in edges.items()
+                }
+            elif not key.startswith("_"):
+                self._graph[key] = [(nb_id, kind) for nb_id, kind in edges]
 
     def _load_metadata(self, path: Path) -> None:
         with path.open(encoding="utf-8") as fh:
@@ -43,6 +87,78 @@ class GraphIndex:
                     "source": record.get("source", ""),
                 }
 
+    # ── direct madde injection ────────────────────────────────────────────
+
+    def inject_from_query(self, query: str, exclude: "set[str] | None" = None) -> list[dict]:
+        """Return chunks for articles explicitly referenced in *query*.
+
+        Recognises two patterns:
+
+        * Canonical: ``"5237 sayılı Türk Ceza Kanununda … madde 86"``
+        * Abbreviation: ``"TCK madde 86"`` / ``"TCK 86. madde"``
+
+        Only active when ``config.DIRECT_MADDE_LOOKUP_ENABLED`` is True
+        (default False).  Returns ``[]`` when the lookup table is empty or
+        the flag is off.
+        """
+        try:
+            import config as _cfg
+            if not getattr(_cfg, "DIRECT_MADDE_LOOKUP_ENABLED", False):
+                return []
+        except ImportError:
+            return []
+
+        if not self._source_madde_lookup:
+            return []
+
+        if exclude is None:
+            exclude = set()
+
+        from retrieval.graph_builder import _resolve_cross_source
+
+        results: list[dict] = []
+        seen: set[str] = set(exclude)
+
+        def _add_chunks(source: str, madde_no: str) -> None:
+            key = f"{source}||{madde_no}"
+            for cid in self._source_madde_lookup.get(key, []):
+                if cid in seen:
+                    continue
+                meta = self._chunk_meta.get(cid)
+                if meta:
+                    results.append({
+                        "chunk_id": cid,
+                        "text": meta["text"],
+                        "doc_id": meta["doc_id"],
+                        "source": meta["source"],
+                        "score": 1.0,  # injected directly, no retrieval score
+                    })
+                    seen.add(cid)
+
+        # Pattern A: "N sayılı ... Kanunu ... madde M"
+        for lm in _QUERY_KANUN_RE.finditer(query):
+            kno = lm.group(1)
+            kname = lm.group(2).strip()
+            src = _resolve_cross_source(kno, kname)
+            if src:
+                window = query[lm.end(): lm.end() + _LOOKUP_WINDOW]
+                mm = _QUERY_MADDE_NUM_RE.search(window)
+                if mm:
+                    _add_chunks(src, mm.group(1))
+
+        # Pattern B: abbreviation like "TCK madde 86" / "TCK 86. madde"
+        for am in _ABBREV_MADDE_RE.finditer(query):
+            abbrev = am.group(1).upper()
+            src = _LAW_ABBREVS.get(abbrev)
+            if src:
+                madde_no = am.group(2) or am.group(3)
+                if madde_no:
+                    _add_chunks(src, madde_no)
+
+        return results
+
+    # ── graph expansion ───────────────────────────────────────────────────
+
     def expand(
         self,
         chunks: list[dict],
@@ -50,12 +166,20 @@ class GraphIndex:
         budget: int = 3,
         kinds: tuple[str, ...] = ("adj", "intra", "cross"),
         decay: dict[str, float] | None = None,
+        query: "str | None" = None,
     ) -> list[dict]:
         if decay is None:
             decay = _DEFAULT_DECAY
 
         seen: set[str] = {c["chunk_id"] for c in chunks}
-        added: list[dict] = []
+
+        # Inject directly-referenced article chunks first (when enabled).
+        injected: list[dict] = []
+        if query is not None:
+            injected = self.inject_from_query(query, exclude=seen)
+            seen.update(c["chunk_id"] for c in injected)
+
+        added: list[dict] = list(injected)
         remaining_budget = budget
 
         sorted_chunks = sorted(chunks, key=lambda c: c["score"], reverse=True)
@@ -96,10 +220,13 @@ class GraphIndex:
         budget: int = 3,
         kinds: tuple[str, ...] = ("adj", "intra", "cross"),
         decay: dict[str, float] | None = None,
+        queries: "list[str] | None" = None,
     ) -> list[list[dict]]:
+        if queries is None:
+            queries = [None] * len(batch)  # type: ignore[list-item]
         return [
-            self.expand(chunks, hops=hops, budget=budget, kinds=kinds, decay=decay)
-            for chunks in batch
+            self.expand(chunks, hops=hops, budget=budget, kinds=kinds, decay=decay, query=q)
+            for chunks, q in zip(batch, queries)
         ]
 
     @classmethod

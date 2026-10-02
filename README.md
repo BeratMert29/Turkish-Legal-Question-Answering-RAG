@@ -294,6 +294,48 @@ All settings are in `config.py`. Key values:
 
 ---
 
+## Retrieval Evaluation Notes
+
+### Why source-level metrics are primary
+
+The HMGS gold test set (161 questions) contains Turkish bar-exam questions whose
+ground-truth relevance cannot be determined at chunk level: the questions do not
+mention a specific law article in most cases, and the correct answer text is not
+verbatim in any corpus chunk.  Assigning arbitrary corpus chunks as "relevant"
+(e.g. the first N chunks of the source law) inflates Recall/MRR/NDCG with
+invented ground-truth.
+
+Instead, two tiers of retrieval metrics are reported:
+
+**Primary — source-level (all queries with a known gold law):**
+- `source_hit@5` / `source_hit@10`: fraction of queries where ≥1 top-k chunk is
+  from the correct law
+- `source_MRR`: mean reciprocal rank of the first chunk from the gold law
+- `source_precision@5`: mean fraction of top-5 chunks from the gold law
+- Covers all 161 HMGS queries (and all Kaggle queries that have a `source` field)
+
+**Secondary — chunk-level (gold-labeled subset only):**
+- Recall@5/10, MRR, nDCG@10 computed only for the subset of queries that have
+  verifiable article-level ground-truth (n is printed per stage; for HMGS this
+  is typically 1–2 queries).  Treat these numbers as indicative, not definitive.
+
+### Silver lexical labels (optional)
+
+To improve chunk-level coverage on HMGS, a "silver" labeling strategy is
+available.  It ranks corpus chunks within the gold law by normalized token
+overlap with the question and answer, then labels the top-m above a threshold.
+Labels are heuristic (not gold-standard) and are kept separate in coverage stats.
+
+Enable in `CENG493_Project/config.py`:
+
+```python
+RELEVANCE_SILVER_LEXICAL = True  # default: False
+SILVER_TOP_M = 3                 # chunks labeled per query
+SILVER_THRESHOLD = 0.10          # minimum token-overlap score
+```
+
+---
+
 ## Tech Stack
 
 - **Python 3.11**, PyTorch, HuggingFace (transformers, PEFT, TRL, sentence-transformers)

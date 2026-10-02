@@ -73,6 +73,11 @@ GRAPH_NEIGHBOR_BUDGET = 3
 GRAPH_EDGE_KINDS = ("adj", "intra", "cross")
 GRAPH_DECAY = {"adj": 0.85, "intra": 0.70, "cross": 0.60}
 
+# Direct madde lookup: when True, queries that explicitly reference a law article
+# (e.g. "TCK 86. madde") inject that article's chunks via _source_madde_lookup.
+# Disabled by default; enable only after verifying graph quality on your index.
+DIRECT_MADDE_LOOKUP_ENABLED = False
+
 # LLM (Ollama — free, no API key)
 LLM_MODEL = "qwen2.5:14b"
 LLM_FINETUNED_MODEL = "qwen25-legal-ft"   # created by scripts/13_export_lora_to_ollama.py
@@ -87,6 +92,9 @@ KAGGLE_MIN_SCORE = 6
 
 # Evaluation
 HALLUCINATION_SAMPLE_SIZE = 150
+# Number of predictions sampled for each LLM-judge metric call.
+# Increase for higher-fidelity estimates (at the cost of more Ollama calls).
+LLM_JUDGE_SAMPLE_SIZE = 20
 
 # Hallucination stratification thresholds (applied to top-1 retrieval score)
 HALLUCINATION_HIT_THRESHOLD = 0.7
@@ -104,4 +112,12 @@ MAX_STRATEGY3_RELEVANT = 20
 
 # Custom corpus / benchmark support
 CUSTOM_CORPUS_FILE = "corpus_chunks_custom.jsonl"
+
+# Silver lexical labeling (strategy 3.5) — off by default.
+# When True, queries with no article-level label receive up to SILVER_TOP_M
+# chunks scored by normalized token overlap with (question + answer), restricted
+# to the gold source law and above SILVER_THRESHOLD.  Tagged label_strategy="silver_lexical".
+RELEVANCE_SILVER_LEXICAL: bool = False
+SILVER_TOP_M: int = 3
+SILVER_THRESHOLD: float = 0.10
 SUPPORTED_DOC_EXTENSIONS = (".txt", ".pdf")
