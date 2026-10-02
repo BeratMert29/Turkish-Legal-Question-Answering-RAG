@@ -55,7 +55,7 @@ import config
 from data.data_processor import DataProcessor, CorpusChunk, QAExample
 from evaluation.hallucination import run_hallucination_analysis, stratified_sample
 from evaluation.qa_metrics import compute_all_qa_metrics_with_citation
-from evaluation.retrieval_metrics import compute_all_metrics
+from evaluation.retrieval_metrics import compute_all_metrics, compute_source_hit_metrics
 from evaluation.llm_judge import (
     llm_judge_answer,
     llm_judge_faithfulness,
@@ -302,6 +302,8 @@ def run_stage(
     reranker_cache: dict,
     relevant_map: dict,
     short_answer_mode: bool,
+    eval_set_name: str = "hmgs",
+    labeling_coverage: Optional[dict] = None,
 ) -> dict:
     """Run a single stage. Returns the final_results dict (same schema as run_baseline)."""
 
@@ -396,11 +398,26 @@ def run_stage(
             "query_id": qa.query_id,
             "relevant": relevant_map.get(qa.query_id, []),
             "retrieved": deduped,
+            # source_law + retrieved_sources enable law-level metrics for ALL queries
+            # (including HMGS queries that are unlabeled at article level)
+            "source_law": qa.source,
+            "retrieved_sources": [c.get("source", "") for c in chunks],
         })
         full_retrieved[qa.query_id] = chunks
 
     retrieval_metrics = compute_all_metrics(metric_input)
-    print(f"    R@5={retrieval_metrics.get('recall_at_5',0):.4f}  "
+    source_metrics = compute_source_hit_metrics(metric_input)
+    _n_src = source_metrics.get("source_labeled_queries", 0)
+    _n_gold = retrieval_metrics.get("num_queries", 0)
+    # PRIMARY: source-level (all queries with known law)
+    print(f"    [PRIMARY] SourceHit@5={source_metrics.get('source_hit_at_5_all',0):.4f}  "
+          f"SourceHit@10={source_metrics.get('source_hit_at_10_all',0):.4f}  "
+          f"SourceMRR={source_metrics.get('source_mrr_all',0):.4f}  "
+          f"SourcePrec@5={source_metrics.get('source_precision_at_5_all',0):.4f}  "
+          f"[n={_n_src}]")
+    # SECONDARY: chunk-level (gold-labeled subset only)
+    print(f"    [chunk-level, gold-labeled subset n={_n_gold}]  "
+          f"R@5={retrieval_metrics.get('recall_at_5',0):.4f}  "
           f"R@10={retrieval_metrics.get('recall_at_10',0):.4f}  "
           f"MRR={retrieval_metrics.get('mrr',0):.4f}  "
           f"nDCG@10={retrieval_metrics.get('ndcg_at_10',0):.4f}")
@@ -538,6 +555,7 @@ def run_stage(
     llm_relevancy_score = None
     llm_coherence_score = None
     llm_faithfulness_score = None
+    llm_judge_parse_failures: Optional[dict] = None
     try:
         judge_preds = [
             {**p, "question": next(
@@ -546,18 +564,31 @@ def run_stage(
             )}
             for p in predictions
         ]
-        judge_result     = llm_judge_answer(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
-        faith_result     = llm_judge_faithfulness(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
-        relev_result     = llm_judge_relevancy(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
-        coher_result     = llm_judge_coherence(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
+        _judge_sample = getattr(config, "LLM_JUDGE_SAMPLE_SIZE", 20)
+        judge_result     = llm_judge_answer(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=_judge_sample, results_dir=stage.results_dir)
+        faith_result     = llm_judge_faithfulness(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=_judge_sample, results_dir=stage.results_dir)
+        relev_result     = llm_judge_relevancy(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=_judge_sample, results_dir=stage.results_dir)
+        coher_result     = llm_judge_coherence(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=_judge_sample, results_dir=stage.results_dir)
         llm_judge_score          = judge_result["score"]
         llm_faithfulness_score   = faith_result["score"]
         llm_relevancy_score      = relev_result["score"]
         llm_coherence_score      = coher_result["score"]
-        print(f"    LLM Judge Answer={llm_judge_score:.4f}  "
-              f"Faith={llm_faithfulness_score:.4f}  "
-              f"Relev={llm_relevancy_score:.4f}  "
-              f"Coher={llm_coherence_score:.4f}")
+        llm_judge_parse_failures = {
+            "answer":       judge_result.get("parse_fail_count", 0),
+            "faithfulness": faith_result.get("parse_fail_count", 0),
+            "relevancy":    relev_result.get("parse_fail_count", 0),
+            "coherence":    coher_result.get("parse_fail_count", 0),
+        }
+        _fmt = lambda v: f"{v:.4f}" if v is not None else "N/A"
+        print(f"    LLM Judge Answer={_fmt(llm_judge_score)}  "
+              f"Faith={_fmt(llm_faithfulness_score)}  "
+              f"Relev={_fmt(llm_relevancy_score)}  "
+              f"Coher={_fmt(llm_coherence_score)}")
+        for _name, _res in [("answer", judge_result), ("faithfulness", faith_result),
+                             ("relevancy", relev_result), ("coherence", coher_result)]:
+            if _res.get("parse_fail_count", 0):
+                print(f"    WARNING: {_res['parse_fail_count']}/{_res['sample_size']} "
+                      f"{_name} judge responses failed to parse")
     except Exception as exc:
         print(f"    WARNING: LLM Judge failed: {exc}")
 
@@ -598,6 +629,8 @@ def run_stage(
         "hyperparameters": {
             "stage": stage_key,
             "stage_name": stage.name,
+            "eval_set": eval_set_name,
+            "eval_n": len(qa_examples),
             "embedding_model": (config.FINETUNED_EMBEDDING_MODEL
                                 if stage.embedding == "finetuned"
                                 else config.EMBEDDING_MODEL),
@@ -609,7 +642,24 @@ def run_stage(
             "top_k_retrieval": config.TOP_K_RETRIEVAL,
             "top_k_for_generation": config.TOP_K_FOR_GENERATION,
         },
+        # headline_metrics: the primary metrics used for stage comparison.
+        # source-level metrics cover all queries with a known gold law (e.g. all 161 HMGS).
+        # chunk-level recall/MRR/NDCG are reported separately, restricted to the
+        # gold-labeled subset (n=num_queries) where article-level ground-truth exists.
+        "headline_metrics": {
+            "source_hit_at_5":       source_metrics.get("source_hit_at_5_all"),
+            "source_hit_at_10":      source_metrics.get("source_hit_at_10_all"),
+            "source_mrr":            source_metrics.get("source_mrr_all"),
+            "source_precision_at_5": source_metrics.get("source_precision_at_5_all"),
+            "n_source_queries":      source_metrics.get("source_labeled_queries"),
+            "chunk_recall_at_5_gold_only":  retrieval_metrics.get("recall_at_5"),
+            "chunk_mrr_gold_only":          retrieval_metrics.get("mrr"),
+            "chunk_ndcg_at_10_gold_only":   retrieval_metrics.get("ndcg_at_10"),
+            "n_gold_labeled":               retrieval_metrics.get("num_queries"),
+        },
         "retrieval_metrics": retrieval_metrics,
+        "source_hit_metrics": source_metrics,
+        "labeling_coverage": labeling_coverage,
         "qa_metrics": qa_metrics,
         "hallucination_summary": hall.get("summary", {}),
         "faithfulness_rate": faithful_rate,
@@ -617,6 +667,7 @@ def run_stage(
         "llm_faithfulness_score": llm_faithfulness_score,
         "llm_relevancy_score": llm_relevancy_score,
         "llm_coherence_score": llm_coherence_score,
+        "llm_judge_parse_failures": llm_judge_parse_failures,
         "semantic_similarity": sem_sim,
         "scenario1_score": scenario_scores["scenario1"],
         "scenario2_score": scenario_scores["scenario2"],
@@ -643,7 +694,15 @@ def run_stage(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_ablation_table(results: dict[str, dict]) -> None:
-    """Print a markdown-compatible ablation table to stdout."""
+    """Print two markdown-compatible ablation tables to stdout.
+
+    Table 1 (PRIMARY) — source-level retrieval metrics covering all queries with
+    a known gold law, plus QA and judge metrics.
+
+    Table 2 (SECONDARY) — chunk-level recall/MRR/NDCG restricted to the
+    gold-labeled subset (where article-level ground-truth exists).  The actual
+    n is printed per-stage to make the scope of these numbers explicit.
+    """
 
     def _pct(v) -> str:
         return f"{v*100:.1f}%" if isinstance(v, (int, float)) else "N/A"
@@ -651,39 +710,74 @@ def print_ablation_table(results: dict[str, dict]) -> None:
     def _f4(v) -> str:
         return f"{v:.4f}" if isinstance(v, (int, float)) else "N/A"
 
-    header = (
-        f"| {'Stage':<26} | {'R@5':>6} | {'R@10':>6} | {'MRR':>6} | "
-        f"{'nDCG@10':>7} | {'F1':>6} | {'ROUGE-L':>7} | {'Citation':>8} | {'Faith.':>7} | "
-        f"{'LLM-J':>6} | {'SemSim':>7} | {'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
+    # ── Table 1: PRIMARY (source-level + QA) ──────────────────────────────────
+    h1 = (
+        f"| {'Stage':<26} | {'SrcHit@5':>8} | {'SrcHit@10':>9} | {'SrcMRR':>7} | "
+        f"{'SrcPrec@5':>9} | {'n_src':>6} | "
+        f"{'F1':>6} | {'Contain':>7} | {'ROUGE-L':>7} | {'Citation':>8} | "
+        f"{'Faith.':>7} | {'LLM-J':>6} | {'SemSim':>7} |"
     )
-    sep = "|" + "|".join(["-"*w for w in [28, 8, 8, 8, 9, 8, 9, 10, 9, 8, 9, 9, 9, 9]]) + "|"
+    sep1 = "|" + "|".join(["-"*w for w in [28,10,11,9,11,8,8,9,9,10,9,8,9]]) + "|"
 
-    print("\n\n" + "="*120)
-    print("  ABLATION TABLE")
-    print("="*120)
-    print(header)
-    print(sep)
+    print("\n\n" + "="*140)
+    print("  PRIMARY ABLATION TABLE  (source-level retrieval — all queries with known law)")
+    print("="*140)
+    print(h1)
+    print(sep1)
+
+    for stage_key in DEFAULT_STAGE_ORDER:
+        if stage_key not in results:
+            continue
+        r = results[stage_key]
+        sm = r.get("source_hit_metrics", r.get("headline_metrics", {}))
+        qa = r.get("qa_metrics", {})
+        stage_name = r.get("hyperparameters", {}).get("stage_name", stage_key)
+        n_src = sm.get("source_labeled_queries", sm.get("n_source_queries", "?"))
+        print(
+            f"| {stage_name:<26} | {_f4(sm.get('source_hit_at_5_all', sm.get('source_hit_at_5'))):>8} | "
+            f"{_f4(sm.get('source_hit_at_10_all', sm.get('source_hit_at_10'))):>9} | "
+            f"{_f4(sm.get('source_mrr_all', sm.get('source_mrr'))):>7} | "
+            f"{_f4(sm.get('source_precision_at_5_all', sm.get('source_precision_at_5'))):>9} | "
+            f"{str(n_src):>6} | "
+            f"{_pct(qa.get('f1')):>6} | "
+            f"{_pct(qa.get('answer_containment')):>7} | "
+            f"{_pct(qa.get('rouge_l')):>7} | "
+            f"{_pct(qa.get('citation_accuracy')):>8} | "
+            f"{_pct(r.get('faithfulness_rate')):>7} | "
+            f"{_f4(r.get('llm_judge_score')):>6} | "
+            f"{_f4(r.get('semantic_similarity')):>7} |"
+        )
+    print("="*140 + "\n")
+
+    # ── Table 2: SECONDARY (chunk-level, gold-labeled subset) ─────────────────
+    h2 = (
+        f"| {'Stage':<26} | {'R@5':>6} | {'R@10':>6} | {'MRR':>6} | "
+        f"{'nDCG@10':>7} | {'n_gold':>7} | {'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
+    )
+    sep2 = "|" + "|".join(["-"*w for w in [28, 8, 8, 8, 9, 9, 9, 9, 9]]) + "|"
+
+    print("="*100)
+    print("  SECONDARY TABLE  (chunk-level — gold-labeled subset only; n_gold may be small for HMGS)")
+    print("="*100)
+    print(h2)
+    print(sep2)
 
     for stage_key in DEFAULT_STAGE_ORDER:
         if stage_key not in results:
             continue
         r = results[stage_key]
         ret = r.get("retrieval_metrics", {})
-        qa = r.get("qa_metrics", {})
+        n_gold = ret.get("num_queries", "?")
         stage_name = r.get("hyperparameters", {}).get("stage_name", stage_key)
         print(
             f"| {stage_name:<26} | {_f4(ret.get('recall_at_5')):>6} | "
             f"{_f4(ret.get('recall_at_10')):>6} | {_f4(ret.get('mrr')):>6} | "
-            f"{_f4(ret.get('ndcg_at_10')):>7} | {_pct(qa.get('f1')):>6} | "
-            f"{_pct(qa.get('rouge_l')):>7} | {_pct(qa.get('citation_accuracy')):>8} | "
-            f"{_pct(r.get('faithfulness_rate')):>7} | "
-            f"{_f4(r.get('llm_judge_score')):>6} | "
-            f"{_f4(r.get('semantic_similarity')):>7} | "
+            f"{_f4(ret.get('ndcg_at_10')):>7} | {str(n_gold):>7} | "
             f"{_f4(r.get('scenario1_score')):>7} | "
             f"{_f4(r.get('scenario2_score')):>7} | "
             f"{_f4(r.get('scenario3_score')):>7} |"
         )
-    print("="*120 + "\n")
+    print("="*100 + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -701,8 +795,19 @@ def main() -> None:
              f"Options: {', '.join(DEFAULT_STAGE_ORDER)}",
     )
     parser.add_argument(
-        "--dataset", choices=["kaggle", "hmgs"], default="kaggle",
-        help="Evaluation dataset (default: kaggle, 300 questions).",
+        "--eval-set", "--dataset",
+        dest="eval_set",
+        choices=["kaggle", "hmgs"],
+        default="hmgs",
+        help=(
+            "Evaluation dataset for ALL stages (default: hmgs, ~161 questions). "
+            "Use 'kaggle' for the Kaggle-split eval set (~300 questions). "
+            "All stages in a single run MUST use the same eval set so that "
+            "ablation comparisons are valid.  Previously, different invocations "
+            "used different datasets (base/hybrid/rrf/rrf_rerank with hmgs n=161 "
+            "and llm_ft/emb_ft/full with kaggle n=300), making cross-stage "
+            "comparisons invalid.  This flag enforces a single dataset per run."
+        ),
     )
     parser.add_argument(
         "--list-stages", action="store_true",
@@ -785,7 +890,7 @@ def main() -> None:
         sys.exit("ERROR: No valid stages to run.")
 
     print(f"\n🚀  Stages to run: {', '.join(valid)}")
-    print(f"   Dataset: {args.dataset}\n")
+    print(f"   Eval set: {args.eval_set}\n")
 
     # ── Check Ollama ───────────────────────────────────────────────────────
     if not check_ollama(config.LLM_BASE_URL, config.LLM_MODEL):
@@ -816,8 +921,8 @@ def main() -> None:
         print(f"  QA source     : {args.eval_data} (external evaluator format)")
         qa_examples, short_answer_mode = _load_external_qa(Path(args.eval_data))
     else:
-        short_answer_mode = (args.dataset == "hmgs")
-        if args.dataset == "hmgs":
+        short_answer_mode = (args.eval_set == "hmgs")
+        if args.eval_set == "hmgs":
             qa_examples = DataProcessor.build_gold_eval_set()
         else:
             if not args.corpus:
@@ -834,7 +939,14 @@ def main() -> None:
     print(f"  Corpus: {len(corpus_chunks)} chunks  |  QA: {len(qa_examples)} examples")
 
     # ── Ground-truth relevance map (shared) ───────────────────────────────
-    relevant_map = DataProcessor.build_relevant_chunk_map(corpus_chunks, qa_examples)
+    relevant_map, labeling_coverage = DataProcessor.build_relevant_chunk_map(
+        corpus_chunks, qa_examples, return_coverage=True
+    )
+    print(
+        f"  Labeling coverage: {labeling_coverage['labeled']}/{labeling_coverage['total']} labeled "
+        f"(unlabeled={labeling_coverage['unlabeled']}) "
+        f"by_strategy={labeling_coverage['by_strategy']}"
+    )
 
     # ── Shared caches (avoid reloading models between stages) ─────────────
     embedder_cache: dict = {}
@@ -856,6 +968,8 @@ def main() -> None:
                 reranker_cache=reranker_cache,
                 relevant_map=relevant_map,
                 short_answer_mode=short_answer_mode,
+                eval_set_name=args.eval_set if not args.eval_data else "external",
+                labeling_coverage=labeling_coverage,
             )
             all_results[key] = result
         except KeyboardInterrupt:
