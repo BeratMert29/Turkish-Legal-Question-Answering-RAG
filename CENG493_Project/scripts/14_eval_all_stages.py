@@ -407,14 +407,20 @@ def run_stage(
 
     retrieval_metrics = compute_all_metrics(metric_input)
     source_metrics = compute_source_hit_metrics(metric_input)
-    print(f"    R@5={retrieval_metrics.get('recall_at_5',0):.4f}  "
+    _n_src = source_metrics.get("source_labeled_queries", 0)
+    _n_gold = retrieval_metrics.get("num_queries", 0)
+    # PRIMARY: source-level (all queries with known law)
+    print(f"    [PRIMARY] SourceHit@5={source_metrics.get('source_hit_at_5_all',0):.4f}  "
+          f"SourceHit@10={source_metrics.get('source_hit_at_10_all',0):.4f}  "
+          f"SourceMRR={source_metrics.get('source_mrr_all',0):.4f}  "
+          f"SourcePrec@5={source_metrics.get('source_precision_at_5_all',0):.4f}  "
+          f"[n={_n_src}]")
+    # SECONDARY: chunk-level (gold-labeled subset only)
+    print(f"    [chunk-level, gold-labeled subset n={_n_gold}]  "
+          f"R@5={retrieval_metrics.get('recall_at_5',0):.4f}  "
           f"R@10={retrieval_metrics.get('recall_at_10',0):.4f}  "
           f"MRR={retrieval_metrics.get('mrr',0):.4f}  "
           f"nDCG@10={retrieval_metrics.get('ndcg_at_10',0):.4f}")
-    print(f"    SourceHit@5={source_metrics.get('source_hit_at_5_all',0):.4f}  "
-          f"SourceHit@10={source_metrics.get('source_hit_at_10_all',0):.4f}  "
-          f"SourcePrec@5={source_metrics.get('source_precision_at_5_all',0):.4f}  "
-          f"[n_src={source_metrics.get('source_labeled_queries',0)}]")
 
     # ── Generation ─────────────────────────────────────────────────────────
     print(f"  Generation with {llm_model} …")
@@ -636,6 +642,21 @@ def run_stage(
             "top_k_retrieval": config.TOP_K_RETRIEVAL,
             "top_k_for_generation": config.TOP_K_FOR_GENERATION,
         },
+        # headline_metrics: the primary metrics used for stage comparison.
+        # source-level metrics cover all queries with a known gold law (e.g. all 161 HMGS).
+        # chunk-level recall/MRR/NDCG are reported separately, restricted to the
+        # gold-labeled subset (n=num_queries) where article-level ground-truth exists.
+        "headline_metrics": {
+            "source_hit_at_5":       source_metrics.get("source_hit_at_5_all"),
+            "source_hit_at_10":      source_metrics.get("source_hit_at_10_all"),
+            "source_mrr":            source_metrics.get("source_mrr_all"),
+            "source_precision_at_5": source_metrics.get("source_precision_at_5_all"),
+            "n_source_queries":      source_metrics.get("source_labeled_queries"),
+            "chunk_recall_at_5_gold_only":  retrieval_metrics.get("recall_at_5"),
+            "chunk_mrr_gold_only":          retrieval_metrics.get("mrr"),
+            "chunk_ndcg_at_10_gold_only":   retrieval_metrics.get("ndcg_at_10"),
+            "n_gold_labeled":               retrieval_metrics.get("num_queries"),
+        },
         "retrieval_metrics": retrieval_metrics,
         "source_hit_metrics": source_metrics,
         "labeling_coverage": labeling_coverage,
@@ -673,7 +694,15 @@ def run_stage(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_ablation_table(results: dict[str, dict]) -> None:
-    """Print a markdown-compatible ablation table to stdout."""
+    """Print two markdown-compatible ablation tables to stdout.
+
+    Table 1 (PRIMARY) — source-level retrieval metrics covering all queries with
+    a known gold law, plus QA and judge metrics.
+
+    Table 2 (SECONDARY) — chunk-level recall/MRR/NDCG restricted to the
+    gold-labeled subset (where article-level ground-truth exists).  The actual
+    n is printed per-stage to make the scope of these numbers explicit.
+    """
 
     def _pct(v) -> str:
         return f"{v*100:.1f}%" if isinstance(v, (int, float)) else "N/A"
@@ -681,39 +710,74 @@ def print_ablation_table(results: dict[str, dict]) -> None:
     def _f4(v) -> str:
         return f"{v:.4f}" if isinstance(v, (int, float)) else "N/A"
 
-    header = (
-        f"| {'Stage':<26} | {'R@5':>6} | {'R@10':>6} | {'MRR':>6} | "
-        f"{'nDCG@10':>7} | {'F1':>6} | {'ROUGE-L':>7} | {'Citation':>8} | {'Faith.':>7} | "
-        f"{'LLM-J':>6} | {'SemSim':>7} | {'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
+    # ── Table 1: PRIMARY (source-level + QA) ──────────────────────────────────
+    h1 = (
+        f"| {'Stage':<26} | {'SrcHit@5':>8} | {'SrcHit@10':>9} | {'SrcMRR':>7} | "
+        f"{'SrcPrec@5':>9} | {'n_src':>6} | "
+        f"{'F1':>6} | {'Contain':>7} | {'ROUGE-L':>7} | {'Citation':>8} | "
+        f"{'Faith.':>7} | {'LLM-J':>6} | {'SemSim':>7} |"
     )
-    sep = "|" + "|".join(["-"*w for w in [28, 8, 8, 8, 9, 8, 9, 10, 9, 8, 9, 9, 9, 9]]) + "|"
+    sep1 = "|" + "|".join(["-"*w for w in [28,10,11,9,11,8,8,9,9,10,9,8,9]]) + "|"
 
-    print("\n\n" + "="*120)
-    print("  ABLATION TABLE")
-    print("="*120)
-    print(header)
-    print(sep)
+    print("\n\n" + "="*140)
+    print("  PRIMARY ABLATION TABLE  (source-level retrieval — all queries with known law)")
+    print("="*140)
+    print(h1)
+    print(sep1)
+
+    for stage_key in DEFAULT_STAGE_ORDER:
+        if stage_key not in results:
+            continue
+        r = results[stage_key]
+        sm = r.get("source_hit_metrics", r.get("headline_metrics", {}))
+        qa = r.get("qa_metrics", {})
+        stage_name = r.get("hyperparameters", {}).get("stage_name", stage_key)
+        n_src = sm.get("source_labeled_queries", sm.get("n_source_queries", "?"))
+        print(
+            f"| {stage_name:<26} | {_f4(sm.get('source_hit_at_5_all', sm.get('source_hit_at_5'))):>8} | "
+            f"{_f4(sm.get('source_hit_at_10_all', sm.get('source_hit_at_10'))):>9} | "
+            f"{_f4(sm.get('source_mrr_all', sm.get('source_mrr'))):>7} | "
+            f"{_f4(sm.get('source_precision_at_5_all', sm.get('source_precision_at_5'))):>9} | "
+            f"{str(n_src):>6} | "
+            f"{_pct(qa.get('f1')):>6} | "
+            f"{_pct(qa.get('answer_containment')):>7} | "
+            f"{_pct(qa.get('rouge_l')):>7} | "
+            f"{_pct(qa.get('citation_accuracy')):>8} | "
+            f"{_pct(r.get('faithfulness_rate')):>7} | "
+            f"{_f4(r.get('llm_judge_score')):>6} | "
+            f"{_f4(r.get('semantic_similarity')):>7} |"
+        )
+    print("="*140 + "\n")
+
+    # ── Table 2: SECONDARY (chunk-level, gold-labeled subset) ─────────────────
+    h2 = (
+        f"| {'Stage':<26} | {'R@5':>6} | {'R@10':>6} | {'MRR':>6} | "
+        f"{'nDCG@10':>7} | {'n_gold':>7} | {'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
+    )
+    sep2 = "|" + "|".join(["-"*w for w in [28, 8, 8, 8, 9, 9, 9, 9, 9]]) + "|"
+
+    print("="*100)
+    print("  SECONDARY TABLE  (chunk-level — gold-labeled subset only; n_gold may be small for HMGS)")
+    print("="*100)
+    print(h2)
+    print(sep2)
 
     for stage_key in DEFAULT_STAGE_ORDER:
         if stage_key not in results:
             continue
         r = results[stage_key]
         ret = r.get("retrieval_metrics", {})
-        qa = r.get("qa_metrics", {})
+        n_gold = ret.get("num_queries", "?")
         stage_name = r.get("hyperparameters", {}).get("stage_name", stage_key)
         print(
             f"| {stage_name:<26} | {_f4(ret.get('recall_at_5')):>6} | "
             f"{_f4(ret.get('recall_at_10')):>6} | {_f4(ret.get('mrr')):>6} | "
-            f"{_f4(ret.get('ndcg_at_10')):>7} | {_pct(qa.get('f1')):>6} | "
-            f"{_pct(qa.get('rouge_l')):>7} | {_pct(qa.get('citation_accuracy')):>8} | "
-            f"{_pct(r.get('faithfulness_rate')):>7} | "
-            f"{_f4(r.get('llm_judge_score')):>6} | "
-            f"{_f4(r.get('semantic_similarity')):>7} | "
+            f"{_f4(ret.get('ndcg_at_10')):>7} | {str(n_gold):>7} | "
             f"{_f4(r.get('scenario1_score')):>7} | "
             f"{_f4(r.get('scenario2_score')):>7} | "
             f"{_f4(r.get('scenario3_score')):>7} |"
         )
-    print("="*120 + "\n")
+    print("="*100 + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -26,6 +26,7 @@ def compute_source_hit_metrics(results: list[dict]) -> dict:
     """
     hit5 = hit10 = 0
     prec5_sum = prec10_sum = 0.0
+    mrr_sum = 0.0
     source_labeled = 0
     total = len(results)
 
@@ -45,15 +46,21 @@ def compute_source_hit_metrics(results: list[dict]) -> dict:
             hit10 += 1
         prec5_sum  += hits5  / max(len(top5),  1)
         prec10_sum += hits10 / max(len(top10), 1)
+        # MRR: reciprocal rank of the first retrieved chunk from the gold law
+        for rank, src in enumerate(srcs):
+            if src == law:
+                mrr_sum += 1.0 / (rank + 1)
+                break
 
     n = source_labeled or 1  # avoid div-by-zero; metrics will be 0.0
     return {
-        "source_hit_at_5_all":       hit5  / n,
-        "source_hit_at_10_all":      hit10 / n,
-        "source_precision_at_5_all": prec5_sum  / n,
-        "source_precision_at_10_all":prec10_sum / n,
-        "source_labeled_queries":    source_labeled,
-        "total_queries":             total,
+        "source_hit_at_5_all":        hit5  / n,
+        "source_hit_at_10_all":       hit10 / n,
+        "source_mrr_all":             mrr_sum / n,
+        "source_precision_at_5_all":  prec5_sum  / n,
+        "source_precision_at_10_all": prec10_sum / n,
+        "source_labeled_queries":     source_labeled,
+        "total_queries":              total,
     }
 
 
