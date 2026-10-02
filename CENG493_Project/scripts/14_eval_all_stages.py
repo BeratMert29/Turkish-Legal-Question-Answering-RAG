@@ -302,6 +302,7 @@ def run_stage(
     reranker_cache: dict,
     relevant_map: dict,
     short_answer_mode: bool,
+    eval_set_name: str = "hmgs",
 ) -> dict:
     """Run a single stage. Returns the final_results dict (same schema as run_baseline)."""
 
@@ -538,6 +539,7 @@ def run_stage(
     llm_relevancy_score = None
     llm_coherence_score = None
     llm_faithfulness_score = None
+    llm_judge_parse_failures: Optional[dict] = None
     try:
         judge_preds = [
             {**p, "question": next(
@@ -546,18 +548,31 @@ def run_stage(
             )}
             for p in predictions
         ]
-        judge_result     = llm_judge_answer(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
-        faith_result     = llm_judge_faithfulness(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
-        relev_result     = llm_judge_relevancy(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
-        coher_result     = llm_judge_coherence(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=20)
+        _judge_sample = getattr(config, "LLM_JUDGE_SAMPLE_SIZE", 20)
+        judge_result     = llm_judge_answer(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=_judge_sample, results_dir=stage.results_dir)
+        faith_result     = llm_judge_faithfulness(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=_judge_sample, results_dir=stage.results_dir)
+        relev_result     = llm_judge_relevancy(judge_preds, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=_judge_sample, results_dir=stage.results_dir)
+        coher_result     = llm_judge_coherence(predictions, config.LLM_BASE_URL, config.LLM_JUDGE_MODEL, sample_size=_judge_sample, results_dir=stage.results_dir)
         llm_judge_score          = judge_result["score"]
         llm_faithfulness_score   = faith_result["score"]
         llm_relevancy_score      = relev_result["score"]
         llm_coherence_score      = coher_result["score"]
-        print(f"    LLM Judge Answer={llm_judge_score:.4f}  "
-              f"Faith={llm_faithfulness_score:.4f}  "
-              f"Relev={llm_relevancy_score:.4f}  "
-              f"Coher={llm_coherence_score:.4f}")
+        llm_judge_parse_failures = {
+            "answer":       judge_result.get("parse_fail_count", 0),
+            "faithfulness": faith_result.get("parse_fail_count", 0),
+            "relevancy":    relev_result.get("parse_fail_count", 0),
+            "coherence":    coher_result.get("parse_fail_count", 0),
+        }
+        _fmt = lambda v: f"{v:.4f}" if v is not None else "N/A"
+        print(f"    LLM Judge Answer={_fmt(llm_judge_score)}  "
+              f"Faith={_fmt(llm_faithfulness_score)}  "
+              f"Relev={_fmt(llm_relevancy_score)}  "
+              f"Coher={_fmt(llm_coherence_score)}")
+        for _name, _res in [("answer", judge_result), ("faithfulness", faith_result),
+                             ("relevancy", relev_result), ("coherence", coher_result)]:
+            if _res.get("parse_fail_count", 0):
+                print(f"    WARNING: {_res['parse_fail_count']}/{_res['sample_size']} "
+                      f"{_name} judge responses failed to parse")
     except Exception as exc:
         print(f"    WARNING: LLM Judge failed: {exc}")
 
@@ -598,6 +613,8 @@ def run_stage(
         "hyperparameters": {
             "stage": stage_key,
             "stage_name": stage.name,
+            "eval_set": eval_set_name,
+            "eval_n": len(qa_examples),
             "embedding_model": (config.FINETUNED_EMBEDDING_MODEL
                                 if stage.embedding == "finetuned"
                                 else config.EMBEDDING_MODEL),
@@ -617,6 +634,7 @@ def run_stage(
         "llm_faithfulness_score": llm_faithfulness_score,
         "llm_relevancy_score": llm_relevancy_score,
         "llm_coherence_score": llm_coherence_score,
+        "llm_judge_parse_failures": llm_judge_parse_failures,
         "semantic_similarity": sem_sim,
         "scenario1_score": scenario_scores["scenario1"],
         "scenario2_score": scenario_scores["scenario2"],
@@ -701,8 +719,19 @@ def main() -> None:
              f"Options: {', '.join(DEFAULT_STAGE_ORDER)}",
     )
     parser.add_argument(
-        "--dataset", choices=["kaggle", "hmgs"], default="kaggle",
-        help="Evaluation dataset (default: kaggle, 300 questions).",
+        "--eval-set", "--dataset",
+        dest="eval_set",
+        choices=["kaggle", "hmgs"],
+        default="hmgs",
+        help=(
+            "Evaluation dataset for ALL stages (default: hmgs, ~161 questions). "
+            "Use 'kaggle' for the Kaggle-split eval set (~300 questions). "
+            "All stages in a single run MUST use the same eval set so that "
+            "ablation comparisons are valid.  Previously, different invocations "
+            "used different datasets (base/hybrid/rrf/rrf_rerank with hmgs n=161 "
+            "and llm_ft/emb_ft/full with kaggle n=300), making cross-stage "
+            "comparisons invalid.  This flag enforces a single dataset per run."
+        ),
     )
     parser.add_argument(
         "--list-stages", action="store_true",
@@ -785,7 +814,7 @@ def main() -> None:
         sys.exit("ERROR: No valid stages to run.")
 
     print(f"\n🚀  Stages to run: {', '.join(valid)}")
-    print(f"   Dataset: {args.dataset}\n")
+    print(f"   Eval set: {args.eval_set}\n")
 
     # ── Check Ollama ───────────────────────────────────────────────────────
     if not check_ollama(config.LLM_BASE_URL, config.LLM_MODEL):
@@ -816,8 +845,8 @@ def main() -> None:
         print(f"  QA source     : {args.eval_data} (external evaluator format)")
         qa_examples, short_answer_mode = _load_external_qa(Path(args.eval_data))
     else:
-        short_answer_mode = (args.dataset == "hmgs")
-        if args.dataset == "hmgs":
+        short_answer_mode = (args.eval_set == "hmgs")
+        if args.eval_set == "hmgs":
             qa_examples = DataProcessor.build_gold_eval_set()
         else:
             if not args.corpus:
@@ -856,6 +885,7 @@ def main() -> None:
                 reranker_cache=reranker_cache,
                 relevant_map=relevant_map,
                 short_answer_mode=short_answer_mode,
+                eval_set_name=args.eval_set if not args.eval_data else "external",
             )
             all_results[key] = result
         except KeyboardInterrupt:

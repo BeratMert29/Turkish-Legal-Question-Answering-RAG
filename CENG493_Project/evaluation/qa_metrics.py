@@ -134,11 +134,48 @@ def _cited_sources(predicted: str, retrieved_chunks: list[dict]) -> list[str]:
 
 
 def exact_match(predicted: str, expected: str) -> float:
+    """Return 1.0 if the normalised expected text is a substring of predicted.
+
+    Note on HMGS questions: HMGS is a Turkish bar-exam dataset whose questions
+    ask which statement is true/false (çoktan seçmeli, multiple-choice style).
+    The ``expected`` field contains the full text of the correct answer option,
+    NOT a single letter (A/B/C/D), because the original CSV does not include
+    the distractors.  As a result, EM is typically ~0: LLM responses are
+    paraphrases, not verbatim copies of the answer text.
+    Use ``answer_containment`` (recall-side token overlap) and ``token_f1`` as
+    the primary lexical metrics for HMGS; EM is reported for completeness only.
+    """
     pred_norm = normalize_turkish(predicted.strip())
     exp_norm = normalize_turkish(expected.strip())
     if not exp_norm:
         return 0.0
     return 1.0 if exp_norm in pred_norm else 0.0
+
+
+def answer_containment(predicted: str, expected: str) -> float:
+    """Recall-side token overlap: fraction of expected tokens present in predicted.
+
+    More lenient than EM and more interpretable than token_f1 for HMGS-style
+    questions where the expected answer is a factual statement and the LLM
+    response is a full explanatory paragraph.  A high containment score
+    indicates the model surfaced all key terms from the ground-truth answer,
+    even if the phrasing differs.
+
+    Args:
+        predicted: The model-generated answer text.
+        expected:  The ground-truth answer text.
+
+    Returns:
+        Float in [0, 1] — 1.0 means every expected token appeared in predicted.
+    """
+    pred_tokens = set(_tokenize(predicted))
+    exp_tokens  = _tokenize(expected)
+    if not exp_tokens:
+        return 0.0
+    if not pred_tokens:
+        return 0.0
+    matched = sum(1 for t in exp_tokens if t in pred_tokens)
+    return matched / len(exp_tokens)
 
 
 def token_f1(predicted: str, expected: str) -> float:
@@ -198,18 +235,20 @@ def compute_qa_metrics(predicted: str, expected: str) -> dict:
         "f1": token_f1(pred_clean, expected),
         "bleu": bleu_score(pred_clean, expected),
         "rouge_l": rouge_l_score(pred_clean, expected),
+        "answer_containment": answer_containment(pred_clean, expected),
     }
 
 
 def compute_all_qa_metrics(predictions: list[dict]) -> dict:
     """
     predictions: list of {"predicted": str, "expected": str}
-    Returns: {"em", "f1", "bleu", "rouge_l", "num_samples"}
+    Returns: {"em", "f1", "bleu", "rouge_l", "answer_containment", "num_samples"}
     """
     if not predictions:
-        return {"em": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0, "num_samples": 0}
+        return {"em": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0,
+                "answer_containment": 0.0, "num_samples": 0}
     metrics = [compute_qa_metrics(p["predicted"], p["expected"]) for p in predictions]
-    keys = ["em", "f1", "rouge_l"]
+    keys = ["em", "f1", "rouge_l", "answer_containment"]
     result = {k: sum(m[k] for m in metrics) / len(metrics) for k in keys}
     # Corpus-level BLEU via evaluate
     if _USE_HF_EVALUATE:
@@ -258,14 +297,15 @@ def compute_all_qa_metrics_with_citation(predictions: list[dict]) -> dict:
     predictions: list of {"predicted": str, "expected": str,
                            "retrieved_sources": list[str], "retrieved_chunks": list[dict],
                            "expected_source": str}
-    Returns: averaged em, f1, bleu, rouge_l, citation_accuracy,
+    Returns: averaged em, f1, bleu, rouge_l, answer_containment, citation_accuracy,
              source_in_context_rate, citation_presence_rate, num_samples
     """
     if not predictions:
         return {"em": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0,
+                "answer_containment": 0.0,
                 "citation_accuracy": 0.0, "source_in_context_rate": 0.0,
                 "citation_presence_rate": 0.0, "num_samples": 0}
-    qa_metrics = [compute_qa_metrics(p["predicted"], p["expected"]) for p in predictions]
+    qa_m = [compute_qa_metrics(p["predicted"], p["expected"]) for p in predictions]
     cite_scores = []
     source_proxy_scores = []
     citation_presence_scores = []
@@ -282,8 +322,8 @@ def compute_all_qa_metrics_with_citation(predictions: list[dict]) -> dict:
         )
         citation_presence_scores.append(citation_presence(p.get("predicted", "")))
     n = len(predictions)
-    keys = ["em", "f1", "rouge_l"]
-    result = {k: sum(m[k] for m in qa_metrics) / n for k in keys}
+    keys = ["em", "f1", "rouge_l", "answer_containment"]
+    result = {k: sum(m[k] for m in qa_m) / n for k in keys}
     # Corpus-level BLEU via evaluate
     if _USE_HF_EVALUATE:
         preds_norm = [normalize_turkish(strip_citations(p["predicted"])) for p in predictions]

@@ -21,6 +21,73 @@ _TEXT_SPLITTER = RecursiveCharacterTextSplitter(
 # Matches the start of a Turkish law article heading (e.g. "MADDE 1", "Madde 12").
 _ARTICLE_RE = re.compile(r"(?m)(?=^\s*MADDE\s+\d)", re.IGNORECASE)
 
+# Patterns for extracting a Turkish law article (madde) number from free text.
+_MADDE_PATTERNS = [
+    re.compile(r"(\d+)\s*\.?\s*madde", re.IGNORECASE),   # "44. madde", "44 madde"
+    re.compile(r"madde\s*(\d+)", re.IGNORECASE),           # "madde 44", "MADDE44"
+    re.compile(r"md\.\s*(\d+)", re.IGNORECASE),            # "md. 44"
+    re.compile(r"(?<!\d)m\.\s*(\d+)", re.IGNORECASE),     # "m. 44" (short form)
+]
+
+# Leading MADDE header in a chunk: "MADDE 44" or "MADDE 44 –" or "MADDE 44-"
+_MADDE_HEADER_RE = re.compile(r"(?m)^\s*MADDE\s+(\d+)\b", re.IGNORECASE)
+
+
+def _extract_madde_no(question: str, answer: str) -> "int | None":
+    """Return the first article (madde) number found in question or answer text.
+
+    Tries several Turkish legal shorthand patterns and returns None when no
+    article number can be unambiguously determined.
+
+    Args:
+        question: The query text.
+        answer:   The expected answer text.
+
+    Returns:
+        Integer article number, or None if not found.
+    """
+    text = f"{question} {answer}"
+    for pat in _MADDE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _chunk_matches_article(chunk: "CorpusChunk", madde_no: int) -> bool:
+    """Return True if *chunk* belongs to Turkish law article *madde_no*.
+
+    Checks (in order):
+    1. Optional ``madde_no`` field on the chunk (added by the corpus builder
+       agent for article-chunked corpora).
+    2. doc_id pattern  e.g. ``"LawName_madde_44"`` or ``"law_madde_44_0"``.
+    3. Chunk text starts with ``"MADDE <N>"`` (article header at top of chunk).
+    4. Any ``"MADDE <N>"`` header on its own line anywhere in the chunk text
+       (article header may appear mid-chunk when sub-splitting oversized articles).
+
+    Args:
+        chunk:    A CorpusChunk instance.
+        madde_no: The article number to match.
+
+    Returns:
+        True if the chunk is associated with article *madde_no*.
+    """
+    # 1. Explicit madde_no field (set by corpus builder for article-chunked corpora)
+    stored = getattr(chunk, "madde_no", None)
+    if stored is not None:
+        return int(stored) == madde_no
+
+    # 2. doc_id pattern — e.g. "Anayasa_madde_44" / "law_madde_44_2"
+    if re.search(rf"madde[_\s]{madde_no}(?:[^\d]|$)", chunk.doc_id, re.IGNORECASE):
+        return True
+
+    # 3 & 4. Scan chunk text for a MADDE header on its own line
+    for m in _MADDE_HEADER_RE.finditer(chunk.text):
+        if int(m.group(1)) == madde_no:
+            return True
+
+    return False
+
 
 @dataclass
 class CorpusChunk:
@@ -463,17 +530,20 @@ class DataProcessor:
         valid_ids = set(c.chunk_id for c in corpus_chunks)
 
         relevant_map: dict[str, list[str]] = {}
-        no_match_count = 0
+        # Coverage counters — one per labeling strategy
+        labeled_s0 = labeled_s1 = labeled_s2 = labeled_s25 = labeled_s3 = 0
+        unlabeled = 0
 
         for qa in qa_examples:
             relevant: list[str] = []
 
             # Unified field accessors: support both QAExample dataclass and plain dict.
             _is_dict = isinstance(qa, dict)
-            qa_query_id = qa["query_id"] if _is_dict else qa.query_id
-            qa_context  = qa.get("context", "") if _is_dict else qa.context
-            qa_answer   = qa.get("answer", "") if _is_dict else qa.answer
-            qa_source   = qa.get("source", "") if _is_dict else qa.source
+            qa_query_id  = qa["query_id"]  if _is_dict else qa.query_id
+            qa_context   = qa.get("context", "") if _is_dict else qa.context
+            qa_answer    = qa.get("answer", "")  if _is_dict else qa.answer
+            qa_source    = qa.get("source", "")  if _is_dict else qa.source
+            qa_question  = qa.get("question", "") if _is_dict else getattr(qa, "question", "")
 
             # Strategy 0: gold_source_ids — exact chunk IDs supplied by the
             # evaluator's benchmark (gold_benchmark.json / rag_eval.json).
@@ -483,6 +553,7 @@ class DataProcessor:
             if gold_ids:
                 relevant = [gid for gid in gold_ids if gid in valid_ids]
                 if relevant:
+                    labeled_s0 += 1
                     relevant_map[qa_query_id] = relevant
                     continue  # Skip remaining strategies — ground truth is exact.
 
@@ -501,10 +572,14 @@ class DataProcessor:
                         seen.add(cid)
                         deduped.append(cid)
                 relevant = deduped
+            if relevant:
+                labeled_s1 += 1
 
             # Strategy 2: doc_id match — used when context is empty/missing
             if not relevant:
                 relevant = [c.chunk_id for c in corpus_chunks if c.doc_id == qa_query_id]
+                if relevant:
+                    labeled_s2 += 1
 
             # Strategy 2.5: answer substring match — for gold sets with known answers (e.g. HMGS)
             # Find chunks that contain a significant portion of the answer text.
@@ -513,37 +588,61 @@ class DataProcessor:
                 search_str = answer_lower[:80] if len(answer_lower) >= 80 else answer_lower
                 candidate_chunks = by_source.get(qa_source, corpus_chunks) if qa_source else corpus_chunks
                 relevant = [c.chunk_id for c in candidate_chunks if search_str in c.text.lower()]
+                if relevant:
+                    labeled_s25 += 1
 
-            # Strategy 3: source match — for gold sets without context (e.g. HMGS).
-            # All chunks from the matching law are considered relevant.
-            # Capped at MAX_STRATEGY3_RELEVANT (default 20) to keep metrics meaningful;
-            # assigning hundreds of chunks from an entire law inflates Recall/MRR/NDCG.
+            # Strategy 3: article-level match — extract the madde (article) number from
+            # the question and answer text.  Match only corpus chunks that belong to that
+            # specific article in the correct source law.
+            #
+            # Design rationale: the previous strategy assigned the first N chunks of the
+            # entire source law as relevant, which is arbitrary and inflates
+            # Recall/MRR/nDCG for queries that do not cite a specific article.
+            # Article-level matching is precise but requires the query to reference an
+            # article number explicitly.  Queries where no article can be determined are
+            # left with an empty relevant set and are excluded from retrieval metrics by
+            # compute_all_metrics (queries with no ground-truth are always skipped).
+            # This is the correct behavior: we should not compute retrieval metrics for
+            # queries whose ground-truth relevance is unknown.
             if not relevant and qa_source:
-                source_chunks = by_source.get(qa_source, [])
-                max_s3 = getattr(config, "MAX_STRATEGY3_RELEVANT", 20)
-                relevant = [c.chunk_id for c in source_chunks[:max_s3]]
+                madde_no = _extract_madde_no(qa_question, qa_answer)
+                if madde_no is not None:
+                    source_chunks = by_source.get(qa_source, [])
+                    relevant = [
+                        c.chunk_id for c in source_chunks
+                        if _chunk_matches_article(c, madde_no)
+                    ]
+                    if relevant:
+                        labeled_s3 += 1
+                # If madde_no is None: leave relevant=[] → query will be unlabeled
+                # and excluded from retrieval metrics.
 
             if not relevant:
-                no_match_count += 1
+                unlabeled += 1
+                # Do NOT add to relevant_map — retrieval_metrics.py already skips
+                # queries with no ground-truth when qid is absent from qrels.
+                # Explicitly setting an empty list would still cause them to be
+                # included in total_queries but not num_queries, which is the
+                # desired behavior; we keep the key in the map for downstream
+                # consumers that iterate over all query_ids.
 
             relevant_map[qa_query_id] = relevant
 
-        if no_match_count:
-            log.warning(
-                "build_relevant_chunk_map: %d/%d queries have no relevant chunks. "
-                "Check that qa.source values match corpus chunk sources.",
-                no_match_count, len(qa_examples),
-            )
-        matched_count = sum(1 for v in relevant_map.values() if v)
+        n_total = len(qa_examples)
+        labeled = n_total - unlabeled
         log.info(
-            "build_relevant_chunk_map: %d/%d queries have relevant chunks (%.1f%%)",
-            matched_count, len(qa_examples),
-            100 * matched_count / len(qa_examples) if qa_examples else 0,
+            "build_relevant_chunk_map coverage: "
+            "total=%d  labeled=%d (%.0f%%)  unlabeled=%d  "
+            "[s0=%d s1=%d s2=%d s2.5=%d s3(article)=%d]",
+            n_total, labeled, 100 * labeled / n_total if n_total else 0,
+            unlabeled, labeled_s0, labeled_s1, labeled_s2, labeled_s25, labeled_s3,
         )
-        if qa_examples and matched_count < len(qa_examples) * 0.5:
+        if unlabeled:
             log.warning(
-                "build_relevant_chunk_map: fewer than 50%% of queries matched. "
-                "Retrieval metrics may be unreliable. Check corpus/eval split alignment."
+                "build_relevant_chunk_map: %d/%d queries are unlabeled (no article "
+                "number found and no context/answer match).  These queries are "
+                "excluded from retrieval metrics.",
+                unlabeled, n_total,
             )
         return relevant_map
 

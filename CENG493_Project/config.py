@@ -87,6 +87,9 @@ KAGGLE_MIN_SCORE = 6
 
 # Evaluation
 HALLUCINATION_SAMPLE_SIZE = 150
+# Number of predictions sampled for each LLM-judge metric call.
+# Increase for higher-fidelity estimates (at the cost of more Ollama calls).
+LLM_JUDGE_SAMPLE_SIZE = 20
 
 # Hallucination stratification thresholds (applied to top-1 retrieval score)
 HALLUCINATION_HIT_THRESHOLD = 0.7
