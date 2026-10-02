@@ -584,6 +584,78 @@ class TestAbbrevMaddeParsing:
         assert "Türk Ceza Kanunu_kaggle_5237_0" in ids
 
 
+class TestMaddeHeadingFixes:
+    """Task 2: EK MADDE all-caps, MADDE N/A suffix, mid-text anchor."""
+
+    def test_ek_madde_allcaps_not_regular(self):
+        """'EK MADDE 1' must return ek-1, not article 1."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "EK MADDE 1 – ek hüküm içeriği.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn == "ek-1", f"Expected 'ek-1', got {mn!r}"
+
+    def test_madde_slash_suffix_normalised(self):
+        """'MADDE 183/A' must return '183-a'."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "MADDE 183/A – Suç ve ceza tanımı.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn == "183-a", f"Expected '183-a', got {mn!r}"
+
+    def test_madde_hyphen_suffix_normalised(self):
+        """'MADDE 5-B' must return '5-b'."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "MADDE 5-B – Hüküm.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn == "5-b", f"Expected '5-b', got {mn!r}"
+
+    def test_mid_text_madde_not_extracted(self):
+        """Inline 'Madde 5 uyarınca' mid-line must not set chunk's article number."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "Bu hüküm Madde 5 uyarınca uygulanır.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn is None, f"Expected None for mid-text reference, got {mn!r}"
+
+    def test_mid_text_ref_does_not_shadow_real_heading(self):
+        """Inline mid-sentence ref before a real line-start heading: heading wins."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            # "Madde 3" is mid-sentence (not at line start); "MADDE 7" is at line start.
+            "text": "Kanun hükmüne göre Madde 3 uyarınca karar verilmiştir.\nMADDE 7- Asıl hüküm.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn == "7", f"Expected '7' from line-start heading, got {mn!r}"
+
+    def test_ek_madde_suffix_normalised(self):
+        """'EK MADDE 2/A' must return 'ek-2-a'."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "EK MADDE 2/A – ek hüküm.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn == "ek-2-a", f"Expected 'ek-2-a', got {mn!r}"
+
+    def test_build_graph_ek_madde_key(self):
+        """build_graph_from_metadata stores 'ek-1' key (not '1') for EK MADDE 1."""
+        recs = [
+            {
+                "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+                "text": "EK MADDE 1 – ek hüküm.",
+            }
+        ]
+        g = build_graph_from_metadata(recs)
+        lookup = g["_source_madde_lookup"]
+        assert "L||ek-1" in lookup, f"Expected 'L||ek-1' in lookup, got keys: {list(lookup)}"
+        assert "L||1" not in lookup, "'L||1' must not appear for EK MADDE 1"
+
+
 class TestDedupeAndSelfLoops:
     def test_duplicate_ids_no_self_loops(self):
         rec = {

@@ -37,10 +37,33 @@ class TestMaddeNoFromText:
     def test_empty_text_returns_none(self):
         assert _madde_no_from_text("") is None
 
+    def test_ek_madde_allcaps_both(self):
+        """EK MADDE N (both words uppercase) must return ek-N, not plain N."""
+        assert _madde_no_from_text("EK MADDE 1 – ek hüküm.") == "ek-1"
+
+    def test_madde_suffix_slash_a(self):
+        """MADDE 183/A must return '183-a' (slash normalised to hyphen, lowercased)."""
+        assert _madde_no_from_text("MADDE 183/A – Suç ve ceza.") == "183-a"
+
+    def test_madde_suffix_hyphen_b(self):
+        """MADDE 5-B must return '5-b'."""
+        assert _madde_no_from_text("MADDE 5-B – Hüküm.") == "5-b"
+
+    def test_mid_text_madde_not_matched(self):
+        """'Madde 5 uyarınca' in the middle of a line must NOT set article number."""
+        assert _madde_no_from_text("Bu hüküm Madde 5 uyarınca uygulanır.") is None
+
+    def test_mid_text_madde_with_leading_content(self):
+        """Inline mid-sentence madde ref must not match when a real heading follows."""
+        # "Madde 3" is embedded mid-sentence (not at line start).
+        # "MADDE 7" at line start is the actual heading.
+        text = "Kanun hükmüne göre Madde 3 uyarınca karar verilmiştir.\nMADDE 7- Asıl hüküm."
+        assert _madde_no_from_text(text) == "7"
+
     def test_madde_within_first_600_chars(self):
-        # text where MADDE appears after 500 chars should still be found
-        padding = "x" * 490
-        text = padding + " MADDE 99- Bir hüküm."
+        # MADDE heading at the start of a new line after 490 chars of padding
+        padding = "x" * 490 + "\n"
+        text = padding + "MADDE 99- Bir hüküm."
         result = _madde_no_from_text(text)
         assert result == "99"
 

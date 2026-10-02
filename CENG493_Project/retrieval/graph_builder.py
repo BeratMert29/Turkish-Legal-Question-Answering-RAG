@@ -37,17 +37,33 @@ _CHUNK_SUFFIX_RE = re.compile(r"m(\d+)(?:_(\d+))?$")
 _DOC_ID_MADDE_RE = re.compile(r"_madde_(\d+)$", re.IGNORECASE)
 
 # First MADDE heading in text (covers Ek Madde / Geçici Madde / regular).
+# Anchored to line-start ((?m)^\s*) so mid-text references like
+# "Madde 5 uyarınca" are never mistaken for article headings.
+# group 1: ek-N   — "Ek Madde 3", "EK MADDE 3" (case-insensitive MADDE)
+# group 2: gecici-N — "Geçici Madde 7"
+# group 3: gecici-N all-caps — "GEÇİCİ MADDE 4"
+# group 4: regular N — "MADDE 86", "MADDE 183/A" (optional letter suffix)
+# Suffix "[/-][A-Za-z]" captures "183/A" or "183-A" so callers can normalise
+# to "183-a" via _normalize_madde_no().
 _TEXT_MADDE_RE = re.compile(
-    r"(?:"
-    r"(?:Ek|EK)\s+[Mm]adde\s+(\d+)"        # group 1: ek-N
-    r"|[Gg]eçici\s+[Mm]adde\s+(\d+)"        # group 2: gecici-N
-    r"|(?:GEÇİCİ\s+MADDE)\s+(\d+)"          # group 3: gecici-N all-caps
-    r"|(?:MADDE|Madde)\s+(\d+)"             # group 4: regular N
+    r"(?m)^\s*(?:"
+    r"(?:Ek|EK)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(\d+(?:[/-][A-Za-z])?)"   # g1: ek-N
+    r"|[Gg]eçici\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(\d+(?:[/-][A-Za-z])?)"  # g2: gecici-N
+    r"|(?:GEÇİCİ\s+MADDE)\s+(\d+(?:[/-][A-Za-z])?)"                    # g3: gecici-N caps
+    r"|(?:MADDE|Madde)\s+(\d+(?:[/-][A-Za-z])?)"                       # g4: regular N
     r")"
 )
 
 # Trailing integer in chunk_id for sub-chunk ordering.
 _TRAILING_INT_RE = re.compile(r"_(\d+)$")
+
+
+def _normalize_madde_no(raw: str) -> str:
+    """Normalise a MADDE number: ``'183/A'`` → ``'183-a'``, ``'183-A'`` → ``'183-a'``.
+
+    Plain integers (e.g. ``'86'``) pass through unchanged.
+    """
+    return re.sub(r"[/-]([A-Za-z])", lambda m: f"-{m.group(1).lower()}", raw)
 
 _CROSS_WINDOW = 200
 
@@ -113,18 +129,21 @@ def _extract_madde_no(rec: dict) -> tuple[str | None, int | None]:
     if m:
         return m.group(1), _parse_sub_idx(rec["chunk_id"])
 
-    # 3. Text-based extraction — look for the first MADDE heading in the chunk text.
+    # 3. Text-based extraction — look for the first MADDE heading at a line
+    #    boundary within the first 600 chars of the chunk text.
+    #    The (?m)^\s* anchor on _TEXT_MADDE_RE prevents mid-text references
+    #    such as "Madde 5 uyarınca" from being mistaken for article headings.
     text = rec.get("text", "")
     if text:
         tm = _TEXT_MADDE_RE.search(text[:600])
         if tm:
             if tm.group(1):
-                return f"ek-{tm.group(1)}", _parse_sub_idx(rec["chunk_id"])
+                return f"ek-{_normalize_madde_no(tm.group(1))}", _parse_sub_idx(rec["chunk_id"])
             if tm.group(2) or tm.group(3):
                 n = tm.group(2) or tm.group(3)
-                return f"gecici-{n}", _parse_sub_idx(rec["chunk_id"])
+                return f"gecici-{_normalize_madde_no(n)}", _parse_sub_idx(rec["chunk_id"])
             if tm.group(4):
-                return tm.group(4), _parse_sub_idx(rec["chunk_id"])
+                return _normalize_madde_no(tm.group(4)), _parse_sub_idx(rec["chunk_id"])
 
     # 4. Legacy: old chunk_id suffix _m<num>(_sub)?
     src = rec.get("source", "")

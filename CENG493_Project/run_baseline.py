@@ -139,8 +139,10 @@ def load_index(embedder):
 def save_results(results: dict, results_dir: Path) -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
     out_path = results_dir / "baseline_metrics.json"
-    with out_path.open("w", encoding="utf-8") as f:
+    _tmp = out_path.with_suffix(".tmp")
+    with _tmp.open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
+    os.replace(_tmp, out_path)
     log.info("Results saved → %s", out_path)
 
 
@@ -158,9 +160,6 @@ def main() -> None:
 
     if args.corpus and args.docs_path:
         sys.exit("ERROR: --corpus and --docs-path are mutually exclusive")
-
-    if args.graph:
-        config.GRAPH_EXPANSION_ENABLED = True
 
     from data.data_processor import DataProcessor, CorpusChunk
     from pipeline.data_loading import load_external_corpus, load_external_qa
@@ -206,15 +205,25 @@ def main() -> None:
 
     graph_index = None
     if args.graph:
-        graph_path = config.INDEX_DIR / getattr(
-            config, "GRAPH_FILE", "graph.json",
-        )
+        graph_path = config.INDEX_DIR / config.GRAPH_FILE
         if graph_path.exists():
-            from retrieval.graph_index import GraphIndex
-            graph_index = GraphIndex(
-                graph_path, config.INDEX_DIR / config.METADATA_FILE,
-            )
-            log.info("Graph index loaded: %s", graph_path)
+            # Validate JSON; rebuild automatically if the file is corrupt.
+            try:
+                with graph_path.open(encoding="utf-8") as _gf:
+                    json.load(_gf)
+            except (json.JSONDecodeError, OSError):
+                log.warning(
+                    "graph.json corrupt at %s; attempting rebuild …",
+                    graph_path,
+                )
+                from pipeline.retrieval import auto_build_graph
+                auto_build_graph(graph_path)
+            if graph_path.exists():
+                from retrieval.graph_index import GraphIndex
+                graph_index = GraphIndex(
+                    graph_path, config.INDEX_DIR / config.METADATA_FILE,
+                )
+                log.info("Graph index loaded: %s", graph_path)
         else:
             log.warning(
                 "--graph set but graph.json not found at %s; "
@@ -353,32 +362,16 @@ def main() -> None:
 
             # Hallucination
             try:
-                import torch
-                from sentence_transformers import CrossEncoder
-                from evaluation.hallucination import (
-                    run_hallucination_analysis, stratified_sample,
-                )
-
-                log.info("Loading NLI model …")
-                if torch.cuda.is_available():
-                    _nli_device = "cuda"
-                elif torch.backends.mps.is_available():
-                    _nli_device = "mps"
-                else:
-                    _nli_device = "cpu"
-                nli_model = CrossEncoder(
-                    "cross-encoder/nli-deberta-v3-small", device=_nli_device,
-                )
+                from pipeline.evaluation import run_hallucination_eval
 
                 retrieval_results_dict = {
                     p["query_id"]: p.get("retrieved_chunks", [])
                     for p in predictions
                 }
-                sample_dict = stratified_sample(
-                    predictions, sample_size=config.HALLUCINATION_SAMPLE_SIZE,
-                )
-                hallucination = run_hallucination_analysis(
-                    sample_dict, retrieval_results_dict, nli_model,
+                hallucination, _faithful_rate, _nli_model = run_hallucination_eval(
+                    predictions, retrieval_results_dict,
+                    config.HALLUCINATION_SAMPLE_SIZE,
+                    llm_model=config.LLM_MODEL,
                 )
                 log.info(
                     "Hallucination analysis: %s", hallucination["summary"],

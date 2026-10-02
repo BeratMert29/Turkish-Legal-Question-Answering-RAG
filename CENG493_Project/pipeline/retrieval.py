@@ -29,14 +29,15 @@ def auto_build_graph(graph_path: Path) -> None:
     for meta_path in candidates:
         if meta_path.exists():
             print(f"  Auto-building graph from {meta_path} …")
+            import os as _os
             from retrieval.graph_builder import build_graph_from_metadata, save_graph
 
-            meta = [
-                json.loads(line)
-                for line in meta_path.open(encoding="utf-8")
-                if line.strip()
-            ]
-            save_graph(build_graph_from_metadata(meta), graph_path)
+            with meta_path.open(encoding="utf-8") as _f:
+                meta = [json.loads(line) for line in _f if line.strip()]
+            _graph = build_graph_from_metadata(meta)
+            _tmp_path = graph_path.with_suffix(".tmp")
+            save_graph(_graph, _tmp_path)
+            _os.replace(_tmp_path, graph_path)
             print(f"  Graph saved → {graph_path}")
             return
 

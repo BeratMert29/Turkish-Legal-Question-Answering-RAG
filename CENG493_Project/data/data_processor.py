@@ -128,32 +128,50 @@ def _silver_lexical_score(query_tokens: "list[str]", chunk_text: str) -> float:
     return matched / len(query_tokens)
 
 
+# Anchored to line-start ((?m)^\s*) so mid-text references like
+# "Madde 5 uyarınca" are never mistaken for article headings.
+# Suffix "[/-][A-Za-z]" captures "183/A" or "183-A"; normalised to
+# "183-a" by _madde_no_from_text() via _normalize_madde_suffix().
+# group 1: ek-N   — "Ek Madde 3", "EK MADDE 3" (case-insensitive MADDE)
+# group 2: gecici-N — "Geçici Madde 7"
+# group 3: gecici-N all-caps — "GEÇİCİ MADDE 4"
+# group 4: regular N — "MADDE 86", "MADDE 183/A"
 _MADDE_HEADING_RE = re.compile(
-    r"(?:"
-    r"(?:Ek|EK)\s+[Mm]adde\s+(\d+)"          # group 1: ek-N
-    r"|[Gg]eçici\s+[Mm]adde\s+(\d+)"          # group 2: gecici-N
-    r"|(?:GEÇİCİ\s+MADDE)\s+(\d+)"            # group 3: gecici-N (all caps)
-    r"|(?:MADDE|Madde)\s+(\d+)"               # group 4: N
+    r"(?m)^\s*(?:"
+    r"(?:Ek|EK)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(\d+(?:[/-][A-Za-z])?)"   # g1: ek-N
+    r"|[Gg]eçici\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(\d+(?:[/-][A-Za-z])?)"  # g2: gecici-N
+    r"|(?:GEÇİCİ\s+MADDE)\s+(\d+(?:[/-][A-Za-z])?)"                    # g3: gecici-N caps
+    r"|(?:MADDE|Madde)\s+(\d+(?:[/-][A-Za-z])?)"                       # g4: N
     r")"
 )
+
+
+def _normalize_madde_suffix(raw: str) -> str:
+    """Normalise a MADDE number: ``'183/A'`` → ``'183-a'``, ``'5'`` → ``'5'``."""
+    return re.sub(r"[/-]([A-Za-z])", lambda m: f"-{m.group(1).lower()}", raw)
 
 
 def _madde_no_from_text(text: str) -> "str | None":
     """Return the leading article number from text, or None if absent.
 
+    Only matches headings anchored to a line boundary so that inline
+    references such as "Madde 5 uyarınca" do not set the chunk's article.
+
     Returns:
-        "N" for a regular article, "ek-N" for supplementary articles
-        (Ek Madde), "gecici-N" for transitory articles (Geçici Madde).
+        ``"N"`` for a regular article (e.g. ``"86"`` or ``"183-a"``),
+        ``"ek-N"`` for supplementary articles (Ek Madde),
+        ``"gecici-N"`` for transitory articles (Geçici Madde),
+        or ``None`` when no heading is found.
     """
     m = _MADDE_HEADING_RE.search(text[:600])
     if m is None:
         return None
     if m.group(1):
-        return f"ek-{m.group(1)}"
+        return f"ek-{_normalize_madde_suffix(m.group(1))}"
     if m.group(2) or m.group(3):
         n = m.group(2) or m.group(3)
-        return f"gecici-{n}"
-    return m.group(4)
+        return f"gecici-{_normalize_madde_suffix(n)}"
+    return _normalize_madde_suffix(m.group(4))
 
 
 @dataclass
