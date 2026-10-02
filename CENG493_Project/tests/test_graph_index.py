@@ -390,3 +390,159 @@ class TestGraphIndex:
         expanded = gi.expand(seed, hops=1, budget=10)
         ids = [c["chunk_id"] for c in expanded]
         assert len(ids) == len(set(ids)), "Duplicates found in expanded results"
+
+    def test_source_madde_lookup_loaded(self, tmp_path):
+        """GraphIndex loads _source_madde_lookup from graph JSON."""
+        gi = _make_graph_index(tmp_path)
+        assert len(gi._source_madde_lookup) > 0
+
+
+# ---------------------------------------------------------------------------
+# Direct madde injection tests (inject_from_query / DIRECT_MADDE_LOOKUP_ENABLED)
+# ---------------------------------------------------------------------------
+
+
+def _make_gi_with_lookup(tmp_path: Path) -> "GraphIndex":
+    """GraphIndex with _META_KAGGLE (has TCK madde 86/87/88) and lookup table."""
+    graph = build_graph_from_metadata(_META_KAGGLE)
+    g_path = tmp_path / "graph_lookup.json"
+    m_path = tmp_path / "meta_lookup.jsonl"
+    g_path.write_text(json.dumps(graph), encoding="utf-8")
+    m_path.write_text(
+        "\n".join(json.dumps(r) for r in _META_KAGGLE),
+        encoding="utf-8",
+    )
+    return GraphIndex(g_path, m_path)
+
+
+class TestDirectMaddeLookup:
+    def test_inject_disabled_by_default(self, tmp_path):
+        """inject_from_query returns [] when DIRECT_MADDE_LOOKUP_ENABLED=False."""
+        gi = _make_gi_with_lookup(tmp_path)
+        # Default config has DIRECT_MADDE_LOOKUP_ENABLED = False
+        result = gi.inject_from_query("TCK madde 86")
+        assert result == []
+
+    def test_inject_abbrev_pattern(self, tmp_path, monkeypatch):
+        """TCK madde 86 → injects the TCK madde-86 chunk when flag is on."""
+        import config
+        monkeypatch.setattr(config, "DIRECT_MADDE_LOOKUP_ENABLED", True)
+        gi = _make_gi_with_lookup(tmp_path)
+        result = gi.inject_from_query("TCK madde 86")
+        ids = [r["chunk_id"] for r in result]
+        assert "Türk Ceza Kanunu_kaggle_5237_0" in ids
+
+    def test_inject_canonical_pattern(self, tmp_path, monkeypatch):
+        """5237 sayılı ... Kanununda ... madde 87 → injects TCK madde-87 chunk."""
+        import config
+        monkeypatch.setattr(config, "DIRECT_MADDE_LOOKUP_ENABLED", True)
+        gi = _make_gi_with_lookup(tmp_path)
+        query = "5237 sayılı Türk Ceza Kanununda madde 87 hükmü uygulanır."
+        result = gi.inject_from_query(query)
+        ids = [r["chunk_id"] for r in result]
+        assert "Türk Ceza Kanunu_kaggle_5237_1" in ids
+
+    def test_inject_no_duplicates(self, tmp_path, monkeypatch):
+        """inject_from_query with exclude set does not return excluded ids."""
+        import config
+        monkeypatch.setattr(config, "DIRECT_MADDE_LOOKUP_ENABLED", True)
+        gi = _make_gi_with_lookup(tmp_path)
+        existing = {"Türk Ceza Kanunu_kaggle_5237_0"}
+        result = gi.inject_from_query("TCK madde 86", exclude=existing)
+        ids = [r["chunk_id"] for r in result]
+        assert "Türk Ceza Kanunu_kaggle_5237_0" not in ids
+
+    def test_expand_batch_with_queries_flag_off(self, tmp_path):
+        """expand_batch with queries= does not inject when flag is off."""
+        gi = _make_gi_with_lookup(tmp_path)
+        seed_batch = [[
+            {
+                "chunk_id": "Türk Ceza Kanunu_kaggle_5237_2",
+                "text": "...",
+                "doc_id": "kaggle_5237",
+                "source": "Türk Ceza Kanunu",
+                "score": 1.0,
+            }
+        ]]
+        before_len = len(seed_batch[0])
+        expanded = gi.expand_batch(
+            seed_batch,
+            hops=0,
+            budget=0,
+            kinds=(),
+            queries=["TCK madde 86"],
+        )
+        # budget=0 and kinds=() prevent graph expansion; inject also off → same length
+        assert len(expanded[0]) == before_len
+
+    def test_expand_batch_with_queries_flag_on(self, tmp_path, monkeypatch):
+        """expand_batch with queries= injects direct-lookup chunks when flag is on."""
+        import config
+        monkeypatch.setattr(config, "DIRECT_MADDE_LOOKUP_ENABLED", True)
+        gi = _make_gi_with_lookup(tmp_path)
+        seed_batch = [[
+            {
+                "chunk_id": "Türk Ceza Kanunu_kaggle_5237_2",
+                "text": "...",
+                "doc_id": "kaggle_5237",
+                "source": "Türk Ceza Kanunu",
+                "score": 1.0,
+            }
+        ]]
+        expanded = gi.expand_batch(
+            seed_batch,
+            hops=0,
+            budget=0,
+            kinds=(),
+            queries=["TCK madde 86"],
+        )
+        ids = [c["chunk_id"] for c in expanded[0]]
+        # madde 86 chunk injected even though it wasn't in seed and budget=0
+        assert "Türk Ceza Kanunu_kaggle_5237_0" in ids
+
+
+# ---------------------------------------------------------------------------
+# Real metadata: GraphIndex round-trip and expand_batch on real chunk IDs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _RESULTS_META.exists(), reason="results/index/metadata.jsonl not available")
+class TestRealGraphIndex:
+    """Build graph from real metadata, save/load GraphIndex, verify expand_batch."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def real_gi(cls, tmp_path_factory):
+        tmp = tmp_path_factory.mktemp("real_gi")
+        metadata = [
+            json.loads(l) for l in _RESULTS_META.open(encoding="utf-8") if l.strip()
+        ]
+        from retrieval.graph_builder import build_graph_from_metadata, save_graph
+        g = build_graph_from_metadata(metadata)
+        g_path = tmp / "graph.json"
+        save_graph(g, g_path)
+        return GraphIndex(g_path, _RESULTS_META)
+
+    def test_graph_loaded(self, real_gi):
+        assert len(real_gi._graph) > 0
+
+    def test_lookup_loaded(self, real_gi):
+        assert len(real_gi._source_madde_lookup) > 0
+
+    def test_expand_batch_returns_extra_chunks(self, real_gi):
+        """expand_batch on real chunk IDs that have adj edges should add neighbors."""
+        # Find a chunk that has adj edges in the graph.
+        seed_id = next(
+            (cid for cid, edges in real_gi._graph.items()
+             if any(k == "adj" for _, k in edges)),
+            None,
+        )
+        assert seed_id is not None, "No chunk with adj edges found"
+        meta = real_gi._chunk_meta.get(seed_id)
+        assert meta is not None
+        seed = [{"chunk_id": seed_id, "text": meta["text"],
+                 "doc_id": meta["doc_id"], "source": meta["source"], "score": 1.0}]
+        expanded = real_gi.expand_batch([seed], hops=1, budget=3, kinds=("adj",))
+        assert len(expanded[0]) > len(seed), (
+            f"expand_batch should add adj neighbors for {seed_id}"
+        )
