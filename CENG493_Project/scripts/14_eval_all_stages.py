@@ -367,6 +367,9 @@ def run_stage(
         if "graph_index" not in reranker_cache:
             graph_path = config.INDEX_DIR / config.GRAPH_FILE
             meta_path = config.INDEX_DIR / config.METADATA_FILE
+            # Fallback: use published results/index/ when local index/ is absent.
+            if not meta_path.exists():
+                meta_path = config.BASE_DIR.parent / "results" / "index" / config.METADATA_FILE
             if graph_path.exists() and meta_path.exists():
                 print(f"  Loading graph index: {graph_path}")
                 reranker_cache["graph_index"] = GraphIndex(graph_path, meta_path)

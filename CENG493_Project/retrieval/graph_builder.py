@@ -20,7 +20,8 @@ _INTRA_RE = re.compile(
 _CROSS_LAW_RE = re.compile(
     r"(\d{2,5})\s*sayılı\s+"
     r"([A-Za-zÇĞİÖŞÜçğıöşü \.''\-]+?)\s+"
-    r"(?:Kanunu?|Yasası?)\b",
+    r"(?:Kanunu?|Yasası?)[a-zçğıöşü]*",
+    # No \b: Turkish case suffixes like "Kanununda", "Kanunundan" must also match.
 )
 
 _MADDE_WINDOW_RE = re.compile(
@@ -29,7 +30,24 @@ _MADDE_WINDOW_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Legacy: chunk_ids ending with _m<num>(_<sub>)? (old format).
 _CHUNK_SUFFIX_RE = re.compile(r"m(\d+)(?:_(\d+))?$")
+
+# doc_id pattern: e.g. "Hukuk Muhakemeleri Kanunu_madde_42"
+_DOC_ID_MADDE_RE = re.compile(r"_madde_(\d+)$", re.IGNORECASE)
+
+# First MADDE heading in text (covers Ek Madde / Geçici Madde / regular).
+_TEXT_MADDE_RE = re.compile(
+    r"(?:"
+    r"(?:Ek|EK)\s+[Mm]adde\s+(\d+)"        # group 1: ek-N
+    r"|[Gg]eçici\s+[Mm]adde\s+(\d+)"        # group 2: gecici-N
+    r"|(?:GEÇİCİ\s+MADDE)\s+(\d+)"          # group 3: gecici-N all-caps
+    r"|(?:MADDE|Madde)\s+(\d+)"             # group 4: regular N
+    r")"
+)
+
+# Trailing integer in chunk_id for sub-chunk ordering.
+_TRAILING_INT_RE = re.compile(r"_(\d+)$")
 
 _CROSS_WINDOW = 200
 
@@ -53,10 +71,16 @@ _NUM_MAP, _NAME_MAP = _build_reverse_maps()
 # ── internal helpers ──────────────────────────────────────────────
 
 
+def _parse_sub_idx(chunk_id: str) -> int | None:
+    """Return the trailing integer of chunk_id for sub-chunk ordering."""
+    m = _TRAILING_INT_RE.search(chunk_id)
+    return int(m.group(1)) if m else None
+
+
 def _parse_chunk_suffix(
     chunk_id: str, source: str, doc_id: str,
 ) -> tuple[str | None, int | None]:
-    """Return (madde_no, sub_idx) from the chunk_id suffix."""
+    """Legacy fallback: return (madde_no, sub_idx) from old _m<num>(_sub)? suffix."""
     prefix = f"{source}_{doc_id}_"
     if not chunk_id.startswith(prefix):
         return None, None
@@ -64,6 +88,52 @@ def _parse_chunk_suffix(
     if not m:
         return None, None
     return m.group(1), (int(m.group(2)) if m.group(2) is not None else None)
+
+
+def _extract_madde_no(rec: dict) -> tuple[str | None, int | None]:
+    """Return (madde_no, sub_idx) from a metadata record using multi-source resolution.
+
+    Resolution order (first match wins):
+    1. ``rec["madde_no"]`` — explicit field written by updated ``_article_chunk``.
+    2. doc_id suffix ``_madde_<N>`` — extra_laws.jsonl format.
+    3. First MADDE / Ek Madde / Geçici Madde heading in ``rec["text"]``.
+    4. Legacy chunk_id suffix ``_m<N>(_sub)?`` — old test fixtures / pre-fix index.
+
+    ``sub_idx`` is always derived from the trailing integer of ``chunk_id`` so that
+    sub-chunks of the same article can be ordered correctly.
+    """
+    # 1. Explicit madde_no field (new CorpusChunk serialization).
+    madde_no = rec.get("madde_no")
+    if madde_no is not None:
+        return str(madde_no), _parse_sub_idx(rec["chunk_id"])
+
+    # 2. doc_id pattern: e.g. "Devlet Memurları Kanunu_madde_44"
+    doc_id = rec.get("doc_id", "")
+    m = _DOC_ID_MADDE_RE.search(doc_id)
+    if m:
+        return m.group(1), _parse_sub_idx(rec["chunk_id"])
+
+    # 3. Text-based extraction — look for the first MADDE heading in the chunk text.
+    text = rec.get("text", "")
+    if text:
+        tm = _TEXT_MADDE_RE.search(text[:600])
+        if tm:
+            if tm.group(1):
+                return f"ek-{tm.group(1)}", _parse_sub_idx(rec["chunk_id"])
+            if tm.group(2) or tm.group(3):
+                n = tm.group(2) or tm.group(3)
+                return f"gecici-{n}", _parse_sub_idx(rec["chunk_id"])
+            if tm.group(4):
+                return tm.group(4), _parse_sub_idx(rec["chunk_id"])
+
+    # 4. Legacy: old chunk_id suffix _m<num>(_sub)?
+    src = rec.get("source", "")
+    return _parse_chunk_suffix(rec["chunk_id"], src, doc_id)
+
+
+def _madde_no_is_numeric(madde_no: str) -> bool:
+    """Return True when madde_no represents a plain integer (not ek-/gecici-)."""
+    return madde_no.isdigit()
 
 
 def _resolve_cross_source(kanun_no: str, kanun_name: str) -> str | None:
@@ -112,16 +182,29 @@ def extract_references(
 def build_graph_from_metadata(
     metadata: list[dict],
 ) -> dict[str, list[tuple[str, str]]]:
-    """Build the full cross-reference graph (two passes over metadata)."""
+    """Build the full cross-reference graph (two passes over metadata).
+
+    Pass 1 — resolve madde_no for every chunk via :func:`_extract_madde_no`,
+    which handles four formats:
+
+    * New ``madde_no`` field written by updated ``_article_chunk``.
+    * doc_id suffix ``_madde_<N>`` (extra_laws.jsonl format).
+    * First ``MADDE / Ek Madde / Geçici Madde`` heading in chunk text
+      (catches existing published metadata.jsonl without re-chunking).
+    * Legacy ``_m<N>(_sub)?`` chunk_id suffix (old test fixtures / backward compat).
+
+    Pass 2 — scan chunk texts for intra- and cross-law references and add edges.
+    """
     src_madde: dict[tuple[str, str], list[str]] = defaultdict(list)
     doc_madde: dict[tuple[str, str], dict[str, list[str]]] = defaultdict(
         lambda: defaultdict(list),
     )
+    # cinfo: chunk_id → (madde_no, sub_idx)
     cinfo: dict[str, tuple[str | None, int | None]] = {}
 
     for rec in metadata:
         cid, src, did = rec["chunk_id"], rec["source"], rec["doc_id"]
-        mn, si = _parse_chunk_suffix(cid, src, did)
+        mn, si = _extract_madde_no(rec)
         cinfo[cid] = (mn, si)
         if mn is not None:
             src_madde[(src, mn)].append(cid)
@@ -135,14 +218,19 @@ def build_graph_from_metadata(
     edges: dict[str, set[tuple[str, str]]] = defaultdict(set)
 
     for (_src, _did), mm in doc_madde.items():
-        nums = sorted(mm, key=int)
-        for i, mn in enumerate(nums):
-            if i + 1 < len(nums) and int(nums[i + 1]) - int(mn) == 1:
-                nxt = nums[i + 1]
+        # Sort only numeric madde_nos for adjacency; skip ek-/gecici- in ordering.
+        numeric_nums = sorted(
+            (mn for mn in mm if _madde_no_is_numeric(mn)),
+            key=int,
+        )
+        for i, mn in enumerate(numeric_nums):
+            if i + 1 < len(numeric_nums) and int(numeric_nums[i + 1]) - int(mn) == 1:
+                nxt = numeric_nums[i + 1]
                 for a in mm[mn]:
                     for b in mm[nxt]:
                         edges[a].add((b, "adj"))
                         edges[b].add((a, "adj"))
+            # Sub-chunk adjacency within same madde (e.g. long article split into pieces).
             clist = mm[mn]
             if len(clist) > 1:
                 ordered = sorted(
@@ -190,6 +278,25 @@ def build_graph_from_metadata(
         sum(1 for k in graph if not k.startswith("_")),
     )
     return graph
+
+
+def lookup_by_source_madde(
+    graph: dict,
+    source: str,
+    madde_no: str,
+) -> list[str]:
+    """Return chunk_ids for the given (source, madde_no) pair from the lookup table.
+
+    This is the *direct reference lookup* used when a query explicitly mentions
+    e.g. "TCK 86. madde" or "5237 sayılı kanun madde 86".  The caller is
+    responsible for resolving the source name via :func:`_resolve_cross_source`
+    and normalising madde_no to a string integer before calling this function.
+
+    Enabled only when ``config.DIRECT_MADDE_LOOKUP_ENABLED`` is True (default
+    False) so existing pipelines are not affected.
+    """
+    lookup = graph.get("_source_madde_lookup", {})
+    return list(lookup.get(f"{source}||{madde_no}", []))
 
 
 def save_graph(graph: dict, path: Path) -> None:

@@ -22,6 +22,34 @@ _TEXT_SPLITTER = RecursiveCharacterTextSplitter(
 _ARTICLE_RE = re.compile(r"(?m)(?=^\s*MADDE\s+\d)", re.IGNORECASE)
 
 
+_MADDE_HEADING_RE = re.compile(
+    r"(?:"
+    r"(?:Ek|EK)\s+[Mm]adde\s+(\d+)"          # group 1: ek-N
+    r"|[Gg]eçici\s+[Mm]adde\s+(\d+)"          # group 2: gecici-N
+    r"|(?:GEÇİCİ\s+MADDE)\s+(\d+)"            # group 3: gecici-N (all caps)
+    r"|(?:MADDE|Madde)\s+(\d+)"               # group 4: N
+    r")"
+)
+
+
+def _madde_no_from_text(text: str) -> "str | None":
+    """Return the leading article number from text, or None if absent.
+
+    Returns:
+        "N" for a regular article, "ek-N" for supplementary articles
+        (Ek Madde), "gecici-N" for transitory articles (Geçici Madde).
+    """
+    m = _MADDE_HEADING_RE.search(text[:600])
+    if m is None:
+        return None
+    if m.group(1):
+        return f"ek-{m.group(1)}"
+    if m.group(2) or m.group(3):
+        n = m.group(2) or m.group(3)
+        return f"gecici-{n}"
+    return m.group(4)
+
+
 @dataclass
 class CorpusChunk:
     chunk_id: str   # f"{source}_{doc_id}_{chunk_index}"
@@ -29,6 +57,7 @@ class CorpusChunk:
     text: str
     source: str
     char_len: int
+    madde_no: "str | None" = None  # e.g. "12", "ek-3", "gecici-2", or None
 
 
 @dataclass
@@ -177,6 +206,7 @@ class DataProcessor:
             part = part.strip()
             if not part or len(part) < config.MIN_CHUNK_CHARS:
                 continue
+            madde_no = _madde_no_from_text(part)
             if len(part) <= config.CHUNK_SIZE:
                 chunks.append(CorpusChunk(
                     chunk_id=f"{source}_{doc_id}_{chunk_index}",
@@ -184,6 +214,7 @@ class DataProcessor:
                     text=part,
                     source=source,
                     char_len=len(part),
+                    madde_no=madde_no,
                 ))
                 chunk_index += 1
             else:
@@ -203,6 +234,7 @@ class DataProcessor:
                         text=sub_chunk,
                         source=source,
                         char_len=len(sub_chunk),
+                        madde_no=madde_no,
                     ))
                     chunk_index += 1
         return chunks
