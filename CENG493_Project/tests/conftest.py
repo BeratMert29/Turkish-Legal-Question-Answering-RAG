@@ -52,6 +52,11 @@ def _stub_if_missing(name: str) -> None:
 
         # Populate common sub-module paths that source code accesses via
         # attribute chains so that e.g. `torch.cuda.is_available()` works.
+        if name == "evaluate":
+            # Force qa_metrics onto its pure-Python BLEU/ROUGE fallback:
+            # a bare MagicMock would make hf_evaluate.load() succeed and
+            # BLEU would come back as a MagicMock/1.0.
+            mock.load.side_effect = RuntimeError("evaluate stub: load unavailable")
         if name == "torch":
             # scipy (installed as a ranx dep) checks:
             #   issubclass(cls, torch.Tensor)

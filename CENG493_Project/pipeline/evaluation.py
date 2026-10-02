@@ -107,9 +107,16 @@ def run_generation_loop(
                 "retrieved_sources": [],
                 "expected_source": qa.source,
                 "retrieved_chunks": [],
+                "generation_error": True,
+                "error": f"{type(exc).__name__}: {exc}",
             })
 
     return predictions
+
+
+def failure_rate_exceeded(failed: int, total: int, max_rate: float) -> bool:
+    """True when failed/total is strictly greater than *max_rate*."""
+    return total > 0 and (failed / total) > max_rate
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +229,8 @@ def run_llm_judge_eval(
         "relevancy": None,
         "coherence": None,
         "parse_failures": None,
+        "failure_count": 0,
+        "call_count": 0,
     }
 
     judge_preds = [
@@ -262,6 +271,10 @@ def run_llm_judge_eval(
         "relevancy": relev_result.get("parse_fail_count", 0),
         "coherence": coher_result.get("parse_fail_count", 0),
     }
+
+    _all = (judge_result, faith_result, relev_result, coher_result)
+    result["failure_count"] = sum(r.get("parse_fail_count", 0) for r in _all)
+    result["call_count"] = sum(r.get("sample_size", 0) for r in _all)
 
     _fmt = lambda v: f"{v:.4f}" if v is not None else "N/A"
     print(
@@ -498,10 +511,19 @@ def run_stage(
         stage_key=stage_key, inject_citations_fn=_inject_fn,
     )
 
+    n_generated_total = len(predictions)
     failed = [p for p in predictions if not p.get("predicted")]
+    n_generation_errors = sum(1 for p in predictions if p.get("generation_error"))
     predictions = [p for p in predictions if p.get("predicted")]
     if failed:
         print(f"    Filtered {len(failed)} failed generation(s) from QA metrics.")
+    _max_rate = getattr(config, "MAX_FAILURE_RATE", 0.2)
+    generation_failed = failure_rate_exceeded(len(failed), n_generated_total, _max_rate)
+    if generation_failed:
+        print(
+            f"    !!! WARNING: {len(failed)}/{n_generated_total} generations failed "
+            f"(> {_max_rate:.0%}); stage {stage_key} marked FAILED !!!"
+        )
 
     from evaluation.qa_metrics import compute_all_qa_metrics_with_citation
 
@@ -563,6 +585,9 @@ def run_stage(
     llm_coherence_score = None
     llm_faithfulness_score = None
     llm_judge_parse_failures: Optional[dict] = None
+    judge_failure_count = 0
+    judge_call_count = 0
+    judge_crashed = False
 
     try:
         _judge_sample = getattr(config, "LLM_JUDGE_SAMPLE_SIZE", 20)
@@ -578,12 +603,24 @@ def run_stage(
         llm_relevancy_score = judge["relevancy"]
         llm_coherence_score = judge["coherence"]
         llm_judge_parse_failures = judge["parse_failures"]
+        judge_failure_count = judge["failure_count"]
+        judge_call_count = judge["call_count"]
     except Exception as exc:
+        judge_crashed = True
         print(f"    WARNING: LLM Judge failed: {exc}")
+    judge_failed = judge_crashed or failure_rate_exceeded(
+        judge_failure_count, judge_call_count, _max_rate,
+    )
+    if judge_failed:
+        print(
+            f"    !!! WARNING: LLM judge failures {judge_failure_count}/{judge_call_count}"
+            f"{' (judge crashed)' if judge_crashed else ''} exceed {_max_rate:.0%}; "
+            f"stage {stage_key} marked FAILED !!!"
+        )
 
     # -- Semantic Similarity -----------------------------------------------
     print("  Semantic similarity …")
-    sem_sim = 0.0
+    sem_sim = None
     try:
         from evaluation.semantic_similarity import compute_semantic_similarity
 
@@ -591,7 +628,8 @@ def run_stage(
         sem_sim = sem_result["mean_similarity"]
         print(f"    SemanticSim={sem_sim:.4f}")
     except Exception as exc:
-        print(f"    WARNING: Semantic similarity failed: {exc}")
+        sem_sim = None
+        print(f"    WARNING: Semantic similarity failed (recorded as null): {exc}")
 
     # -- Final Scenario Scores ---------------------------------------------
     from evaluation.final_score import compute_all_scenario_scores
@@ -619,6 +657,17 @@ def run_stage(
 
     # -- Assemble & save ---------------------------------------------------
     final = {
+        "status": "failed" if (generation_failed or judge_failed) else "ok",
+        "failure_counts": {
+            "generation_total": n_generated_total,
+            "generation_failed": len(failed),
+            "generation_errors": n_generation_errors,
+            "judge_calls": judge_call_count,
+            "judge_failed": judge_failure_count,
+            "judge_crashed": judge_crashed,
+            "semantic_similarity_failed": sem_sim is None,
+            "max_failure_rate": _max_rate,
+        },
         "hyperparameters": {
             "stage": stage_key,
             "stage_name": stage.name,

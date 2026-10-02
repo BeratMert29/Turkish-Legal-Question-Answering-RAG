@@ -69,30 +69,28 @@ def _parse_score(text: str) -> Optional[float]:
         parsed.  Callers must treat None as a failed parse and exclude it from
         aggregate statistics rather than substituting a default value.
     """
-    text = text.strip()
+    if not text:
+        return None
+    # Decimal comma ("0,8") -> decimal point
+    text = re.sub(r'(?<=\d),(?=\d)', '.', text.strip())
 
-    # 1. Try exact standalone float in [0,1] (e.g. "0.7", "1", "0.85")
+    # 1. Exact standalone float in [0,1] (e.g. "0.7", "1", "0.85")
     m = re.match(r'^([01](?:\.\d+)?)\s*$', text)
     if m:
         return max(0.0, min(1.0, float(m.group(1))))
 
-    # 2. Try N/10 format (e.g. "7/10", "8.5/10")
-    m = re.search(r'(\d+(?:\.\d+)?)\s*/\s*10', text)
+    # 2. N/D formats (N/10, N/5, N/1): the denominator is the scale
+    m = re.search(r'(?<![\d.])(\d+(?:\.\d+)?)\s*/\s*(10|5|1)(?!\d)', text)
     if m:
-        return max(0.0, min(1.0, float(m.group(1)) / 10.0))
+        return max(0.0, min(1.0, float(m.group(1)) / float(m.group(2))))
 
-    # 3. Try N/5 format (e.g. "4/5")
-    m = re.search(r'(\d+(?:\.\d+)?)\s*/\s*5', text)
-    if m:
-        return max(0.0, min(1.0, float(m.group(1)) / 5.0))
-
-    # 4. Try standalone decimal in [0,1] anywhere in text (anchored by word boundary)
-    m = re.search(r'(?<!\d)(?<![/\d])([01]\.\d+)(?!\s*/)', text)
+    # 3. Standalone decimal in [0,1] anywhere in text
+    m = re.search(r'(?<![\d/.])([01]\.\d+)(?!\d)(?!\s*/)', text)
     if m:
         return max(0.0, min(1.0, float(m.group(1))))
 
-    # 5. Try standalone "0" or "1" not part of larger number
-    m = re.search(r'(?<!\d)([01])(?!\d|\.?\d)', text)
+    # 4. Standalone "0" or "1" not part of a larger number
+    m = re.search(r'(?<![\d.])([01])(?![\d/]|\.\d)', text)
     if m:
         return float(m.group(1))
 
@@ -108,11 +106,11 @@ def _ollama_generate(
     base_url: str,
     model: str,
     max_retries: int = 3,
-) -> str:
+) -> Optional[str]:
     """Call Ollama /api/generate and return the response text.
 
-    Returns empty string on unrecoverable error (instead of the old "0.5"
-    sentinel, which polluted _parse_score results).
+    Returns **None** on unrecoverable error (or an empty response after
+    retries) so callers can count it as a failure and exclude it from means.
     """
     base = base_url.rstrip("/")
     if base.endswith("/v1"):
@@ -131,7 +129,10 @@ def _ollama_generate(
             resp = requests.post(url, json=payload, timeout=30)
             resp.raise_for_status()
             data = resp.json()
-            return data.get("response", "").strip()
+            text = data.get("response", "").strip()
+            if text:
+                return text
+            raise ValueError("empty response from judge")
         except Exception as exc:
             if attempt < max_retries - 1:
                 time.sleep(1.5 * (attempt + 1))
@@ -139,8 +140,8 @@ def _ollama_generate(
                 logger.warning(
                     "_ollama_generate failed after %d retries: %s", max_retries, exc
                 )
-                return ""
-    return ""
+                return None
+    return None
 
 
 def _subsample(items: list, sample_size: int, seed: int = 42) -> list:
@@ -179,7 +180,7 @@ def save_raw_responses(
 def _aggregate(per_sample: list[dict]) -> dict:
     """Compute mean score excluding None/failed parses and return summary dict."""
     valid = [s["score"] for s in per_sample if s["score"] is not None]
-    fail_count = sum(1 for s in per_sample if s.get("parse_failed", False))
+    fail_count = sum(1 for s in per_sample if s.get("parse_failed", False) or s["score"] is None)
     mean_score: Optional[float] = sum(valid) / len(valid) if valid else None
     return {
         "score": mean_score,
@@ -235,7 +236,7 @@ def llm_judge_answer(
         )
 
         raw = _ollama_generate(prompt, ollama_base_url, model)
-        score = _parse_score(raw)
+        score = None if raw is None else _parse_score(raw)
         per_sample.append({
             "query_id": item.get("query_id", ""),
             "score": score,
@@ -290,7 +291,7 @@ def llm_judge_faithfulness(
         )
 
         raw   = _ollama_generate(prompt, ollama_base_url, model)
-        score = _parse_score(raw)
+        score = None if raw is None else _parse_score(raw)
         per_sample.append({
             "query_id": item.get("query_id", ""),
             "score": score,
@@ -342,7 +343,7 @@ def llm_judge_relevancy(
         )
 
         raw   = _ollama_generate(prompt, ollama_base_url, model)
-        score = _parse_score(raw)
+        score = None if raw is None else _parse_score(raw)
         per_sample.append({
             "query_id": item.get("query_id", ""),
             "score": score,
@@ -396,7 +397,7 @@ def llm_judge_coherence(
         )
 
         raw   = _ollama_generate(prompt, ollama_base_url, model)
-        score = _parse_score(raw)
+        score = None if raw is None else _parse_score(raw)
         per_sample.append({
             "query_id": item.get("query_id", ""),
             "score": score,
