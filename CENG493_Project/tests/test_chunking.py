@@ -150,3 +150,9 @@ class TestArticleChunk:
         for c in chunks:
             assert c.char_len > 0
             assert c.char_len == len(c.text)
+
+
+def test_gecici_madde_no_not_matched_as_int():
+    from data.data_processor import CorpusChunk, _chunk_matches_article
+    c = CorpusChunk(chunk_id="c", doc_id="d", source="s", text="t", char_len=1, madde_no="gecici-2")
+    assert _chunk_matches_article(c, 2) is False

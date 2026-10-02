@@ -75,7 +75,7 @@ def _chunk_matches_article(chunk: "CorpusChunk", madde_no: int) -> bool:
     # 1. Explicit madde_no field (set by corpus builder for article-chunked corpora)
     stored = getattr(chunk, "madde_no", None)
     if stored is not None:
-        return int(stored) == madde_no
+        return str(stored).strip() == str(madde_no)
 
     # 2. doc_id pattern — e.g. "Anayasa_madde_44" / "law_madde_44_2"
     if re.search(rf"madde[_\s]{madde_no}(?:[^\d]|$)", chunk.doc_id, re.IGNORECASE):
