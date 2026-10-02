@@ -11,3 +11,7 @@ CENG493_Project/data/*
 
 # Assignment PDF — keep local only
 CENG493_Project_Assignment_Turkish_Legal_RAG.pdf
+
+# Virtual environments
+.venv/
+venv/
