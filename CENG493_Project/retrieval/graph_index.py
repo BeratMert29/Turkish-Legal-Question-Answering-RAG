@@ -36,13 +36,54 @@ _LAW_ABBREVS: dict[str, str] = {
     "Anayasa": "Türkiye Cumhuriyeti Anayasası",
 }
 
-# "TCK madde 86" or "TCK 86. madde"
-_ABBREV_MADDE_RE = re.compile(
-    r"\b(TCK|CMK|TMK|TBK|HMK|TTK|İYUK|İİK|DMK|Anayasa)\b"
-    r"[^\n]{0,60}"
-    r"(?:(?:madde|MADDE)\s*(\d{1,4})|(\d{1,4})\s*\.?\s*madde)",
+
+def _abbrev_key(s: str) -> str:
+    """Turkish-aware key: all i/İ/ı/I variants collapse to İ, then upper()."""
+    return s.translate(str.maketrans("iIı", "İİİ")).upper()
+
+
+_LAW_ABBREVS_NORM: dict[str, str] = {_abbrev_key(k): v for k, v in _LAW_ABBREVS.items()}
+
+_TR_LETTER = "A-Za-zÇĞİIıÖŞÜçğöşü"
+_I = "[İIiı]"
+
+# Law abbreviation (case-insensitive, Turkish i/İ/ı/I variants accepted).
+_ABBREV_RE = re.compile(
+    rf"(?<![{_TR_LETTER}])"
+    rf"(TCK|CMK|TMK|TBK|HMK|TTK|{_I}YUK|{_I}{_I}K|DMK|Anayasa)"
+    rf"(?![{_TR_LETTER}])",
     re.IGNORECASE,
 )
+
+# Article number right after a law name, within that law's own window:
+# "madde 86", "md. 5", "m. 49", "86. madde", "86. maddesi", "86'ncı maddesi".
+_MADDE_AFTER_ABBREV_RE = re.compile(
+    rf"(?<![{_TR_LETTER}])(?:madde|md|m)\.?\s*(?<!\d)(\d{{1,4}})(?!\d)"
+    r"|(?<!\d)(\d{1,4})(?!\d)"
+    r"(?:\s*['\u2019]?\s*(?:inci|ıncı|nci|ncı|üncü|uncu))?"
+    r"\s*\.?\s*madde",
+    re.IGNORECASE,
+)
+
+_ABBREV_WINDOW = 60  # max chars after an abbreviation to look for its madde
+
+
+def find_abbrev_maddes(query: str) -> list[tuple[str, str]]:
+    """Return [(abbrev_key, madde_no)] binding each number to the nearest
+    preceding law abbreviation; each abbreviation's window ends at the next one."""
+    ams = list(_ABBREV_RE.finditer(query))
+    out: list[tuple[str, str]] = []
+    for i, am in enumerate(ams):
+        end = am.end() + _ABBREV_WINDOW
+        if i + 1 < len(ams):
+            end = min(end, ams[i + 1].start())
+        window = query[am.end(): end]
+        window = window.split("\n", 1)[0]
+        mm = _MADDE_AFTER_ABBREV_RE.search(window)
+        if mm:
+            out.append((_abbrev_key(am.group(1)), mm.group(1) or mm.group(2)))
+    return out
+
 
 _LOOKUP_WINDOW = 250  # chars after law name to search for madde number
 
@@ -147,13 +188,10 @@ class GraphIndex:
                     _add_chunks(src, mm.group(1))
 
         # Pattern B: abbreviation like "TCK madde 86" / "TCK 86. madde"
-        for am in _ABBREV_MADDE_RE.finditer(query):
-            abbrev = am.group(1).upper()
-            src = _LAW_ABBREVS.get(abbrev)
+        for abbrev, madde_no in find_abbrev_maddes(query):
+            src = _LAW_ABBREVS_NORM.get(abbrev)
             if src:
-                madde_no = am.group(2) or am.group(3)
-                if madde_no:
-                    _add_chunks(src, madde_no)
+                _add_chunks(src, madde_no)
 
         return results
 

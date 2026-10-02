@@ -546,3 +546,69 @@ class TestRealGraphIndex:
         assert len(expanded[0]) > len(seed), (
             f"expand_batch should add adj neighbors for {seed_id}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Abbreviation + madde regex, dedupe, self-loops
+# ---------------------------------------------------------------------------
+
+from retrieval.graph_index import find_abbrev_maddes  # noqa: E402
+
+
+class TestAbbrevMaddeParsing:
+    @pytest.mark.parametrize("q,exp", [
+        ("TCK 86. madde", [("TCK", "86")]),
+        ("İİK 72. madde", [("İİK", "72")]),
+        ("TMK madde 2 ve TBK madde 49", [("TMK", "2"), ("TBK", "49")]),
+        ("Anayasa 10. maddesi", [("ANAYASA", "10")]),
+        ("anayasa madde 138", [("ANAYASA", "138")]),
+        ("iik madde 72", [("İİK", "72")]),
+        ("IIK madde 72", [("İİK", "72")]),
+        ("TBK m. 49", [("TBK", "49")]),
+        ("TBK md. 5", [("TBK", "5")]),
+        ("TCK 86'ncı maddesi", [("TCK", "86")]),
+        ("TCK madde 1234", [("TCK", "1234")]),
+        ("TCK madde 5 ve TBK", [("TCK", "5")]),
+    ])
+    def test_forms(self, q, exp):
+        assert find_abbrev_maddes(q) == exp
+
+    def test_no_madde(self):
+        assert find_abbrev_maddes("TCK hakkında bilgi") == []
+
+    def test_inject_casing_and_two_laws(self, tmp_path, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "DIRECT_MADDE_LOOKUP_ENABLED", True)
+        gi = _make_gi_with_lookup(tmp_path)
+        ids = [r["chunk_id"] for r in gi.inject_from_query("tck 86. maddesi")]
+        assert "Türk Ceza Kanunu_kaggle_5237_0" in ids
+
+
+class TestDedupeAndSelfLoops:
+    def test_duplicate_ids_no_self_loops(self):
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "MADDE 5 - bkz. madde 5 ve madde 6.", "madde_no": "5",
+        }
+        rec2 = {
+            "chunk_id": "L_d_1", "doc_id": "d", "source": "L",
+            "text": "MADDE 6 - x.", "madde_no": "6",
+        }
+        g = build_graph_from_metadata([rec, dict(rec), rec2, dict(rec2)])
+        for k, es in g.items():
+            if k.startswith("_"):
+                continue
+            assert all(t != k for t, _ in es)
+        lk = g["_source_madde_lookup"]
+        assert lk["L||5"] == ["L_d_0"]
+        assert lk["L||6"] == ["L_d_1"]
+
+    def test_gecici_madde_no_graph(self):
+        recs = [
+            {"chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+             "text": "x", "madde_no": "gecici-2"},
+            {"chunk_id": "L_d_1", "doc_id": "d", "source": "L",
+             "text": "y", "madde_no": "7"},
+        ]
+        g = build_graph_from_metadata(recs)
+        assert g["_source_madde_lookup"]["L||gecici-2"] == ["L_d_0"]
