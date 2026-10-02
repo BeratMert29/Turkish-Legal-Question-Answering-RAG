@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
 CENG493_Project/index/
 CENG493_Project/results/
 CENG493_Project/tools/

@@ -73,6 +73,11 @@ GRAPH_NEIGHBOR_BUDGET = 3
 GRAPH_EDGE_KINDS = ("adj", "intra", "cross")
 GRAPH_DECAY = {"adj": 0.85, "intra": 0.70, "cross": 0.60}
 
+# Direct madde lookup: when True, queries that explicitly reference a law article
+# (e.g. "TCK 86. madde") inject that article's chunks via _source_madde_lookup.
+# Disabled by default; enable only after verifying graph quality on your index.
+DIRECT_MADDE_LOOKUP_ENABLED = False
+
 # LLM (Ollama — free, no API key)
 LLM_MODEL = "qwen2.5:14b"
 LLM_FINETUNED_MODEL = "qwen25-legal-ft"   # created by scripts/13_export_lora_to_ollama.py

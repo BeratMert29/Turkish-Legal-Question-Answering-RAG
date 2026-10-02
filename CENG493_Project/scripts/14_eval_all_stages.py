@@ -76,6 +76,25 @@ from utils import check_ollama, inject_citations, set_seeds
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Graph auto-build ──────────────────────────────────────────────────────────
+
+
+def _auto_build_graph(graph_path: Path) -> None:
+    """Build graph.json on the fly from the first available metadata file."""
+    candidates = [
+        config.INDEX_DIR / config.METADATA_FILE,
+        config.BASE_DIR.parent / "results" / "index" / config.METADATA_FILE,
+    ]
+    for meta_path in candidates:
+        if meta_path.exists():
+            print(f"  Auto-building graph from {meta_path} …")
+            from retrieval.graph_builder import build_graph_from_metadata, save_graph
+            meta = [json.loads(l) for l in meta_path.open(encoding="utf-8") if l.strip()]
+            save_graph(build_graph_from_metadata(meta), graph_path)
+            print(f"  Graph saved → {graph_path}")
+            return
+
+
 # External data loaders
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -280,6 +299,7 @@ def _retrieve(
             hops=config.GRAPH_HOPS,
             budget=config.GRAPH_NEIGHBOR_BUDGET,
             kinds=("adj",),  # use only adjacency edges (safest)
+            queries=questions,
         )
 
     print(f"    Retrieval done in {time.time()-t0:.1f}s")
@@ -369,6 +389,9 @@ def run_stage(
         if "graph_index" not in reranker_cache:
             graph_path = config.INDEX_DIR / config.GRAPH_FILE
             meta_path = config.INDEX_DIR / config.METADATA_FILE
+            # Fallback: use published results/index/ when local index/ is absent.
+            if not meta_path.exists():
+                meta_path = config.BASE_DIR.parent / "results" / "index" / config.METADATA_FILE
             if graph_path.exists() and meta_path.exists():
                 print(f"  Loading graph index: {graph_path}")
                 reranker_cache["graph_index"] = GraphIndex(graph_path, meta_path)
@@ -863,6 +886,8 @@ def main() -> None:
         stage = STAGE_REGISTRY[key]
         if stage.requires_graph:
             graph_path = config.INDEX_DIR / config.GRAPH_FILE
+            if not graph_path.exists():
+                _auto_build_graph(graph_path)
             if not graph_path.exists():
                 print(f"INFO: Stage '{key}' skipped — "
                       f"graph.json not found at {graph_path}\n"
