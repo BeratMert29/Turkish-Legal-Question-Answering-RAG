@@ -113,20 +113,16 @@ class GraphIndex:
                 self._graph[key] = [(nb_id, kind) for nb_id, kind in edges]
 
     def _load_metadata(self, path: Path) -> None:
-        with path.open(encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                record: dict = json.loads(line)
-                cid = record.get("chunk_id")
-                if cid is None:
-                    continue
-                self._chunk_meta[cid] = {
-                    "text": record.get("text", ""),
-                    "doc_id": record.get("doc_id", ""),
-                    "source": record.get("source", ""),
-                }
+        from utils import read_jsonl
+        for record in read_jsonl(path):
+            cid = record.get("chunk_id")
+            if cid is None:
+                continue
+            self._chunk_meta[cid] = {
+                "text": record.get("text", ""),
+                "doc_id": record.get("doc_id", ""),
+                "source": record.get("source", ""),
+            }
 
     # ── direct madde injection ────────────────────────────────────────────
 

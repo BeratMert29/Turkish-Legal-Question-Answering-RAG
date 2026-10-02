@@ -1,8 +1,50 @@
 """Shared utilities for the Turkish Legal RAG pipeline."""
+import json
+import logging
+import pathlib
 import re
 import unicodedata
 import random
+from typing import Iterator
+
 import numpy as np
+
+log = logging.getLogger(__name__)
+
+
+def read_jsonl(
+    path: "str | pathlib.Path",
+    *,
+    on_error: str = "warn",
+) -> "Iterator[dict]":
+    """Yield parsed dicts from a JSONL file, skipping blank lines.
+
+    Args:
+        path:     Path to the JSONL file.
+        on_error: ``"warn"`` (default) — skip bad lines and emit a
+                  ``logging.WARNING`` naming the file and 1-based line number.
+                  ``"raise"`` — raise a ``ValueError`` with the same context
+                  instead of skipping.
+
+    Yields:
+        Parsed dicts, one per non-blank line.
+
+    Raises:
+        ValueError: When *on_error* is ``"raise"`` and a line cannot be parsed.
+    """
+    p = pathlib.Path(path)
+    with p.open(encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                yield json.loads(raw)
+            except json.JSONDecodeError as exc:
+                msg = f"{p}:{lineno}: JSON parse error: {exc}"
+                if on_error == "raise":
+                    raise ValueError(msg) from exc
+                log.warning(msg)
 
 
 def normalize_turkish(text: str) -> str:

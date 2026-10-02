@@ -400,13 +400,9 @@ class DataProcessor:
         # Load supplementary law texts (HMK, TTK, İYUK, İİK, VUK, DMK, …)
         extra_path = pathlib.Path(config.BASE_DIR) / "data" / "extra_laws.jsonl"
         if extra_path.exists():
+            from utils import read_jsonl
             extra_kept = 0
-            with open(extra_path, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    entry = json.loads(line)
+            for entry in read_jsonl(extra_path):
                     text   = entry.get("text", "")
                     source = entry.get("source", "")
                     doc_id = entry.get("doc_id", "")
@@ -805,7 +801,13 @@ class DataProcessor:
 
     @staticmethod
     def load_jsonl(path) -> list[dict]:
-        """Load a JSONL file and return a list of raw dicts."""
+        """Load a JSONL file and return a list of raw dicts.
+
+        Delegates to :func:`utils.read_jsonl` which logs a warning (with file
+        name and 1-based line number) and skips any line that cannot be parsed
+        as JSON.
+        """
+        from utils import read_jsonl
         p = pathlib.Path(path)
         MAX_JSONL_BYTES = 2 * 1024 ** 3  # 2 GB
         file_size = p.stat().st_size
@@ -813,10 +815,4 @@ class DataProcessor:
             raise ValueError(
                 f"JSONL file too large to load: {file_size / 1024**3:.1f} GB > 2 GB limit: {p}"
             )
-        results: list[dict] = []
-        with p.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    results.append(json.loads(line))
-        return results
+        return list(read_jsonl(p))
