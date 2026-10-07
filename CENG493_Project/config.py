@@ -2,6 +2,9 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 
+# Global RNG seed (python/numpy/torch, sampling of judge/NLI/perplexity subsets)
+SEED = 42
+
 # Chunking
 CHUNK_SIZE = 1400
 CHUNK_OVERLAP = 180
@@ -18,6 +21,10 @@ PROCESSED_DIR = BASE_DIR / "data/processed"
 INDEX_DIR = BASE_DIR / "index"
 INDEX_FILE = "faiss.index"
 METADATA_FILE = "metadata.jsonl"
+# Root for scripts/14 runs: results/<eval_set>[_limitN]/<stage>/ plus an
+# ablation_summary.json per run directory, so runs on different eval sets or
+# quick --limit runs never overwrite each other.
+RESULTS_ROOT = BASE_DIR / "results"
 RESULTS_DIR = BASE_DIR / "results/stage1"
 RESULTS_DIR_BASE     = BASE_DIR / "results" / "stage_base"
 RESULTS_DIR_EMB_FT   = BASE_DIR / "results" / "stage_emb_finetuned"
@@ -78,7 +85,14 @@ HEADLINE_CHUNK_MIN_LABELED_FRACTION = 0.5
 # Embedding
 EMBEDDING_MODEL = "BAAI/bge-m3"
 FINETUNED_EMBEDDING_MODEL = str(BASE_DIR / "models" / "bge-m3-turkish-legal")
-HF_PERPLEXITY_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+# Perplexity is computed with the generator's own weights: the HF base of the
+# Ollama model (LORA_BASE_HF_MODEL) plus, for the fine-tuned stages, the LoRA
+# adapter.  Set a model id here only to override that (not comparable across
+# stages then).  PERPLEXITY_ENABLED=False skips the phase (it loads a 7B model).
+HF_PERPLEXITY_MODEL = None
+PERPLEXITY_ENABLED = True
+PERPLEXITY_SAMPLE_SIZE = 100
+PERPLEXITY_MAX_TOKENS = 4096   # prefix is cut from the left, never the answer
 EMBEDDING_DIM = 1024
 EMBEDDING_BATCH_SIZE = 8  # lower = less VRAM; increase to 32 if you have 12GB+ VRAM
 
@@ -119,6 +133,10 @@ LLM_BASE_FOR_ABLATION = "qwen2.5:7b"
 LORA_BASE_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 LLM_MODEL = LLM_BASE_FOR_ABLATION
 LLM_FINETUNED_MODEL = "qwen25-legal-ft"   # created by scripts/13_export_lora_to_ollama.py
+# LoRA adapter written by scripts/08 (a copy is committed under
+# results/model_configs/qwen25_lora).
+LORA_ADAPTER_DIR = BASE_DIR / "models" / "qwen25_lora"
+LORA_ADAPTER_FALLBACK_DIR = BASE_DIR.parent / "results" / "model_configs" / "qwen25_lora"
 LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_API_KEY = "ollama"
 LLM_TEMPERATURE = 0.0

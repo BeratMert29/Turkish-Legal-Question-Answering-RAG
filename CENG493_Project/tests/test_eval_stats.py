@@ -53,3 +53,26 @@ def test_paired_dict_alignment_and_drop_none():
 def test_paired_length_mismatch_raises():
     with pytest.raises(ValueError):
         paired_bootstrap([1, 2], [1])
+
+
+def test_holm_adjust_matches_hand_calculation():
+    from evaluation.stats import holm_adjust
+    adj = holm_adjust({"a": 0.01, "b": 0.04, "c": 0.03, "d": None})
+    # sorted: a .01*3=.03, c .03*2=.06, b .04*1=.04 -> monotone max .06
+    assert adj["a"] == pytest.approx(0.03)
+    assert adj["c"] == pytest.approx(0.06)
+    assert adj["b"] == pytest.approx(0.06)
+    assert adj["d"] is None
+
+
+def test_compare_stages_aligns_by_query_id_and_skips_missing_pairs():
+    from pipeline.evaluation import compare_stages
+    base = [{"query_id": f"q{i}", "f1": 0.2} for i in range(30)]
+    # reversed order: alignment must use query_id, not position
+    llm = [{"query_id": f"q{i}", "f1": 0.5} for i in reversed(range(30))]
+    out = compare_stages({"base": base, "llm_ft": llm}, metrics=("f1", "judge_answer"))
+    r = out["f1"]["base->llm_ft"]
+    assert r["mean_diff"] == pytest.approx(0.3)
+    assert r["n"] == 30 and r["significant_holm"]
+    assert "judge_answer" not in out          # no values -> no comparison
+    assert set(out["f1"]) == {"base->llm_ft"}  # pairs with an absent stage skipped

@@ -33,7 +33,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import config
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-ADAPTER_DIR    = config.BASE_DIR / "models" / "qwen25_lora"
+ADAPTER_DIR    = config.LORA_ADAPTER_DIR
 MERGED_DIR     = config.BASE_DIR / "models" / "qwen25_merged"
 GGUF_PATH      = config.BASE_DIR / "models" / "qwen25_merged.gguf"
 MODELFILE_PATH = config.BASE_DIR / "models" / "Modelfile"

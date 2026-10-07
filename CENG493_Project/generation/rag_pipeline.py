@@ -31,6 +31,16 @@ ZORUNLU KURALLAR:
 
 Yanıtını yalnızca Türkçe ver."""
 
+def format_source(i: int, source: str, text: str) -> str:
+    """One numbered context block, exactly as the generator sees it."""
+    return f"[Kaynak {i}] ({source})\n{text}\n\n"
+
+
+def user_message(question: str, context: str) -> str:
+    """User turn sent to the generator."""
+    return f"Bağlam:\n{context}\n\nSoru: {question}"
+
+
 class ChunkExpander:
     """Merge chunk text with adjacent chunks (same chunk_id prefix) from metadata."""
 
@@ -172,7 +182,7 @@ class RAGPipeline:
                 if self._chunk_expander is not None
                 else chunk["text"]
             )
-            part = f"[Kaynak {i+1}] ({chunk['source']})\n{text}\n\n"
+            part = format_source(i + 1, chunk['source'], text)
             if i > 0 and running_len + len(part) > self.context_window_chars:
                 break
             parts.append(part)
@@ -189,7 +199,7 @@ class RAGPipeline:
             max_tokens=self._effective_max_tokens,
             messages=[
                 {"role": "system", "content": self._system_prompt},
-                {"role": "user", "content": f"Bağlam:\n{context}\n\nSoru: {question}"},
+                {"role": "user", "content": user_message(question, context)},
             ],
         )
         if not response.choices:

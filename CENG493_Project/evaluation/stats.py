@@ -100,3 +100,18 @@ def paired_bootstrap(
     return {"mean_diff": float(diff.mean()), "ci_low": float(lo), "ci_high": float(hi),
             "p_value": p, "significant": bool(lo > 0 or hi < 0), "n": n,
             "n_resamples": n_resamples, "confidence": confidence}
+
+
+def holm_adjust(pvalues: Mapping[str, float | None]) -> dict[str, float | None]:
+    """Holm-Bonferroni adjusted p-values (family = the given tests).
+
+    None entries are left as None and do not count towards the family size.
+    """
+    valid = sorted(((p, k) for k, p in pvalues.items() if p is not None))
+    m = len(valid)
+    out: dict[str, float | None] = {k: None for k in pvalues}
+    running = 0.0
+    for i, (p, k) in enumerate(valid):
+        running = max(running, min(1.0, (m - i) * p))
+        out[k] = running
+    return out

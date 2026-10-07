@@ -21,7 +21,7 @@ from generation.rag_pipeline import TURKISH_PROMPT
 
 HF_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 QLORA_MODEL_ID = config.LORA_BASE_HF_MODEL  # 7B; matches config.LLM_BASE_FOR_ABLATION
-ADAPTER_DIR = config.BASE_DIR / "models" / "qwen25_lora"
+ADAPTER_DIR = config.LORA_ADAPTER_DIR
 
 RAG_DATASET    = config.PROCESSED_DIR / "qa_train_rag.jsonl"
 MERGED_DATASET = config.PROCESSED_DIR / "qa_train_merged.jsonl"
