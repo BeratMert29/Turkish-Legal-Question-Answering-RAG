@@ -357,6 +357,114 @@ class QAExample:
     hf_row_id: "str | None" = None
 
 
+# ---------------------------------------------------------------------------
+# Gold-label strategies used by DataProcessor.build_relevant_chunk_map
+# ---------------------------------------------------------------------------
+
+class _LabelIndex:
+    """Lookup structures over the corpus, built once per labeling call."""
+
+    def __init__(self, corpus_chunks) -> None:
+        self.chunks = list(corpus_chunks)
+        self.hash_to_ids: dict[str, list[str]] = {}
+        self.by_source: dict[str, list] = {}
+        for chunk in self.chunks:
+            h = hashlib.md5(chunk.text.encode()).hexdigest()
+            self.hash_to_ids.setdefault(h, []).append(chunk.chunk_id)
+            self.by_source.setdefault(chunk.source, []).append(chunk)
+        self.valid_ids = {c.chunk_id for c in self.chunks}
+        self.inherited = _inherited_madde_nos(self.chunks)
+
+
+@dataclass
+class _QAFields:
+    """The QA fields labeling needs, from a QAExample or a plain dict."""
+    query_id: str
+    question: str
+    answer: str
+    context: str
+    source: str
+    madde_no: "str | None"
+    gold_ids: list
+
+    @classmethod
+    def of(cls, qa) -> "_QAFields":
+        get = qa.get if isinstance(qa, dict) else (lambda k, d=None: getattr(qa, k, d))
+        return cls(
+            query_id=get("query_id"),
+            question=get("question", "") or "",
+            answer=get("answer", "") or "",
+            context=get("context", "") or "",
+            source=get("source", "") or "",
+            madde_no=get("madde_no"),
+            gold_ids=list(get("gold_source_ids") or []),
+        )
+
+
+def _label_gold_ids(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """0: chunk ids supplied by an evaluator benchmark (those in the corpus)."""
+    return [gid for gid in q.gold_ids if gid in idx.valid_ids]
+
+
+def _label_explicit_madde(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """0.5: the explicit (source, madde_no) of the row (turkish_legal_rag)."""
+    if not (q.madde_no and q.source):
+        return []
+    return [c.chunk_id for c in idx.by_source.get(q.source, [])
+            if _chunk_matches_madde_str(c, q.madde_no, idx.inherited.get(c.chunk_id))]
+
+
+def _label_context_hash(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """1: re-chunk the row's context with the corpus chunker, match by hash."""
+    if not q.context:
+        return []
+    found: list[str] = []
+    for chunk in DataProcessor.chunk_text(q.context, q.query_id, q.source):
+        found.extend(idx.hash_to_ids.get(hashlib.md5(chunk.text.encode()).hexdigest(), []))
+    return list(dict.fromkeys(found))
+
+
+def _label_doc_id(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """2: chunks of the document whose id is the query id."""
+    return [c.chunk_id for c in idx.chunks if c.doc_id == q.query_id]
+
+
+def _label_answer_substring(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """2.5: chunks containing the first 80 characters of a long answer."""
+    if len(q.answer) < 40:
+        return []
+    needle = q.answer.lower().strip()[:80]
+    pool = idx.by_source.get(q.source, idx.chunks) if q.source else idx.chunks
+    return [c.chunk_id for c in pool if needle in c.text.lower()]
+
+
+def _label_article_mention(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """3: the article number named in the question/answer, in the gold law.
+
+    Queries naming no article stay unlabeled rather than labelling a whole law.
+    """
+    if not q.source:
+        return []
+    madde_no = _extract_madde_no(q.question, q.answer)
+    if madde_no is None:
+        return []
+    return [c.chunk_id for c in idx.by_source.get(q.source, [])
+            if _chunk_matches_article(c, madde_no)]
+
+
+def _label_silver_lexical(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """3.5 (optional): top-m chunks of the gold law by token overlap with
+    question+answer, above config.SILVER_THRESHOLD -- silver, not gold."""
+    source_chunks = idx.by_source.get(q.source, []) if q.source else []
+    if not source_chunks:
+        return []
+    q_tokens = _turkish_tokenize(f"{q.question} {q.answer}")
+    scored = sorted(((c, _silver_lexical_score(q_tokens, c.text)) for c in source_chunks),
+                    key=lambda x: -x[1])
+    return [c.chunk_id for c, score in scored[:config.SILVER_TOP_M]
+            if score >= config.SILVER_THRESHOLD]
+
+
 class DataProcessor:
     def __init__(self, csv_path):
         self.csv_path = csv_path
@@ -848,7 +956,8 @@ class DataProcessor:
         Build ground-truth relevance map using source/doc_id join.
         Model-independent: does NOT use embeddings to define relevance.
 
-        Strategy (in order):
+        Strategy (first one that yields chunks wins; see the ``_label_*``
+        functions):
         0. gold_source_ids: exact chunk IDs from evaluator benchmark
         0.5 explicit source + madde_no fields (turkish_legal_rag): chunks of that
            law whose article matches exactly
@@ -874,179 +983,50 @@ class DataProcessor:
         Returns:
             relevant_map: dict mapping query_id -> list of relevant chunk_ids.
             coverage_dict (only when return_coverage=True): dict with per-strategy
-                counts and label_strategy breakdown.
+                counts, label_strategy breakdown and the number of supplied gold
+                chunk ids missing from the corpus.
         """
         import logging
         log = logging.getLogger(__name__)
 
-        # Build lookup structures
-        hash_to_chunk_ids: dict[str, list[str]] = {}
-        by_source: dict[str, list] = {}
-        for chunk in corpus_chunks:
-            h = hashlib.md5(chunk.text.encode()).hexdigest()
-            hash_to_chunk_ids.setdefault(h, []).append(chunk.chunk_id)
-            by_source.setdefault(chunk.source, []).append(chunk)
-
-        # Issue 11 fix: build valid_ids once outside the per-query loop (O(N) not O(N*Q))
-        valid_ids = set(c.chunk_id for c in corpus_chunks)
-
-        inherited = _inherited_madde_nos(corpus_chunks)
+        index = _LabelIndex(corpus_chunks)
+        strategies = [
+            ("gold", _label_gold_ids),
+            ("explicit_madde", _label_explicit_madde),
+            ("context_hash", _label_context_hash),
+            ("doc_id", _label_doc_id),
+            ("answer_substr", _label_answer_substring),
+            ("article", _label_article_mention),
+        ]
+        if config.RELEVANCE_SILVER_LEXICAL:
+            strategies.append(("silver_lexical", _label_silver_lexical))
 
         relevant_map: dict[str, list[str]] = {}
-        # label_strategy tracks how each query was labeled (for coverage reporting)
         label_strategy_map: dict[str, str] = {}
-        # Coverage counters — one per labeling strategy
-        labeled_s0 = labeled_s05 = labeled_s1 = labeled_s2 = labeled_s25 = labeled_s3 = 0
-        labeled_silver = 0
-        unlabeled = 0
-        # Silver config (read once for performance)
-        silver_enabled = config.RELEVANCE_SILVER_LEXICAL
-        silver_top_m = config.SILVER_TOP_M
-        silver_threshold = config.SILVER_THRESHOLD
-
+        counts = collections.Counter({name: 0 for name in (
+            "gold", "explicit_madde", "context_hash", "doc_id",
+            "answer_substr", "article", "silver_lexical")})
+        missing_gold_ids = 0
         for qa in qa_examples:
+            q = _QAFields.of(qa)
+            missing_gold_ids += sum(1 for g in q.gold_ids if g not in index.valid_ids)
             relevant: list[str] = []
-
-            # Unified field accessors: support both QAExample dataclass and plain dict.
-            _is_dict = isinstance(qa, dict)
-            qa_query_id  = qa["query_id"]  if _is_dict else qa.query_id
-            qa_context   = qa.get("context", "") if _is_dict else qa.context
-            qa_answer    = qa.get("answer", "")  if _is_dict else qa.answer
-            qa_source    = qa.get("source", "")  if _is_dict else qa.source
-            qa_question  = qa.get("question", "") if _is_dict else getattr(qa, "question", "")
-
-            # Strategy 0: gold_source_ids — exact chunk IDs supplied by the
-            # evaluator's benchmark (gold_benchmark.json / rag_eval.json).
-            # These are chunk_ids that exist verbatim in the corpus, so we use
-            # them directly without any heuristic matching.
-            gold_ids = qa.get("gold_source_ids") if _is_dict else getattr(qa, "gold_source_ids", None)
-            if gold_ids:
-                relevant = [gid for gid in gold_ids if gid in valid_ids]
+            for name, label_fn in strategies:
+                relevant = label_fn(q, index)
                 if relevant:
-                    labeled_s0 += 1
-                    label_strategy_map[qa_query_id] = "gold"
-                    relevant_map[qa_query_id] = relevant
-                    continue  # Skip remaining strategies — ground truth is exact.
-
-            # Strategy 0.5: explicit source + madde_no fields (turkish_legal_rag).
-            # The gold article is given directly, so label the corpus chunks of
-            # that law and article without any text heuristics.
-            explicit_madde = qa.get("madde_no") if _is_dict else getattr(qa, "madde_no", None)
-            if explicit_madde and qa_source:
-                relevant = [
-                    c.chunk_id for c in by_source.get(qa_source, [])
-                    if _chunk_matches_madde_str(c, explicit_madde, inherited.get(c.chunk_id))
-                ]
-                if relevant:
-                    labeled_s05 += 1
-                    label_strategy_map[qa_query_id] = "explicit_madde"
-                    relevant_map[qa_query_id] = relevant
-                    continue
-
-            # Strategy 1: context-hash match — re-chunk qa.context using the same
-            # chunking path as the corpus index build (article or char chunking).
-            # This ensures hashes match exactly, regardless of ARTICLE_CHUNKING_ENABLED.
-            if qa_context:
-                for corpus_chunk in DataProcessor.chunk_text(qa_context, qa_query_id, qa_source or ""):
-                    h = hashlib.md5(corpus_chunk.text.encode()).hexdigest()
-                    relevant.extend(hash_to_chunk_ids.get(h, []))
-                # deduplicate while preserving order
-                seen: set[str] = set()
-                deduped = []
-                for cid in relevant:
-                    if cid not in seen:
-                        seen.add(cid)
-                        deduped.append(cid)
-                relevant = deduped
-            if relevant:
-                labeled_s1 += 1
-                label_strategy_map[qa_query_id] = "context_hash"
-
-            # Strategy 2: doc_id match — used when context is empty/missing
-            if not relevant:
-                relevant = [c.chunk_id for c in corpus_chunks if c.doc_id == qa_query_id]
-                if relevant:
-                    labeled_s2 += 1
-                    label_strategy_map[qa_query_id] = "doc_id"
-
-            # Strategy 2.5: answer substring match — for gold sets with known answers (e.g. HMGS)
-            # Find chunks that contain a significant portion of the answer text.
-            if not relevant and qa_answer and len(qa_answer) >= 40:
-                answer_lower = qa_answer.lower().strip()
-                search_str = answer_lower[:80] if len(answer_lower) >= 80 else answer_lower
-                candidate_chunks = by_source.get(qa_source, corpus_chunks) if qa_source else corpus_chunks
-                relevant = [c.chunk_id for c in candidate_chunks if search_str in c.text.lower()]
-                if relevant:
-                    labeled_s25 += 1
-                    label_strategy_map[qa_query_id] = "answer_substr"
-
-            # Strategy 3: article-level match — extract the madde (article) number from
-            # the question and answer text.  Match only corpus chunks that belong to that
-            # specific article in the correct source law.
-            #
-            # Design rationale: the previous strategy assigned the first N chunks of the
-            # entire source law as relevant, which is arbitrary and inflates
-            # Recall/MRR/nDCG for queries that do not cite a specific article.
-            # Article-level matching is precise but requires the query to reference an
-            # article number explicitly.  Queries where no article can be determined are
-            # left with an empty relevant set and are excluded from retrieval metrics by
-            # compute_all_metrics (queries with no ground-truth are always skipped).
-            # This is the correct behavior: we should not compute retrieval metrics for
-            # queries whose ground-truth relevance is unknown.
-            if not relevant and qa_source:
-                madde_no = _extract_madde_no(qa_question, qa_answer)
-                if madde_no is not None:
-                    source_chunks = by_source.get(qa_source, [])
-                    relevant = [
-                        c.chunk_id for c in source_chunks
-                        if _chunk_matches_article(c, madde_no)
-                    ]
-                    if relevant:
-                        labeled_s3 += 1
-                        label_strategy_map[qa_query_id] = "article"
-                # If madde_no is None: leave relevant=[] → query will be unlabeled
-                # and excluded from retrieval metrics.
-
-            # Strategy 3.5: silver lexical labeling — optional, off by default.
-            # Within the gold source law only, rank chunks by normalized token overlap
-            # with (question + answer) and label the top-m above threshold.
-            # Uses Turkish-aware case folding (İ→i, I→ı).
-            # This is a HEURISTIC: labels are "silver" quality, not gold.
-            # Do NOT use silver labels when precise article-level labels are available.
-            if not relevant and qa_source and silver_enabled:
-                source_chunks = by_source.get(qa_source, [])
-                if source_chunks:
-                    q_tokens = _turkish_tokenize(f"{qa_question} {qa_answer}")
-                    scored = [
-                        (c, _silver_lexical_score(q_tokens, c.text))
-                        for c in source_chunks
-                    ]
-                    scored.sort(key=lambda x: -x[1])
-                    relevant = [
-                        c.chunk_id for c, score in scored[:silver_top_m]
-                        if score >= silver_threshold
-                    ]
-                    if relevant:
-                        labeled_silver += 1
-                        label_strategy_map[qa_query_id] = "silver_lexical"
-
-            if not relevant:
-                unlabeled += 1
-                # Keep the key with empty list — retrieval_metrics.py already
-                # excludes queries with no ground-truth from metric computation.
-
-            relevant_map[qa_query_id] = relevant
+                    counts[name] += 1
+                    label_strategy_map[q.query_id] = name
+                    break
+            relevant_map[q.query_id] = relevant
 
         n_total = len(qa_examples)
+        unlabeled = sum(1 for v in relevant_map.values() if not v)
         labeled = n_total - unlabeled
         log.info(
-            "build_relevant_chunk_map coverage: "
-            "total=%d  labeled=%d (%.0f%%)  unlabeled=%d  "
-            "[s0(gold)=%d s0.5(explicit_madde)=%d s1(ctx_hash)=%d s2(doc_id)=%d s2.5(ans_substr)=%d "
-            "s3(article)=%d s3.5(silver_lexical)=%d]",
+            "build_relevant_chunk_map coverage: total=%d  labeled=%d (%.0f%%)  "
+            "unlabeled=%d  by_strategy=%s",
             n_total, labeled, 100 * labeled / n_total if n_total else 0,
-            unlabeled, labeled_s0, labeled_s05, labeled_s1, labeled_s2, labeled_s25,
-            labeled_s3, labeled_silver,
+            unlabeled, dict(counts),
         )
         if unlabeled:
             log.warning(
@@ -1054,6 +1034,13 @@ class DataProcessor:
                 "number found, no context/answer match, silver disabled or below "
                 "threshold).  These queries are excluded from retrieval metrics.",
                 unlabeled, n_total,
+            )
+        if missing_gold_ids:
+            # A missing gold id is unreachable gold, not a smaller gold set: the
+            # supplied ids do not match this corpus (stale ids / other chunking).
+            log.warning(
+                "build_relevant_chunk_map: %d supplied gold chunk ids are not in the "
+                "corpus; recall over the remaining ids is optimistic.", missing_gold_ids,
             )
 
         if not return_coverage:
@@ -1063,15 +1050,8 @@ class DataProcessor:
             "total": n_total,
             "labeled": labeled,
             "unlabeled": unlabeled,
-            "by_strategy": {
-                "gold":          labeled_s0,
-                "explicit_madde": labeled_s05,
-                "context_hash":  labeled_s1,
-                "doc_id":        labeled_s2,
-                "answer_substr": labeled_s25,
-                "article":       labeled_s3,
-                "silver_lexical": labeled_silver,
-            },
+            "by_strategy": dict(counts),
+            "missing_gold_ids": missing_gold_ids,
             "label_strategy_per_query": label_strategy_map,
         }
         return relevant_map, coverage
