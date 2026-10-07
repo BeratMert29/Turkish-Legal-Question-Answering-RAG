@@ -113,28 +113,24 @@ python scripts/14_eval_all_stages.py `
 
 ### Step 5 — Read results
 
-Results are written to `results/` per stage:
+Each run writes to its own directory, so runs on different eval sets or quick
+`--limit` runs never overwrite each other:
 
 ```
-results/
-├── stage_base/
-│   ├── baseline_metrics.json   ← all metrics in one file
-│   └── predictions.jsonl       ← per-question predictions
-├── stage_rrf_rerank/
-│   ├── baseline_metrics.json
-│   └── predictions.jsonl
-└── ablation_summary.json       ← side-by-side comparison of all stages
+results/<eval_set>[_limitN]/          e.g. results/turkish_legal_rag/, results/hmgs_limit10/
+├── <stage>/                          base, rrf_rerank, llm_ft, ...
+│   ├── baseline_metrics.json         all metrics + hyperparameters + provenance
+│   ├── predictions.jsonl             per-question answers, contexts, citation scores
+│   ├── per_query.jsonl               per-question metric values (CIs, paired tests)
+│   └── judge_raw_<metric>_<run>.jsonl
+├── <stage>_FAILED/                   a stage whose generation/judge failure rate was too high
+└── ablation_summary.json             {"run": ..., "stages": {...}, "comparisons": {...}}
 ```
 
-`baseline_metrics.json` contains:
-
-| Key | Description |
-|-----|-------------|
-| `retrieval_metrics` | Recall@5, Recall@10, MRR, nDCG@10, Precision@K |
-| `qa_metrics` | F1, ROUGE-L, BLEU, Exact Match, Citation Accuracy |
-| `hallucination_summary` | NLI-based faithfulness rate |
-| `llm_judge_score` | LLM-judged quality (0–1) |
-| `semantic_similarity` | Embedding similarity to gold answer |
+Re-running some stages merges them into the existing `ablation_summary.json`.
+`comparisons` holds paired bootstrap differences (same queries, Holm-corrected)
+for the one-factor stage pairs.  See [Evaluation Metrics](#evaluation-metrics)
+for the keys of `baseline_metrics.json`.
 
 ### Available stages
 
@@ -196,34 +192,43 @@ The 14B generator and `llama3.3:70b` judge are options on a larger GPU, but then
 the LoRA must be retrained on the matching base.
 
 ```bash
-# 1. Terminal A: Ollama server, one model resident, 8192-token context
-OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_CONTEXT_LENGTH=8192 ollama serve
+# 1. Terminal A: Ollama server, one model resident.  The context window,
+#    output length, stop sequences and seed are sent with every request
+#    (config.LLM_NUM_CTX etc.), so OLLAMA_CONTEXT_LENGTH is no longer required.
+OLLAMA_MAX_LOADED_MODELS=1 ollama serve
 
 # 2. Terminal B: models
 ollama pull qwen2.5:7b
-ollama pull llama3.1:8b
-# optional, only for the llm_ft / full stages:
+ollama pull llama3.1:8b          # judge; or run scripts/14 with --no-judge
+# llm_ft / full stages: re-export the LoRA so its Modelfile has the current
+# stop sequences and context window (older exports produced runaway answers)
 python scripts/13_export_lora_to_ollama.py
 
-# 3. Python deps
+# 3. Python deps (adds sacrebleu, snowballstemmer, pypdf, requests)
 pip install -r requirements.txt
 
-# 4. Optional: standalone index + graph (needed only for run_baseline.py,
-#    scripts/03 and the graph stage's graph.json; scripts/14 builds its own
-#    in-memory FAISS index and auto-builds graph.json)
-PYTHONUTF8=1 python scripts/02_build_index.py --corpus ../results/processed_data/corpus_chunks.jsonl
-PYTHONUTF8=1 python scripts/15_build_graph.py
+# 4. Optional: re-check the turkish_legal_rag gold labels against the current
+#    corpus (needs combined_dataset.csv via `git lfs pull`; the checked labels
+#    are committed, so this is only needed after changing the chunker/corpus)
+PYTHONUTF8=1 python scripts/17_check_tlr_labels.py --dry-run
 
-# 5. Smoke run (10 questions, two stages)
+# 5. Smoke run (10 questions, two stages) -> results/turkish_legal_rag_limit10/
 PYTHONUTF8=1 python scripts/14_eval_all_stages.py --stages base rrf_rerank --limit 10
 
-# 6. Full run (all stages whose prerequisites exist; the default eval set)
+# 6. Full run (all stages whose prerequisites exist) -> results/turkish_legal_rag/
 PYTHONUTF8=1 python scripts/14_eval_all_stages.py
 ```
 
-Re-export the LoRA with `13_export_lora_to_ollama.py` only if the Modelfile
-changed (it bakes in `LLM_NUM_CTX` and `LLM_MAX_TOKENS`); the 7B adapter already
-matches the base, no retraining is needed.
+`scripts/14` builds its FAISS index, BM25 index and graph in memory from the
+corpus, so `02_build_index.py` / `15_build_graph.py` are needed only for
+`run_baseline.py` (which refuses a saved index built from a different corpus).
+The chunker changed (article titles, short articles kept), so rebuild a saved
+index before using `run_baseline.py`.
+
+Perplexity loads the generator's HF weights (`Qwen/Qwen2.5-7B-Instruct`, 4-bit,
+plus the LoRA for the fine-tuned stages); set `PERPLEXITY_ENABLED = False` in
+`config.py` to skip it.  Useful flags: `--no-judge`, `--limit N`,
+`--results-root DIR`, `--eval-set {turkish_legal_rag,hmgs,kaggle}`.
 
 ---
 
@@ -245,28 +250,24 @@ The system includes five evaluation stages that progressively add components:
   base size (`config.LLM_BASE_FOR_ABLATION` = `qwen2.5:7b`; the committed
   adapter in `results/model_configs/qwen25_lora` is trained on
   `config.LORA_BASE_HF_MODEL` = `Qwen/Qwen2.5-7B-Instruct`, so they match),
-  the same `LLM_MAX_TOKENS` and the same `LLM_NUM_CTX`.  Each stage's
-  `baseline_metrics.json` records `llm_model`, `llm_max_tokens`, `llm_num_ctx`.
+  and every request carries the same `num_ctx`, `num_predict`, stop sequences
+  and seed (`config.LLM_NUM_CTX`, `LLM_MAX_TOKENS`, `LLM_STOP`, `SEED`).
 - **rrf vs rrf_rerank**: both fuse the same top-`RERANKER_CANDIDATES` (50)
   dense and BM25 candidates; only the cross-encoder reorder differs.
-- **graph** adds neighbours (adjacent chunks) of the top results.  Up to
-  `GRAPH_NEIGHBOR_BUDGET` of the `TOP_K_FOR_GENERATION` context slots are
-  reserved for them (`GRAPH_CONTEXT_RESERVE`), so the graph can change the
-  generated answer.  Retrieval metrics (Recall/MRR/nDCG/source-hit) are always
-  computed on the pre-expansion ranking, so graph and rrf_rerank have identical
-  retrieval numbers by construction; the effect shows up in QA metrics.
-- Failed generations stay in the QA-metric denominator and score 0; the count
-  is reported (`qa_metrics.n_generation_failed_scored_zero`).
-- Each stage writes `per_query.jsonl` (per-query metric arrays) and
-  `confidence_intervals` (95% bootstrap CIs); the ablation table shows an F1 CI.
-- Faithfulness (`Ctx-NLI`) is multilingual NLI of the answer against its
-  retrieved context; hallucination samples are stratified by whether the gold
-  chunk/law was retrieved at rank 1, 2-5 or missed.  Citation accuracy is
-  reported for the model's own citations (`native`) and after citation
-  injection (`injected`, mostly reflects retrieval overlap).
-- The corpus holds out eval rows only for `--eval-set kaggle`.
-  `14_eval_all_stages.py` aborts if fewer than 50% of `turkish_legal_rag`
-  queries have gold chunk labels (stale index/corpus).
+- **graph** adds neighbours (adjacent articles) of the kept top results.  Up to
+  `GRAPH_NEIGHBOR_BUDGET` context slots go to neighbours, and only when such a
+  neighbour exists.  Retrieval metrics are computed on the pre-expansion
+  ranking, so graph and rrf_rerank have identical retrieval numbers; the
+  effect shows up in answer metrics.
+- **Paired comparisons**: `compare_stages` reports later-minus-earlier deltas
+  for `base→hybrid`, `base→rrf`, `rrf→rrf_rerank`, `rrf_rerank→graph`,
+  `base→llm_ft`, `rrf_rerank→emb_ft`, `emb_ft→full` on the same queries, with
+  95% bootstrap CIs and Holm-corrected p-values.
+- Failed generations stay in the QA-metric denominator and score 0.  When more
+  than `MAX_FAILURE_RATE` fail, the LLM-based metrics are skipped (None) and the
+  stage is written to `<stage>_FAILED/`, marked `[FAILED]` in the table.
+- Every stage records provenance: git commit, seed, eval-file hash, corpus
+  fingerprint, Ollama model digests, package versions, BM25 tokenizer state.
 
 ### Retrieval Pipeline
 
@@ -285,13 +286,38 @@ The system includes five evaluation stages that progressively add components:
 
 ## Evaluation Metrics
 
-**Retrieval**: Recall@5, Recall@10, MRR, nDCG@10, Source Hit@K, Precision@K
+**Retrieval** (gold-labeled queries):
+- article level — Hit@5/10, MRR, nDCG@10 over (law, article) ids
+  (`retrieval_metrics.article_level`); independent of chunk size
+- chunk level — Recall@5/10, MRR, nDCG@10, Hit@k, capped recall, Precision@k
+  (one deduplicated ranking per query; None when no query is labeled)
+- source level — law hit@5/10, MRR, precision@5 for every query with a known law
 
-**QA**: F1, ROUGE-L, BLEU, Exact Match, Citation Accuracy, Source-in-Context Rate
+**Answer quality**: token F1 with separate token precision / recall, chrF++ and
+BLEU (sacrebleu, corpus level), ROUGE-L, exact match on token boundaries,
+answer containment, semantic similarity (multilingual mpnet), answer length,
+truncation and runaway-continuation rates.
 
-**Faithfulness**: NLI-based hallucination detection, semantic similarity, perplexity
+**Faithfulness (NLI, every answer)**: `faithfulness_rate` = mean fraction of
+answer sentences entailed by the context the generator actually saw
+(multilingual mDeBERTa); `gold_claim_recall` = fraction of gold-answer
+sentences the answer entails.
 
-**Overall**: LLM judge scores (quality, faithfulness, relevancy, coherence), 3 composite scenario scores
+**Citations**: the model's own `[Kaynak N]` citations checked against the gold
+article — precision, recall, invalid rate — next to the precision of a random
+context citation (`qa_metrics.citation_article_level`); law-level citation
+accuracy is kept for reference.
+
+**LLM judge** (`llama3.1:8b`, every answer, 0/0.5/1 rubric): answer quality,
+faithfulness, relevancy, coherence; parse and call failures are counted, and a
+failures-as-zero sensitivity mean is reported.  Calibrate against human labels
+with `scripts/18_judge_calibration.py` (Cohen's kappa).
+
+**Perplexity**: answer tokens only, under the generator's own weights.
+
+**Composites**: Scenario 1–3 with their components, weights and n saved under
+`scenario_components`; chunk MRR enters Scenario 1 only when most queries are
+gold-labeled.  Every per-query metric gets a 95% bootstrap CI.
 
 ---
 
@@ -301,19 +327,22 @@ The system includes five evaluation stages that progressively add components:
 CENG493_Project/
 ├── config.py                  # all hyperparameters and paths
 ├── requirements.txt
-├── utils.py
+├── utils.py                   # Turkish normalisation, citation injection, provenance
 ├── data/
-│   ├── corpus_loader.py       # custom doc ingestion (.txt/.pdf → chunks)
-│   └── processed/             # chunked corpus, train/eval JSONL files
-├── index/                     # FAISS vector index
-├── models/
-│   ├── bge-m3-turkish-legal/  # fine-tuned embedding model
-│   └── qwen25_lora/           # QLoRA adapter weights
-├── results/                   # per-stage eval output (metrics, predictions)
-├── evaluation/                # metric modules (F1, RAGAS, hallucination, etc.)
+│   ├── data_processor.py      # chunking (article-aware), eval/train sets, gold labels
+│   ├── tlr_labels.py          # check turkish_legal_rag gold articles against the law text
+│   ├── extra_laws_cleaner.py  # clean the scraped supplementary laws
+│   └── corpus_loader.py       # custom doc ingestion (.txt/.pdf → chunks)
+├── retrieval/                 # dense (FAISS), BM25, RRF / hybrid fusion, reranker, graph
 ├── generation/
-│   └── rag_pipeline.py        # retrieve → assemble context → generate
-├── retrieval/                 # dense, BM25, RRF, reranker modules
+│   └── rag_pipeline.py        # context assembly → Ollama /api/chat
+├── evaluation/                # retrieval, QA, citation, NLI, judge, perplexity, stats
+├── pipeline/
+│   ├── evaluation.py          # run_stage: one ablation stage end-to-end
+│   ├── metric_input.py        # metric rows, per-query records, CIs
+│   ├── report.py              # ablation tables, paired stage comparisons
+│   └── stages.py              # stage registry
+├── results/                   # results/<eval_set>[_limitN]/<stage>/ (scripts/14)
 └── scripts/
     ├── 02_build_index.py      # build FAISS index (--corpus or --docs-path)
     ├── 08_finetune_llm.py     # QLoRA fine-tune Qwen2.5
@@ -322,7 +351,10 @@ CENG493_Project/
     ├── 12_finetune_embeddings.py  # fine-tune BGE-M3
     ├── 12b_finetune_reranker.py
     ├── 13_export_lora_to_ollama.py
-    └── 14_eval_all_stages.py  # main evaluation entry point
+    ├── 14_eval_all_stages.py  # main evaluation entry point
+    ├── 16_prepare_turkish_legal_rag.py
+    ├── 17_check_tlr_labels.py # check / fix gold article labels
+    └── 18_judge_calibration.py  # judge vs human labels (Cohen's kappa)
 ```
 
 ---
@@ -358,11 +390,16 @@ PYTHONUTF8=1 python scripts/11_build_embedding_triplets.py
 PYTHONUTF8=1 python scripts/12_finetune_embeddings.py
 ```
 
-Training data format (`embedding.jsonl`) — each line:
+Training data format (`embedding_triplets.jsonl`, written by script 11) — each line:
 
 ```json
-{"id": "trip_001", "query": "soru metni", "positive_passage": "ilgili metin", "negative_passage": "alakasız metin"}
+{"query": "soru metni", "pos": ["ilgili madde metni"], "neg": ["n1", "...", "n7"], "pos_chunk_id": "...", "pos_strategy": "article"}
 ```
+
+When a training question names an article ("Anayasa madde 1") its chunk is
+the positive; hard negatives exclude only the positive's own article.
+Questions of any eval set are dropped from every training file (scripts 10, 11,
+12b and the train split).
 
 ---
 
@@ -383,49 +420,45 @@ All settings are in `config.py`. Key values:
 | `LLM_NUM_CTX` | 8192 | Context window for both LLMs |
 | `LLM_JUDGE_SAMPLE_SIZE` | `None` | Judge every answer (int = cap) |
 | `NLI_MODEL` | mDeBERTa xnli | Multilingual NLI for faithfulness |
+| `HALLUCINATION_SAMPLE_SIZE` | `None` | NLI on every answer (int = stratified sample) |
+| `LLM_STOP` / `SEED` | see file | Stop sequences / seed sent with every request |
+| `PERPLEXITY_ENABLED` | `True` | Skip the 7B HF perplexity pass when False |
+| `TLR_USE_LABEL_FIXES` | `True` | Checked gold articles (False = original HF labels) |
+| `RESULTS_ROOT` | `results/` | Root of `<eval_set>[_limitN]/<stage>/` outputs |
 | `TRUST_REMOTE_CODE` | `False` | Passed to HF `from_pretrained` |
 
 ---
 
 ## Default Evaluation Set: `turkish_legal_rag`
 
-`scripts/14_eval_all_stages.py` and `run_baseline.py` now evaluate on
-`turkish_legal_rag` by default: 195 questions with explicit law + article gold
-labels, so chunk-level Recall/MRR/nDCG are meaningful.
+`scripts/14_eval_all_stages.py` and `run_baseline.py` evaluate on
+`turkish_legal_rag` by default: 194 questions with law + article gold labels,
+all of which have gold chunks in the corpus.
 
 - **Source:** [`mtntasci/turkish-legal-rag`](https://huggingface.co/datasets/mtntasci/turkish-legal-rag),
   config `qa_benchmark`, split `test` (290 rows).
 - **License / attribution:** CC-BY-4.0. Dataset by `mtntasci`; questions derive
   from the Kaggle legal QA data our corpus is built from.
-- **Filtering** (290 -> 195 kept):
+- **Filtering** (`scripts/16_prepare_turkish_legal_rag.py`, 290 -> 195):
   - drop 90 rows whose `source_origin` is not `kaggle_batuhankalem` (templated, low quality)
-  - drop 0 rows whose law has no chunks in our corpus (all 8 laws are indexed)
-  - drop 5 rows whose question appears in a `qa_train*.jsonl` fine-tuning file (leakage; normalized text match)
-  - `madde_no` is normalised to the corpus convention (`"3-"` -> `"3"`); 1 kept row has no article
-  - 4 kept questions also appear in `qa_eval.jsonl`
-- **Gold labels:** `source` + `madde_no` select the corpus chunks of that law and
-  article (194/195 labeled this way, 195/195 with at least one gold chunk).
-- **Headline metrics:** chunk-level R@5/R@10/MRR/nDCG@10 lead the PRIMARY table
-  when at least 50% of queries have gold chunk labels
-  (`config.HEADLINE_CHUNK_MIN_LABELED_FRACTION`); otherwise source-hit stays the headline.
+  - drop 5 rows whose question appears in a `qa_train*.jsonl` fine-tuning file (leakage)
+  - `madde_no` is normalised to the corpus convention (`"3-"` -> `"3"`)
+- **Label check** (`scripts/17_check_tlr_labels.py`, `data/tlr_labels.py`):
+  about a quarter of the HF article labels point 1–3 articles before the one
+  that holds the answer (İş Kanunu "Ara dinlenmesi" is article 68, labelled 67).
+  Each label is checked by how much of the gold answer the labelled article
+  covers; 43 labels moved to the article the question names or a neighbour
+  that covers the answer, 16 of 17 HF-conflict rows were confirmed or corrected
+  and re-admitted, 1 stays out -> 194 rows.  `madde_no_hf` keeps the HF label,
+  `label_check` records each decision, and `config.TLR_USE_LABEL_FIXES = False`
+  restores the HF labels.
+- **Headline metrics:** chunk/article-level metrics lead the PRIMARY table when
+  at least 50% of queries have gold chunk labels
+  (`config.HEADLINE_CHUNK_MIN_LABELED_FRACTION`); otherwise source-hit does.
 
-Rebuild the set (outputs `results/processed_data/qa_turkish_legal_rag.jsonl` and
-`.report.json`; pass `--input rows.json` to use a local copy instead of downloading):
-
-```bash
-python CENG493_Project/scripts/16_prepare_turkish_legal_rag.py
-```
-
-Run the ablation (default set is `turkish_legal_rag`):
-
-```bash
-python scripts/14_eval_all_stages.py --stages base rrf_rerank graph emb_ft full
-```
-
-`scripts/10_eval_finetuned.py` was removed (superseded by
-`14_eval_all_stages.py --stages llm_ft full`).
-
-HMGS is still available with `--eval-set hmgs` (Kaggle with `--eval-set kaggle`).
+HMGS is available with `--eval-set hmgs`.  `--eval-set kaggle` uses 300 kaggle
+rows taken round-robin over the 240 distinct contexts (their passages stay in
+the index; leakage is controlled on the training side).
 
 ---
 
@@ -476,5 +509,5 @@ SILVER_THRESHOLD = 0.10          # minimum token-overlap score
 - **Python 3.11**, PyTorch, HuggingFace (transformers, PEFT, TRL, sentence-transformers)
 - **Retrieval**: FAISS (GPU/CPU), rank_bm25
 - **Inference**: Ollama (local, no API key)
-- **Evaluation**: RAGAS, NLI-based hallucination detection, LLM judge
+- **Evaluation**: ranx, sacrebleu (BLEU, chrF++), multilingual NLI, LLM judge, paired bootstrap
 - **GPU**: Tested on NVIDIA A100 (80GB) and RTX 5070 Ti (16GB)
