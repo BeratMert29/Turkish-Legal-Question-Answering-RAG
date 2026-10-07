@@ -569,6 +569,11 @@ class TestAbbrevMaddeParsing:
         ("TCK 86'ncı maddesi", [("TCK", "86")]),
         ("TCK madde 1234", [("TCK", "1234")]),
         ("TCK madde 5 ve TBK", [("TCK", "5")]),
+        # number-first forms with md abbreviation (Task 0 fix)
+        ("TCK 86. md.", [("TCK", "86")]),
+        ("TBK 49. md", [("TBK", "49")]),
+        ("TCK 5. md. nedir", [("TCK", "5")]),
+        ("CMK 100. md. uygulanır", [("CMK", "100")]),
     ])
     def test_forms(self, q, exp):
         assert find_abbrev_maddes(q) == exp
@@ -582,6 +587,25 @@ class TestAbbrevMaddeParsing:
         gi = _make_gi_with_lookup(tmp_path)
         ids = [r["chunk_id"] for r in gi.inject_from_query("tck 86. maddesi")]
         assert "Türk Ceza Kanunu_kaggle_5237_0" in ids
+
+    def test_inject_abbrev_number_first_md(self, tmp_path, monkeypatch):
+        """TCK 86. md. → injects TCK madde-86 chunk (number-first md form)."""
+        import config
+        monkeypatch.setattr(config, "DIRECT_MADDE_LOOKUP_ENABLED", True)
+        gi = _make_gi_with_lookup(tmp_path)
+        result = gi.inject_from_query("TCK 86. md.")
+        ids = [r["chunk_id"] for r in result]
+        assert "Türk Ceza Kanunu_kaggle_5237_0" in ids
+
+    def test_inject_canonical_number_first_md(self, tmp_path, monkeypatch):
+        """5237 sayılı ... Kanununda 87. md. → injects TCK madde-87 chunk."""
+        import config
+        monkeypatch.setattr(config, "DIRECT_MADDE_LOOKUP_ENABLED", True)
+        gi = _make_gi_with_lookup(tmp_path)
+        query = "5237 sayılı Türk Ceza Kanununda 87. md. hükmü uygulanır."
+        result = gi.inject_from_query(query)
+        ids = [r["chunk_id"] for r in result]
+        assert "Türk Ceza Kanunu_kaggle_5237_1" in ids
 
 
 class TestMaddeHeadingFixes:

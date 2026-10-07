@@ -63,12 +63,13 @@ _ABBREV_RE = re.compile(
 )
 
 # Article number right after a law name, within that law's own window:
-# "madde 86", "md. 5", "m. 49", "86. madde", "86. maddesi", "86'ncı maddesi".
+# "madde 86", "md. 5", "m. 49", "86. madde", "86. maddesi", "86'ncı maddesi",
+# "86. md.", "5. md" (number-first forms with md abbreviation).
 _MADDE_AFTER_ABBREV_RE = re.compile(
     rf"(?<![{_TR_LETTER}])(?:madde|md|m)\.?\s*(?<!\d)(\d{{1,4}})(?!\d)"
     r"|(?<!\d)(\d{1,4})(?!\d)"
     r"(?:\s*['\u2019]?\s*(?:inci|ıncı|nci|ncı|üncü|uncu))?"
-    r"\s*\.?\s*madde",
+    r"\s*\.?\s*(?:madde|md)\.?",
     re.IGNORECASE,
 )
 
