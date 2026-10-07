@@ -126,8 +126,8 @@ class TestEvalAllStagesCLI:
         finally:
             sys.path.pop(0)
 
-        # Default eval set is hmgs
-        assert args.eval_set == "hmgs"
+        # Default eval set is turkish_legal_rag (hmgs stays selectable)
+        assert args.eval_set == "turkish_legal_rag"
         assert args.limit is None
         assert args.corpus is None
         assert args.eval_data is None

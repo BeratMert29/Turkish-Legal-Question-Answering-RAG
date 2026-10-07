@@ -895,6 +895,10 @@ def _assemble_final_result(
             "top_k_for_generation": _config.TOP_K_FOR_GENERATION,
         },
         "headline_metrics": {
+            "headline_mode": headline_mode(
+                (labeling_coverage or {}).get("labeled", 0),
+                (labeling_coverage or {}).get("total", 0),
+            ),
             "source_hit_at_5": source_metrics.get("source_hit_at_5_all"),
             "source_hit_at_10": source_metrics.get("source_hit_at_10_all"),
             "source_mrr": source_metrics.get("source_mrr_all"),
@@ -941,7 +945,7 @@ def run_stage(
     reranker_cache: dict,
     relevant_map: dict,
     short_answer_mode: bool,
-    eval_set_name: str = "hmgs",
+    eval_set_name: str = "turkish_legal_rag",
     labeling_coverage: Optional[dict] = None,
 ) -> dict:
     """Run a single ablation stage end-to-end.
@@ -1025,14 +1029,32 @@ def run_stage(
 # Ablation table
 # ---------------------------------------------------------------------------
 
+def headline_mode(n_labeled: int, n_total: int,
+                  min_fraction: Optional[float] = None) -> str:
+    """Pick the headline retrieval view from the gold-labeled fraction.
+
+    Returns ``"chunk"`` (recall/MRR/nDCG are the headline) when at least
+    ``min_fraction`` of the queries have gold chunk labels, else ``"source"``
+    (source-hit stays the headline).  Independent of the eval-set name.
+    """
+    from config import HEADLINE_CHUNK_MIN_LABELED_FRACTION
+    if min_fraction is None:
+        min_fraction = HEADLINE_CHUNK_MIN_LABELED_FRACTION
+    if not n_total:
+        return "source"
+    return "chunk" if n_labeled / n_total >= min_fraction else "source"
+
+
 def print_ablation_table(
     results: dict[str, dict],
     stage_order: Optional[list[str]] = None,
 ) -> None:
     """Print two markdown-style ablation tables to stdout.
 
-    Table 1 (PRIMARY) -- source-level retrieval + QA + judge.
-    Table 2 (SECONDARY) -- chunk-level recall/MRR/NDCG (gold-labeled subset).
+    The PRIMARY table leads with chunk-level recall/MRR/nDCG when at least
+    ``config.HEADLINE_CHUNK_MIN_LABELED_FRACTION`` of the queries have gold
+    chunk labels (see :func:`headline_mode`), otherwise with source-hit.
+    The SECONDARY table carries whichever retrieval view is not the headline.
     """
     if stage_order is None:
         from pipeline.stages import DEFAULT_STAGE_ORDER
@@ -1044,11 +1066,51 @@ def print_ablation_table(
     def _f4(v) -> str:
         return f"{v:.4f}" if isinstance(v, (int, float)) else "N/A"
 
+    def _src_cells(r) -> list:
+        sm = r.get("source_hit_metrics", r.get("headline_metrics", {}))
+        n = sm.get("source_labeled_queries", sm.get("n_source_queries", "?"))
+        return [
+            _f4(sm.get("source_hit_at_5_all", sm.get("source_hit_at_5"))),
+            _f4(sm.get("source_hit_at_10_all", sm.get("source_hit_at_10"))),
+            _f4(sm.get("source_mrr_all", sm.get("source_mrr"))),
+            _f4(sm.get("source_precision_at_5_all", sm.get("source_precision_at_5"))),
+            str(n),
+        ]
+
+    def _chunk_cells(r) -> list:
+        ret = r.get("retrieval_metrics", {})
+        return [
+            _f4(ret.get("recall_at_5")), _f4(ret.get("recall_at_10")),
+            _f4(ret.get("mrr")), _f4(ret.get("ndcg_at_10")),
+            str(ret.get("num_queries", "?")),
+        ]
+
+    src_hdr = ["SrcHit@5", "SrcHit@10", "SrcMRR", "SrcPrec@5", "n_src"]
+    chunk_hdr = ["R@5", "R@10", "MRR", "nDCG@10", "n_gold"]
+
+    mode = "source"
+    for stage_key in stage_order:
+        cov = (results.get(stage_key) or {}).get("labeling_coverage")
+        if cov:
+            mode = headline_mode(cov.get("labeled", 0), cov.get("total", 0))
+            break
+    if mode == "chunk":
+        head_hdr, head_cells = chunk_hdr, _chunk_cells
+        side_hdr, side_cells = src_hdr, _src_cells
+        head_title = "chunk-level retrieval — gold-labeled queries"
+        side_title = "source-level — all queries with known law"
+    else:
+        head_hdr, head_cells = src_hdr, _src_cells
+        side_hdr, side_cells = chunk_hdr, _chunk_cells
+        head_title = "source-level retrieval — all queries with known law"
+        side_title = ("chunk-level — gold-labeled subset only; "
+                      "n_gold may be small for HMGS")
+
     # -- Table 1: PRIMARY --------------------------------------------------
     h1 = (
-        f"| {'Stage':<26} | {'SrcHit@5':>8} | {'SrcHit@10':>9} | "
-        f"{'SrcMRR':>7} | {'SrcPrec@5':>9} | {'n_src':>6} | "
-        f"{'F1':>6} | {'Contain':>7} | {'ROUGE-L':>7} | {'Citation':>8} | "
+        f"| {'Stage':<26} | "
+        + " | ".join(f"{h:>{w}}" for h, w in zip(head_hdr, [8, 9, 7, 9, 6]))
+        + f" | {'F1':>6} | {'Contain':>7} | {'ROUGE-L':>7} | {'Citation':>8} | "
         f"{'Faith.':>7} | {'LLM-J':>6} | {'SemSim':>7} |"
     )
     sep1 = "|" + "|".join(
@@ -1056,8 +1118,7 @@ def print_ablation_table(
     ) + "|"
 
     print("\n\n" + "=" * 140)
-    print("  PRIMARY ABLATION TABLE  "
-          "(source-level retrieval — all queries with known law)")
+    print(f"  PRIMARY ABLATION TABLE  ({head_title})")
     print("=" * 140)
     print(h1)
     print(sep1)
@@ -1066,19 +1127,13 @@ def print_ablation_table(
         if stage_key not in results:
             continue
         r = results[stage_key]
-        sm = r.get("source_hit_metrics", r.get("headline_metrics", {}))
         qa = r.get("qa_metrics", {})
         stage_name = r.get("hyperparameters", {}).get("stage_name", stage_key)
-        n_src = sm.get(
-            "source_labeled_queries", sm.get("n_source_queries", "?"),
+        cells = " | ".join(
+            f"{c:>{w}}" for c, w in zip(head_cells(r), [8, 9, 7, 9, 6])
         )
         print(
-            f"| {stage_name:<26} | "
-            f"{_f4(sm.get('source_hit_at_5_all', sm.get('source_hit_at_5'))):>8} | "
-            f"{_f4(sm.get('source_hit_at_10_all', sm.get('source_hit_at_10'))):>9} | "
-            f"{_f4(sm.get('source_mrr_all', sm.get('source_mrr'))):>7} | "
-            f"{_f4(sm.get('source_precision_at_5_all', sm.get('source_precision_at_5'))):>9} | "
-            f"{str(n_src):>6} | "
+            f"| {stage_name:<26} | {cells} | "
             f"{_pct(qa.get('f1')):>6} | "
             f"{_pct(qa.get('answer_containment')):>7} | "
             f"{_pct(qa.get('rouge_l')):>7} | "
@@ -1091,18 +1146,16 @@ def print_ablation_table(
 
     # -- Table 2: SECONDARY ------------------------------------------------
     h2 = (
-        f"| {'Stage':<26} | {'R@5':>6} | {'R@10':>6} | {'MRR':>6} | "
-        f"{'nDCG@10':>7} | {'n_gold':>7} | "
-        f"{'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
+        f"| {'Stage':<26} | "
+        + " | ".join(f"{h:>{w}}" for h, w in zip(side_hdr, [9, 9, 7, 9, 7]))
+        + f" | {'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
     )
     sep2 = "|" + "|".join(
-        ["-" * w for w in [28, 8, 8, 8, 9, 9, 9, 9, 9]]
+        ["-" * w for w in [28, 11, 11, 9, 11, 9, 9, 9, 9]]
     ) + "|"
 
     print("=" * 100)
-    print("  SECONDARY TABLE  "
-          "(chunk-level — gold-labeled subset only; "
-          "n_gold may be small for HMGS)")
+    print(f"  SECONDARY TABLE  ({side_title})")
     print("=" * 100)
     print(h2)
     print(sep2)
@@ -1111,16 +1164,12 @@ def print_ablation_table(
         if stage_key not in results:
             continue
         r = results[stage_key]
-        ret = r.get("retrieval_metrics", {})
-        n_gold = ret.get("num_queries", "?")
         stage_name = r.get("hyperparameters", {}).get("stage_name", stage_key)
+        cells = " | ".join(
+            f"{c:>{w}}" for c, w in zip(side_cells(r), [9, 9, 7, 9, 7])
+        )
         print(
-            f"| {stage_name:<26} | "
-            f"{_f4(ret.get('recall_at_5')):>6} | "
-            f"{_f4(ret.get('recall_at_10')):>6} | "
-            f"{_f4(ret.get('mrr')):>6} | "
-            f"{_f4(ret.get('ndcg_at_10')):>7} | "
-            f"{str(n_gold):>7} | "
+            f"| {stage_name:<26} | {cells} | "
             f"{_f4(r.get('scenario1_score')):>7} | "
             f"{_f4(r.get('scenario2_score')):>7} | "
             f"{_f4(r.get('scenario3_score')):>7} |"

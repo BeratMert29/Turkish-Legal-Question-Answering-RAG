@@ -89,6 +89,28 @@ def _chunk_matches_article(chunk: "CorpusChunk", madde_no: int) -> bool:
     return False
 
 
+def _chunk_matches_madde_str(chunk: "CorpusChunk", madde_no: str) -> bool:
+    """Return True if *chunk* belongs to the article named by the normalised
+    string *madde_no* (``"12"``, ``"183-a"``, ``"ek-3"``, ``"gecici-2"``)."""
+    want = str(madde_no).strip().lower()
+    stored = getattr(chunk, "madde_no", None)
+    if stored is not None and str(stored).strip().lower() == want:
+        return True
+    # The stored/leading article can differ from the one asked for when the
+    # chunk opens with a section title or holds several articles, so also scan
+    # every line-anchored article heading in the chunk text.
+    for m in _MADDE_HEADING_RE.finditer(chunk.text):
+        if m.group(1):
+            found = f"ek-{_normalize_madde_suffix(m.group(1))}"
+        elif m.group(2) or m.group(3):
+            found = f"gecici-{_normalize_madde_suffix(m.group(2) or m.group(3))}"
+        else:
+            found = _normalize_madde_suffix(m.group(4))
+        if found == want:
+            return True
+    return False
+
+
 # Turkish-aware tokenizer for silver lexical scoring.
 # İ→i and I→ı to handle Turkish case-folding correctly (avoiding ASCII lowercasing
 # that would map İ→i but leave I as i, conflating two different letters).
@@ -192,6 +214,8 @@ class QAExample:
     context: str    # "" for test/train rows (null in CSV)
     source: str
     data_type: str
+    madde_no: "str | None" = None   # explicit gold article (turkish_legal_rag)
+    hf_row_id: "str | None" = None
 
 
 class DataProcessor:
@@ -582,6 +606,28 @@ class DataProcessor:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def build_turkish_legal_rag_eval_set(path=None) -> list[QAExample]:
+        """Load the committed turkish_legal_rag eval set (see scripts/16).
+
+        Rows keep their explicit ``source`` and ``madde_no`` so that
+        :meth:`build_relevant_chunk_map` can label gold chunks directly.
+        """
+        p = pathlib.Path(path) if path else pathlib.Path(config.TLR_DATA_PATH)
+        return [
+            QAExample(
+                query_id=r["query_id"],
+                question=r["question"],
+                answer=r.get("answer", ""),
+                context=r.get("context", ""),
+                source=r.get("source", ""),
+                data_type=r.get("data_type", ""),
+                madde_no=r.get("madde_no"),
+                hf_row_id=r.get("hf_row_id"),
+            )
+            for r in DataProcessor.load_jsonl(p)
+        ]
+
+    @staticmethod
     def build_relevant_chunk_map(
         corpus_chunks: list,           # list[CorpusChunk]
         qa_examples: list,             # list[QAExample]
@@ -594,6 +640,8 @@ class DataProcessor:
 
         Strategy (in order):
         0. gold_source_ids: exact chunk IDs from evaluator benchmark
+        0.5 explicit source + madde_no fields (turkish_legal_rag): chunks of that
+           law whose article matches exactly
         1. Context hash match: re-chunk qa.context and match by text hash
         2. doc_id match: chunk.doc_id == qa.query_id
         2.5. Answer substring: chunk.text contains a significant portion of qa.answer
@@ -636,7 +684,7 @@ class DataProcessor:
         # label_strategy tracks how each query was labeled (for coverage reporting)
         label_strategy_map: dict[str, str] = {}
         # Coverage counters — one per labeling strategy
-        labeled_s0 = labeled_s1 = labeled_s2 = labeled_s25 = labeled_s3 = 0
+        labeled_s0 = labeled_s05 = labeled_s1 = labeled_s2 = labeled_s25 = labeled_s3 = 0
         labeled_silver = 0
         unlabeled = 0
         # Silver config (read once for performance)
@@ -667,6 +715,21 @@ class DataProcessor:
                     label_strategy_map[qa_query_id] = "gold"
                     relevant_map[qa_query_id] = relevant
                     continue  # Skip remaining strategies — ground truth is exact.
+
+            # Strategy 0.5: explicit source + madde_no fields (turkish_legal_rag).
+            # The gold article is given directly, so label the corpus chunks of
+            # that law and article without any text heuristics.
+            explicit_madde = qa.get("madde_no") if _is_dict else getattr(qa, "madde_no", None)
+            if explicit_madde and qa_source:
+                relevant = [
+                    c.chunk_id for c in by_source.get(qa_source, [])
+                    if _chunk_matches_madde_str(c, explicit_madde)
+                ]
+                if relevant:
+                    labeled_s05 += 1
+                    label_strategy_map[qa_query_id] = "explicit_madde"
+                    relevant_map[qa_query_id] = relevant
+                    continue
 
             # Strategy 1: context-hash match — re-chunk qa.context using the same
             # chunking path as the corpus index build (article or char chunking).
@@ -767,10 +830,10 @@ class DataProcessor:
         log.info(
             "build_relevant_chunk_map coverage: "
             "total=%d  labeled=%d (%.0f%%)  unlabeled=%d  "
-            "[s0(gold)=%d s1(ctx_hash)=%d s2(doc_id)=%d s2.5(ans_substr)=%d "
+            "[s0(gold)=%d s0.5(explicit_madde)=%d s1(ctx_hash)=%d s2(doc_id)=%d s2.5(ans_substr)=%d "
             "s3(article)=%d s3.5(silver_lexical)=%d]",
             n_total, labeled, 100 * labeled / n_total if n_total else 0,
-            unlabeled, labeled_s0, labeled_s1, labeled_s2, labeled_s25,
+            unlabeled, labeled_s0, labeled_s05, labeled_s1, labeled_s2, labeled_s25,
             labeled_s3, labeled_silver,
         )
         if unlabeled:
@@ -790,6 +853,7 @@ class DataProcessor:
             "unlabeled": unlabeled,
             "by_strategy": {
                 "gold":          labeled_s0,
+                "explicit_madde": labeled_s05,
                 "context_hash":  labeled_s1,
                 "doc_id":        labeled_s2,
                 "answer_substr": labeled_s25,

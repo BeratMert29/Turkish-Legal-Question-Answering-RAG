@@ -14,7 +14,7 @@ Prerequisites:
 Usage:
     python scripts/14_eval_all_stages.py                           # all available stages (CSV format)
     python scripts/14_eval_all_stages.py --stages base,rrf_rerank,llm_ft
-    python scripts/14_eval_all_stages.py --stages base --dataset hmgs
+    python scripts/14_eval_all_stages.py --stages base --eval-set hmgs
     python scripts/14_eval_all_stages.py --list-stages
     python scripts/14_eval_all_stages.py \
         --corpus /content/datasets/corpus.jsonl \
@@ -59,20 +59,23 @@ def _parse_args(argv=None):
     )
     parser.add_argument(
         "--stages",
-        default=",".join(DEFAULT_STAGE_ORDER),
+        nargs="+",
+        default=[",".join(DEFAULT_STAGE_ORDER)],
         help=(
-            f"Comma-separated stages to run. Default: all. "
+            f"Stages to run, comma- or space-separated. Default: all. "
             f"Options: {', '.join(DEFAULT_STAGE_ORDER)}"
         ),
     )
     parser.add_argument(
         "--eval-set", "--dataset",
         dest="eval_set",
-        choices=["kaggle", "hmgs"],
-        default="hmgs",
+        choices=config.EVAL_SET_CHOICES,
+        default=config.DEFAULT_EVAL_SET,
         help=(
-            "Evaluation dataset for ALL stages (default: hmgs, ~161 questions). "
-            "Use 'kaggle' for the Kaggle-split eval set (~300 questions). "
+            "Evaluation dataset for ALL stages (default: turkish_legal_rag, "
+            "~195 questions with explicit law+article gold labels). "
+            "Use 'hmgs' for the HMGS exam set (~161 questions) or 'kaggle' "
+            "for the Kaggle-split eval set (~300 questions). "
             "All stages in a single run MUST use the same eval set so that "
             "ablation comparisons are valid.  Previously, different invocations "
             "used different datasets (base/hybrid/rrf/rrf_rerank with hmgs n=161 "
@@ -118,7 +121,9 @@ def _parse_args(argv=None):
             "Mutually exclusive with --corpus."
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.stages = ",".join(args.stages)
+    return args
 
 
 def main() -> None:
@@ -253,6 +258,8 @@ def main() -> None:
         short_answer_mode = args.eval_set == "hmgs"
         if args.eval_set == "hmgs":
             qa_examples = DataProcessor.build_gold_eval_set()
+        elif args.eval_set == "turkish_legal_rag":
+            qa_examples = DataProcessor.build_turkish_legal_rag_eval_set()
         else:
             if not args.corpus:
                 pass  # processor already initialised above

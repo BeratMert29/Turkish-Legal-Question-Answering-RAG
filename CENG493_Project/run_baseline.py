@@ -68,8 +68,13 @@ def _parse_args(argv=None):
         help="Directory to write baseline_metrics.json",
     )
     parser.add_argument(
+        "--eval-set", dest="eval_set",
+        choices=config.EVAL_SET_CHOICES, default=config.DEFAULT_EVAL_SET,
+        help="Evaluation set (default: %(default)s)",
+    )
+    parser.add_argument(
         "--hmgs", action="store_true",
-        help="Use HMGS exam questions instead of Kaggle eval set",
+        help="Alias for --eval-set hmgs",
     )
     parser.add_argument(
         "--corpus", type=Path, default=None, metavar="PATH",
@@ -255,13 +260,17 @@ def main() -> None:
             "  %d QA examples loaded (short_answer_mode=%s)",
             len(qa_examples), short_answer_mode,
         )
-    elif args.hmgs:
+    elif args.hmgs or args.eval_set == "hmgs":
         if processor is None:
             processor = DataProcessor(config.RAW_DATA_PATH)
             processor.load_and_validate()
         qa_examples = processor.build_gold_eval_set()
         short_answer_mode = True
         log.info("Using HMGS eval set: %d examples", len(qa_examples))
+    elif args.eval_set == "turkish_legal_rag":
+        qa_examples = DataProcessor.build_turkish_legal_rag_eval_set()
+        short_answer_mode = False
+        log.info("Using turkish_legal_rag eval set: %d examples", len(qa_examples))
     else:
         if processor is None:
             processor = DataProcessor(config.RAW_DATA_PATH)
