@@ -78,7 +78,8 @@ def inject_citations(answer: str, chunks: list) -> str:
     THRESHOLD = 0.15
 
     def _tok(text: str) -> set:
-        return {t.lower() for t in re.split(r"[\s\.,;:!?()\[\]{}'\"]+", text) if t}
+        # Turkish-aware lowercasing ("İ".lower() would add a combining dot)
+        return {t for t in re.split(r"[\s\.,;:!?()\[\]{}'\"]+", normalize_turkish(text)) if t}
 
     def _overlap(a: set, b: set) -> float:
         return len(a & b) / min(len(a), len(b)) if a and b else 0.0

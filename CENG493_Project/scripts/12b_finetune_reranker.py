@@ -17,7 +17,7 @@ ADAPTER_DIR = config.BASE_DIR / "models" / "bge_reranker_ft"
 HARD_NEG_PER_QUERY = 3
 TRAIN_EPOCHS = 3
 BATCH_SIZE = 4
-RANDOM_SEED = 42
+RANDOM_SEED = config.SEED
 
 
 def parse_args() -> argparse.Namespace:

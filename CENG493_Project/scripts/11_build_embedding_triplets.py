@@ -36,7 +36,7 @@ HARD_NEG_TOP_K = 30           # search pool size for hard negative mining
 MIN_POSITIVE_SCORE = 0.3      # skip query if best chunk similarity is below this
 HARD_NEG_START_RANK = 4       # skip ranks 0-3 (too close to positive) — 0-indexed
 MIN_GT_OVERLAP = 0.3          # minimum Jaccard overlap to accept a ground-truth positive
-RANDOM_SEED = 42
+RANDOM_SEED = config.SEED
 
 QA_PATH = config.PROCESSED_DIR / "qa_train.jsonl"
 CORPUS_PATH = config.PROCESSED_DIR / "corpus_chunks.jsonl"

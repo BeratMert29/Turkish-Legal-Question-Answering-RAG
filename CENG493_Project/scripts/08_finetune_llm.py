@@ -313,6 +313,8 @@ def main() -> None:
         max_grad_norm=0.0,
         gradient_checkpointing=tc["gradient_checkpointing"],
         dataloader_num_workers=tc["dataloader_num_workers"],
+        seed=config.SEED,
+        data_seed=config.SEED,
         dataloader_pin_memory=False,
         # SFT-specific fields live here in TRL 1.x
         dataset_text_field=tc["dataset_text_field"],

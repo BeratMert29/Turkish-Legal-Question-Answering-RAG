@@ -113,7 +113,7 @@ def main() -> None:
 
     dataset = Dataset.from_list(records)
     split = dataset.train_test_split(
-        test_size=TRAINING_CONFIG["eval_split"], seed=42
+        test_size=TRAINING_CONFIG["eval_split"], seed=config.SEED
     )
     train_ds = split["train"]
     eval_ds = split["test"]
@@ -146,6 +146,8 @@ def main() -> None:
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
+        seed=config.SEED,
+        data_seed=config.SEED,
     )
 
     # ── Trainer ──────────────────────────────────────────────────────────────
