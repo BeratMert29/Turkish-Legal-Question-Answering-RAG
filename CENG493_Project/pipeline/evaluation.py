@@ -166,8 +166,8 @@ def run_hallucination_eval(
 
     Returns
     -------
-    tuple[dict, float]
-        ``(hallucination_result, faithful_rate)``
+    tuple[dict, float, Any]
+        ``(hallucination_result, faithful_rate, nli_model)``
     """
     import gc
     import torch
@@ -236,7 +236,7 @@ def run_llm_judge_eval(
     *,
     base_url: str,
     judge_model: str,
-    sample_size: int = 20,
+    sample_size: Optional[int] = None,
     results_dir: Optional[Path] = None,
 ) -> dict:
     """Run all four LLM judge metrics.
@@ -251,7 +251,11 @@ def run_llm_judge_eval(
         llm_judge_coherence,
     )
 
+    import config as _config
     import random as _random_mod
+
+    if sample_size is None:
+        sample_size = _config.LLM_JUDGE_SAMPLE_SIZE
 
     result: dict = {
         "score": None,
