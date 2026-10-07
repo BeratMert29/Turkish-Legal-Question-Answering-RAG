@@ -174,14 +174,14 @@ def print_ablation_table(
 
     # -- Table 1: PRIMARY --------------------------------------------------
     h1 = (
-        f"| {'Stage':<26} | "
+        f"| {'Stage':<30} | "
         + " | ".join(f"{h:>{w}}" for h, w in zip(head_hdr, [8, 9, 7, 9, 6]))
         + f" | {'F1':>6} | {'F1 95% CI':>13} | {'Contain':>7} | {'ROUGE-L':>7} | {'chrF++':>6} | "
         f"{'CiteP-nat':>9} | {'CiteP-rnd':>9} | {'Ctx-NLI':>7} | {'ClaimR':>6} | "
         f"{'LLM-J':>6} | {'SemSim':>7} | {'AnsLen':>6} |"
     )
     sep1 = "|" + "|".join(
-        ["-" * w for w in [28, 10, 11, 9, 11, 8, 8, 15, 9, 9, 8, 11, 11, 9, 8, 8, 9, 8]]
+        ["-" * w for w in [32, 10, 11, 9, 11, 8, 8, 15, 9, 9, 8, 11, 11, 9, 8, 8, 9, 8]]
     ) + "|"
 
     print("\n\n" + "=" * 190)
@@ -201,7 +201,7 @@ def print_ablation_table(
             f"{c:>{w}}" for c, w in zip(head_cells(r), [8, 9, 7, 9, 6])
         )
         print(
-            f"| {stage_name:<26} | {cells} | "
+            f"| {stage_name:<30} | {cells} | "
             f"{_pct(qa.get('f1')):>6} | "
             f"{_ci(r, 'f1'):>13} | "
             f"{_pct(qa.get('answer_containment')):>7} | "
@@ -219,12 +219,12 @@ def print_ablation_table(
 
     # -- Table 2: SECONDARY ------------------------------------------------
     h2 = (
-        f"| {'Stage':<26} | "
+        f"| {'Stage':<30} | "
         + " | ".join(f"{h:>{w}}" for h, w in zip(side_hdr, [9, 9, 7, 9, 7]))
         + f" | {'ArtHit@5':>8} | {'ArtMRR':>7} | {'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
     )
     sep2 = "|" + "|".join(
-        ["-" * w for w in [28, 11, 11, 9, 11, 9, 10, 9, 9, 9, 9]]
+        ["-" * w for w in [32, 11, 11, 9, 11, 9, 10, 9, 9, 9, 9]]
     ) + "|"
 
     print("=" * 100)
@@ -243,7 +243,7 @@ def print_ablation_table(
         )
         art = (r.get("retrieval_metrics") or {}).get("article_level") or {}
         print(
-            f"| {stage_name:<26} | {cells} | "
+            f"| {stage_name:<30} | {cells} | "
             f"{_f4(art.get('hit_at_5')):>8} | {_f4(art.get('mrr')):>7} | "
             f"{_f4(r.get('scenario1_score')):>7} | "
             f"{_f4(r.get('scenario2_score')):>7} | "
