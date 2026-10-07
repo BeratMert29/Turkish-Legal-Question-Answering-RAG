@@ -58,8 +58,34 @@ class TestAdapterFilters:
     def test_schema_matches_hmgs_plus_extras(self):
         ex, _ = adapter.build_examples([_row(7, "q")], KNOWN, set())
         assert set(ex[0]) == {"query_id", "question", "answer", "context", "source",
-                              "data_type", "madde_no", "hf_row_id"}
+                              "data_type", "madde_no", "hf_row_id", "label_conflict"}
         assert ex[0]["query_id"] == "tlr_7" and ex[0]["madde_no"] == "3"
+
+    def test_gecici_section_recovered_from_text(self):
+        rows = [_row(1, "Geçici Madde 5 neyi düzenler?", madde="5-"),
+                _row(2, "Madde 5 neyi düzenler?", madde="5-")]
+        ex, _ = adapter.build_examples(rows, KNOWN, set())
+        assert [e["madde_no"] for e in ex] == ["gecici-5", "5"]
+
+    def test_label_conflict_flagged_and_dropped_from_default_set(self):
+        row = _row(1, "Hangi madde?", madde="150-")
+        row["cevap"] = "Türk Ceza Kanunu'nun 151. maddesinde belirtilmiştir."
+        ok = _row(2, "Hangi madde?", madde="150-")
+        ok["cevap"] = "150. maddede belirtilmiştir."
+        ex, rep = adapter.build_examples([row, ok], KNOWN, set())
+        assert [e["hf_row_id"] for e in ex] == ["2"]
+        assert rep["label_conflict"] == 1 and rep["kept"] == 1
+        assert rep["label_conflict_rows"][0]["label_conflict"] is True
+
+    def test_conflict_rows_skipped_by_loader(self, tmp_path):
+        p = tmp_path / "x.jsonl"
+        base = {"question": "q", "answer": "a", "context": "",
+                "source": "Türk Medeni Kanunu", "data_type": "", "madde_no": "3"}
+        p.write_text(
+            json.dumps({**base, "query_id": "a", "label_conflict": True}) + "\n"
+            + json.dumps({**base, "query_id": "b", "label_conflict": False}) + "\n",
+            encoding="utf-8")
+        assert [e.query_id for e in DataProcessor.build_turkish_legal_rag_eval_set(p)] == ["b"]
 
     def test_madde_normalization(self):
         n = adapter.normalize_madde_no
@@ -116,6 +142,45 @@ class TestExplicitGoldLabels:
             "hf_row_id": "1"}) + "\n", encoding="utf-8")
         ex = DataProcessor.build_turkish_legal_rag_eval_set(p)
         assert ex[0].madde_no == "3" and ex[0].source == "Türk Medeni Kanunu"
+
+
+class TestCorpusHoldout:
+    """build_corpus_chunks must index the eval laws unless holdout is requested."""
+
+    LAWS = ["Türk Ceza Kanunu", "Türk Medeni Kanunu", "Ceza Muhakemesi Kanunu",
+            "Türk Borçlar Kanunu", "Türkiye Cumhuriyeti Anayasası",
+            "Türkiye Cumhuriyeti İş Kanunu", "Türk Bayrağı Tüzüğü", "Bilgi Edinme Kanunu"]
+
+    def _processor(self, tmp_path, monkeypatch):
+        import pandas as pd
+        rows = []
+        for i, law in enumerate(self.LAWS):
+            ctx = (f"MADDE {i + 1}- {law} birinci hüküm " + "metin " * 60 +
+                   f"\nMADDE {i + 2}- {law} ikinci hüküm " + "metin " * 60)
+            rows.append({"id": f"k{i}", "question": "q", "answer": "a", "context": ctx,
+                         "source": law, "data_type": "", "score": 1, "split": "kaggle"})
+        csv = tmp_path / "d.csv"
+        pd.DataFrame(rows).to_csv(csv, index=False)
+        monkeypatch.setattr(config, "BASE_DIR", tmp_path)  # no extra_laws.jsonl
+        return DataProcessor(csv)
+
+    def test_default_corpus_contains_all_eval_laws(self, tmp_path, monkeypatch):
+        dp = self._processor(tmp_path, monkeypatch)
+        sources = {c.source for c in dp.build_corpus_chunks()}
+        assert sources == set(self.LAWS)
+
+    def test_holdout_true_is_legacy_kaggle_only(self, tmp_path, monkeypatch):
+        dp = self._processor(tmp_path, monkeypatch)
+        # fewer unique contexts than QA_EVAL_EXPECTED -> everything is held out
+        assert list(dp.build_corpus_chunks(holdout=True)) == []
+
+    def test_gold_labels_found_for_every_eval_law(self, tmp_path, monkeypatch):
+        dp = self._processor(tmp_path, monkeypatch)
+        chunks = list(dp.build_corpus_chunks())
+        qa = [QAExample(f"q{i}", "", "", "", law, "", madde_no=str(i + 1))
+              for i, law in enumerate(self.LAWS)]
+        m = DataProcessor.build_relevant_chunk_map(chunks, qa)
+        assert all(m[q.query_id] for q in qa)
 
 
 class TestEvalSetDefaultAndHeadline:
