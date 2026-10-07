@@ -1,22 +1,46 @@
+"""Lexical answer metrics on Turkish-normalised tokens.
+
+ROUGE-L is computed here (LCS F1 on Unicode tokens, deterministic); BLEU and
+chrF++ come from sacrebleu on the same pre-tokenised text.  When sacrebleu is
+missing, BLEU falls back to the pure-Python implementation below and chrF++
+is None; ``qa_metrics["lexical_impl"]`` records which one ran, so results
+never change silently with the environment.
+"""
 from collections import Counter
+import logging
 import math
 import re
-import warnings
-import evaluate as hf_evaluate
 from utils import normalize_turkish
 
+log = logging.getLogger(__name__)
+
 try:
-    _BLEU_METRIC = hf_evaluate.load("bleu")
-    _ROUGE_METRIC = hf_evaluate.load("rouge")
-    _USE_HF_EVALUATE = True
-except Exception:
-    _USE_HF_EVALUATE = False
-    warnings.warn(
-        "hf_evaluate not available; using fallback BLEU/ROUGE implementation. "
-        "Scores may differ from standard implementations.",
-        ImportWarning,
-        stacklevel=2,
-    )
+    import sacrebleu as _sacrebleu
+    from sacrebleu.metrics import BLEU as _BLEU, CHRF as _CHRF
+    _BLEU_CORPUS = _BLEU(tokenize="none")
+    _BLEU_SENT = _BLEU(tokenize="none", effective_order=True)
+    _CHRF_PP = _CHRF(word_order=2)  # chrF++
+    _USE_SACREBLEU = True
+except ImportError:
+    _sacrebleu = None
+    _USE_SACREBLEU = False
+    log.warning("sacrebleu not installed: BLEU uses the fallback implementation "
+                "and chrF++ is not computed (pip install sacrebleu)")
+
+
+def _unit(score: float) -> float:
+    """sacrebleu 0-100 score -> [0, 1] (clamped against float noise)."""
+    return min(1.0, max(0.0, score / 100.0))
+
+
+def lexical_impl() -> dict:
+    """Which implementation produced BLEU / chrF++ / ROUGE-L."""
+    return {
+        "bleu": f"sacrebleu {_sacrebleu.__version__}" if _USE_SACREBLEU else "fallback",
+        "chrf": f"sacrebleu {_sacrebleu.__version__} chrF++" if _USE_SACREBLEU else None,
+        "rouge_l": "builtin LCS-F1",
+        "tokenizer": "normalize_turkish + \\w+",
+    }
 
 _CITATION_PATTERN = re.compile(r"\[\s*kaynak\s+(\d+)\s*\]", re.IGNORECASE)
 _STRIP_CITATION_PATTERN = re.compile(r"\[\s*kaynak\s+\d+\s*\]", re.IGNORECASE)
@@ -37,12 +61,6 @@ def _tokenize(text: str) -> list[str]:
     (ç ğ ı ö ş ü) stay inside tokens.
     """
     return _WORD_RE.findall(normalize_turkish(text or ""))
-
-
-def _rouge_tokenizer(text: str) -> list[str]:
-    # rouge_score's default tokenizer strips non-[a-z0-9] chars, destroying
-    # Turkish letters; pass our Unicode-aware one instead.
-    return _tokenize(text)
 
 
 def _bleu_text(text: str) -> str:
@@ -157,7 +175,9 @@ def _cited_sources(predicted: str, retrieved_chunks: list[dict]) -> list[str]:
 
 
 def exact_match(predicted: str, expected: str) -> float:
-    """Return 1.0 if the normalised expected text is a substring of predicted.
+    """Return 1.0 if the expected answer's tokens occur as a contiguous token
+    run in predicted (token boundaries respected: "5" does not match inside
+    "25" or "28/10/2023" -> "28 10 2023" only as a whole token).
 
     Note on HMGS questions: HMGS is a Turkish bar-exam dataset whose questions
     ask which statement is true/false (çoktan seçmeli, multiple-choice style).
@@ -168,11 +188,12 @@ def exact_match(predicted: str, expected: str) -> float:
     Use ``answer_containment`` (recall-side token overlap) and ``token_f1`` as
     the primary lexical metrics for HMGS; EM is reported for completeness only.
     """
-    pred_norm = normalize_turkish(predicted.strip())
-    exp_norm = normalize_turkish(expected.strip())
-    if not exp_norm:
+    exp = _tokenize(expected)
+    if not exp:
         return 0.0
-    return 1.0 if exp_norm in pred_norm else 0.0
+    pred = _tokenize(predicted)
+    n = len(exp)
+    return 1.0 if any(pred[i:i + n] == exp for i in range(len(pred) - n + 1)) else 0.0
 
 
 def answer_containment(predicted: str, expected: str) -> float:
@@ -201,45 +222,49 @@ def answer_containment(predicted: str, expected: str) -> float:
     return matched / len(exp_tokens)
 
 
-def token_f1(predicted: str, expected: str) -> float:
+def token_prf(predicted: str, expected: str) -> tuple[float, float, float]:
+    """Token (precision, recall, F1) with clipped counts."""
     pred_tokens = _tokenize(predicted)
     exp_tokens = _tokenize(expected)
     if not pred_tokens and not exp_tokens:
-        return 1.0
+        return 1.0, 1.0, 1.0
     if not pred_tokens or not exp_tokens:
-        return 0.0
-    pred_counter = Counter(pred_tokens)
-    exp_counter = Counter(exp_tokens)
-    common = sum((pred_counter & exp_counter).values())
+        return 0.0, 0.0, 0.0
+    common = sum((Counter(pred_tokens) & Counter(exp_tokens)).values())
     precision = common / len(pred_tokens)
     recall = common / len(exp_tokens)
     if precision + recall == 0:
-        return 0.0
-    return 2 * precision * recall / (precision + recall)
+        return precision, recall, 0.0
+    return precision, recall, 2 * precision * recall / (precision + recall)
+
+
+def token_f1(predicted: str, expected: str) -> float:
+    return token_prf(predicted, expected)[2]
 
 
 def bleu_score(predicted: str, expected: str) -> float:
+    """Sentence BLEU in [0, 1] (smoothed, effective order with sacrebleu)."""
     pred_norm = _bleu_text(predicted)
     ref_norm = _bleu_text(expected)
     if not pred_norm or not ref_norm:
         return 0.0
-    if _USE_HF_EVALUATE:
-        result = _BLEU_METRIC.compute(predictions=[pred_norm], references=[[ref_norm]])
-        return float(result["bleu"])
+    if _USE_SACREBLEU:
+        return _unit(_BLEU_SENT.sentence_score(pred_norm, [ref_norm]).score)
     return _sentence_bleu_fallback(pred_norm, ref_norm)
 
 
+def chrf_score(predicted: str, expected: str) -> "float | None":
+    """Sentence chrF++ in [0, 1] (character n-grams suit agglutinative
+    Turkish); None without sacrebleu."""
+    if not _USE_SACREBLEU:
+        return None
+    pred_norm, ref_norm = _bleu_text(predicted), _bleu_text(expected)
+    if not pred_norm or not ref_norm:
+        return 0.0
+    return _unit(_CHRF_PP.sentence_score(pred_norm, [ref_norm]).score)
+
+
 def rouge_l_score(predicted: str, expected: str) -> float:
-    pred_norm = _bleu_text(predicted)
-    exp_norm = _bleu_text(expected)
-    if _USE_HF_EVALUATE:
-        if not pred_norm or not exp_norm:
-            return 0.0
-        result = _ROUGE_METRIC.compute(
-            predictions=[pred_norm], references=[exp_norm], rouge_types=["rougeL"],
-            tokenizer=_rouge_tokenizer,
-        )
-        return float(result["rougeL"])
     pred_tokens = _tokenize(predicted)
     exp_tokens = _tokenize(expected)
     if not pred_tokens or not exp_tokens:
@@ -256,10 +281,14 @@ def compute_qa_metrics(predicted: str, expected: str) -> dict:
     # Strip citation markers from predicted before lexical comparison;
     # citations inflate token count and suppress F1/EM vs. citation-free expected.
     pred_clean = strip_citations(predicted)
+    precision, recall, f1 = token_prf(pred_clean, expected)
     return {
         "em": exact_match(pred_clean, expected),
-        "f1": token_f1(pred_clean, expected),
+        "f1": f1,
+        "token_precision": precision,
+        "token_recall": recall,
         "bleu": bleu_score(pred_clean, expected),
+        "chrf": chrf_score(pred_clean, expected),
         "rouge_l": rouge_l_score(pred_clean, expected),
         "answer_containment": answer_containment(pred_clean, expected),
     }
@@ -271,30 +300,38 @@ def compute_all_qa_metrics(predictions: list[dict]) -> dict:
     Returns: {"em", "f1", "bleu", "rouge_l", "answer_containment", "num_samples"}
     """
     if not predictions:
-        return {"em": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0,
-                "answer_containment": 0.0, "mean_answer_len_words": 0.0, "num_samples": 0}
+        return {"em": 0.0, "f1": 0.0, "token_precision": 0.0, "token_recall": 0.0,
+                "bleu": 0.0, "chrf": None, "rouge_l": 0.0,
+                "answer_containment": 0.0, "mean_answer_len_words": 0.0, "num_samples": 0,
+                "lexical_impl": lexical_impl()}
     metrics = [compute_qa_metrics(p["predicted"], p["expected"]) for p in predictions]
-    keys = ["em", "f1", "rouge_l", "answer_containment"]
+    # macro means over queries (F1, ROUGE-L, ...); BLEU and chrF++ are corpus-level
+    keys = ["em", "f1", "token_precision", "token_recall", "rouge_l", "answer_containment"]
     result = {k: sum(m[k] for m in metrics) / len(metrics) for k in keys}
-    # Corpus-level BLEU via evaluate
-    if _USE_HF_EVALUATE:
-        preds_norm = [_bleu_text(strip_citations(p["predicted"])) for p in predictions]
-        refs_norm = [[_bleu_text(p["expected"])] for p in predictions]
-        bleu_result = _BLEU_METRIC.compute(predictions=preds_norm, references=refs_norm)
-        result["bleu"] = float(bleu_result["bleu"])
+    preds_norm = [_bleu_text(strip_citations(p["predicted"])) for p in predictions]
+    refs_norm = [_bleu_text(p["expected"]) for p in predictions]
+    if _USE_SACREBLEU:
+        result["bleu"] = _unit(_BLEU_CORPUS.corpus_score(preds_norm, [refs_norm]).score)
+        result["chrf"] = _unit(_CHRF_PP.corpus_score(preds_norm, [refs_norm]).score)
     else:
         stripped = [{**p, "predicted": strip_citations(p["predicted"])} for p in predictions]
         result["bleu"] = _corpus_bleu_fallback(stripped)
+        result["chrf"] = None
     result["mean_answer_len_words"] = (
         sum(answer_length_words(p["predicted"]) for p in predictions) / len(predictions)
     )
+    result["mean_gold_len_words"] = (
+        sum(answer_length_words(p["expected"]) for p in predictions) / len(predictions)
+    )
     result["num_samples"] = len(predictions)
+    result["lexical_impl"] = lexical_impl()
     return result
 
 
 def compute_per_query_qa_metrics(predictions: list[dict]) -> list[dict]:
-    """Per-query metrics for bootstrap CIs: query_id, em, f1, rouge_l,
-    bleu (sentence-level), answer_containment, answer_len_words."""
+    """Per-query metrics for bootstrap CIs: query_id, em, f1, token
+    precision/recall, rouge_l, bleu and chrf (sentence-level),
+    answer_containment, answer_len_words."""
     out = []
     for p in predictions:
         m = compute_qa_metrics(p["predicted"], p["expected"])
@@ -352,8 +389,7 @@ def compute_all_qa_metrics_with_citation(predictions: list[dict]) -> dict:
              num_samples
     """
     if not predictions:
-        return {"em": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0,
-                "answer_containment": 0.0, "mean_answer_len_words": 0.0,
+        return {**compute_all_qa_metrics([]),
                 "citation_accuracy_native": None, "citation_accuracy_injected": 0.0,
                 "source_in_context_rate": 0.0,
                 "citation_presence_rate_native": None,

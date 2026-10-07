@@ -32,7 +32,7 @@ _HEAVY: list[str] = [
     "openai",
     "nltk",
     "snowballstemmer",
-    "evaluate",          # huggingface evaluate — optional heavy dep
+    "evaluate",          # huggingface evaluate — no longer imported by the pipeline
     "bitsandbytes",
     "peft",
     "trl",

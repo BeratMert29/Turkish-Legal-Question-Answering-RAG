@@ -492,7 +492,8 @@ def build_per_query(
             "query_id": qid,
             "generation_failed": not p.get("predicted"),
             **ret_rows.get(qid, {}),
-            **{k: q.get(k) for k in ("em", "f1", "rouge_l", "bleu",
+            **{k: q.get(k) for k in ("em", "f1", "token_precision", "token_recall",
+                                      "rouge_l", "bleu", "chrf",
                                       "answer_containment", "answer_len_words")},
             "semantic_similarity": sem.get(qid),
             "nli_context_grounding": n.get("context_grounding_score"),
@@ -509,7 +510,8 @@ def build_per_query(
 _CI_METRICS = (
     "recall_at_5", "recall_at_10", "reciprocal_rank", "source_hit_at_5",
     "article_hit_at_5", "article_reciprocal_rank",
-    "f1", "rouge_l", "answer_containment", "em", "semantic_similarity",
+    "f1", "token_precision", "token_recall", "rouge_l", "chrf",
+    "answer_containment", "em", "semantic_similarity",
     "nli_context_grounding", "nli_context_supported", "nli_gold_claim_recall",
     "judge_answer", "judge_faithfulness",
     "judge_relevancy", "judge_coherence",
@@ -540,7 +542,8 @@ ABLATION_PAIRS: tuple[tuple[str, str], ...] = (
 )
 
 COMPARISON_METRICS: tuple[str, ...] = (
-    "recall_at_5", "reciprocal_rank", "article_reciprocal_rank", "f1", "answer_containment", "rouge_l",
+    "recall_at_5", "reciprocal_rank", "article_reciprocal_rank",
+    "f1", "token_recall", "chrf", "answer_containment", "rouge_l",
     "semantic_similarity", "nli_context_supported", "nli_gold_claim_recall",
     "judge_answer",
 )
@@ -1506,12 +1509,12 @@ def print_ablation_table(
     h1 = (
         f"| {'Stage':<26} | "
         + " | ".join(f"{h:>{w}}" for h, w in zip(head_hdr, [8, 9, 7, 9, 6]))
-        + f" | {'F1':>6} | {'F1 95% CI':>13} | {'Contain':>7} | {'ROUGE-L':>7} | "
+        + f" | {'F1':>6} | {'F1 95% CI':>13} | {'Contain':>7} | {'ROUGE-L':>7} | {'chrF++':>6} | "
         f"{'Cite-nat':>8} | {'Cite-inj':>8} | {'Ctx-NLI':>7} | {'ClaimR':>6} | "
         f"{'LLM-J':>6} | {'SemSim':>7} | {'AnsLen':>6} |"
     )
     sep1 = "|" + "|".join(
-        ["-" * w for w in [28, 10, 11, 9, 11, 8, 8, 15, 9, 9, 10, 10, 9, 8, 8, 9, 8]]
+        ["-" * w for w in [28, 10, 11, 9, 11, 8, 8, 15, 9, 9, 8, 10, 10, 9, 8, 8, 9, 8]]
     ) + "|"
 
     print("\n\n" + "=" * 190)
@@ -1535,6 +1538,7 @@ def print_ablation_table(
             f"{_ci(r, 'f1'):>13} | "
             f"{_pct(qa.get('answer_containment')):>7} | "
             f"{_pct(qa.get('rouge_l')):>7} | "
+            f"{_pct(qa.get('chrf')):>6} | "
             f"{_pct(qa.get('citation_accuracy_native')):>8} | "
             f"{_pct(qa.get('citation_accuracy_injected', qa.get('citation_accuracy'))):>8} | "
             f"{_pct(r.get('faithfulness_rate')):>7} | "

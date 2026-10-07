@@ -1,21 +1,28 @@
+# Core pipeline (retrieval, generation via Ollama's HTTP API, evaluation)
 faiss-cpu>=1.9.0.post1,<2
 sentence-transformers==3.4.1
 transformers==4.57.6
-openai==1.63.2
-rouge-score==0.1.2
-nltk==3.9.1
-numpy==1.26.4
+numpy>=1.26.4,<3
 pandas==2.2.3
-httpx
-rank_bm25>=0.2.2
-ranx>=0.3.5
-langchain-text-splitters>=0.3.0
 scipy>=1.12.0
-evaluate>=0.4.0
+requests>=2.31
+httpx
 tqdm>=4.66.0
+rank_bm25>=0.2.2
+snowballstemmer>=2.2      # Turkish stemming for BM25 (no-op without it)
+nltk==3.9.1               # Turkish stopwords for BM25
+ranx>=0.3.5
+sacrebleu>=2.3,<3         # BLEU and chrF++ (evaluation/qa_metrics.py)
+langchain-text-splitters>=0.3.0
+pypdf>=4.0                # --docs-path with .pdf files
 
-# Fine-tuning dependencies
+# Fine-tuning (scripts 08, 12, 12b, 13) and perplexity (LoRA weights)
 bitsandbytes>=0.41.0
 peft>=0.7.0
-trl>=0.7.0
+trl>=0.9.0                # SFTConfig
 datasets>=2.14.0
+
+# Optional extras, install when needed:
+#   streamlit plotly                  -> demo.py
+#   ragas langchain-ollama            -> RAGAS metrics (judge model as evaluator)
+#   FlagEmbedding                     -> BGEM3Embedder multi-vector retrieval
