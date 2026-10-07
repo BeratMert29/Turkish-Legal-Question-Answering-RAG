@@ -465,12 +465,30 @@ class TestEvalHelpers:
              patch.object(_eval, "run_hallucination_eval",
                           return_value=(fake_hall, 0.9, fake_nli)) as mock_rhe:
             _eval._model_cache.clear()
-            hall, rate = _eval._run_hallucination_phase([], {}, "mock-model")
+            hall, rate = _eval._run_hallucination_phase([], "mock-model")
 
         mock_evict.assert_called_once()
         assert _eval._model_cache.get("nli") is fake_nli
         assert rate == 0.9
         assert hall is fake_hall
+
+    def test_hallucination_phase_scores_generation_context(self):
+        """NLI premises are each prediction's own retrieved_chunks (the
+        generator's context), and a cached NLI model survives eviction."""
+        from unittest.mock import patch, MagicMock
+        from pipeline import evaluation as _eval
+
+        cached = MagicMock()
+        preds = [{"query_id": "q1", "predicted": "a",
+                  "retrieved_chunks": [{"chunk_id": "ctx", "text": "t"}]}]
+        with patch.object(_eval, "run_hallucination_eval",
+                          return_value=({"summary": {}}, 0.5, cached)) as mock_rhe:
+            _eval._model_cache.clear()
+            _eval._model_cache["nli"] = cached
+            _eval._run_hallucination_phase(preds, "m")
+        args, kwargs = mock_rhe.call_args
+        assert args[1] == {"q1": [{"chunk_id": "ctx", "text": "t"}]}
+        assert kwargs["nli_model"] is cached
 
     def test_no_run_stage_nli_attribute(self):
         """run_stage must not cache NLI on a function attribute."""

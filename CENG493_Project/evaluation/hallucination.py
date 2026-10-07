@@ -1,7 +1,5 @@
 import random
 import config
-from scipy.special import softmax as scipy_softmax
-from evaluation.nli import entailment_index, nli_context_faithfulness
 
 
 def _norm_source(s) -> str:
@@ -53,22 +51,25 @@ def _classify_result(result: dict, k: int = 5) -> str | None:
     return "hit" if rank == 1 else "partial"
 
 
-def stratified_sample(results: list[dict], sample_size: int = config.HALLUCINATION_SAMPLE_SIZE,
+def stratified_sample(results: list[dict], sample_size: int | None = config.HALLUCINATION_SAMPLE_SIZE,
                       k: int = 5) -> dict:
-    """Sample ~third from each gold-retrieval stratum (hit/partial/miss); fills to sample_size."""
-    # Use a local RNG instance to avoid mutating the global random state across runs.
-    rng = random.Random(42)
+    """Group results by gold-retrieval stratum (hit/partial/miss/unlabeled).
 
-    hits, partial, misses = [], [], []
+    ``sample_size=None`` keeps every result (no sampling, the default): the
+    stage-level rate then covers the whole eval set and every stage scores
+    the same queries.  An int draws ~a third from each labeled stratum
+    (filling up to sample_size) and leaves unlabeled results out.
+    """
+    hits, partial, misses, unlabeled = [], [], [], []
     for r in results:
         category = _classify_result(r, k)
-        if category == "hit":
-            hits.append(r)
-        elif category == "partial":
-            partial.append(r)
-        elif category == "miss":
-            misses.append(r)
+        {"hit": hits, "partial": partial, "miss": misses, None: unlabeled}[category].append(r)
 
+    if sample_size is None:
+        return {"hits": hits, "partial": partial, "misses": misses, "unlabeled": unlabeled}
+
+    # Use a local RNG instance to avoid mutating the global random state across runs.
+    rng = random.Random(42)
     target = sample_size // 3
     h = rng.sample(hits, min(target, len(hits)))
     p = rng.sample(partial, min(target, len(partial)))
@@ -83,115 +84,78 @@ def stratified_sample(results: list[dict], sample_size: int = config.HALLUCINATI
             c = _classify_result(item, k)
             {"hit": h, "partial": p, "miss": m}[c].append(item)
 
-    return {"hits": h, "partial": p, "misses": m}
-
-
-def evaluate_faithfulness(answer: str, context: str, nli_model) -> dict:
-    """NLI entailment prob (context → answer)."""
-    logits = nli_model.predict([(context, answer)])
-    logit_vec = logits[0]
-    probs = scipy_softmax(logit_vec)
-    entailment_idx = entailment_index(nli_model)
-    entailment_prob = float(probs[entailment_idx])
-    return {"faithful": entailment_prob >= 0.5, "score": entailment_prob}
+    return {"hits": h, "partial": p, "misses": m, "unlabeled": []}
 
 
 def run_hallucination_analysis(
     sample_dict: dict,
     retrieved_results: dict,
     nli_model,
+    threshold: float = 0.5,
 ) -> dict:
-    """Batch NLI: context grounding + gold-answer consistency (entailment probs)."""
+    """Batch NLI over the sampled predictions.
+
+    ``retrieved_results`` maps query_id to the chunks the generator actually
+    saw (its context), which are the NLI premises.
+
+    Reported per answer and summarised:
+      * context grounding  — answer sentences vs context (``supported_rate``
+        = fraction of sentences some chunk entails; ``score`` = mean
+        sentence entailment);
+      * gold claim recall  — fraction of gold-answer sentences the answer
+        entails (needs a gold answer).
+    The headline ``context_supported_sentence_rate`` is the mean of the
+    per-answer supported_rate; ``context_grounding_rate`` (answers whose mean
+    sentence entailment >= threshold) is kept for comparison with older runs.
+    """
     import numpy as np
+    from evaluation.nli import nli_claim_recall, nli_context_faithfulness
 
-    entailment_idx = entailment_index(nli_model)
-
-    ordered_items = []
-    for category, items in sample_dict.items():
-        for item in items:
-            query_id = item.get("query_id", "")
-            predicted = item.get("predicted", "")
-            gold_answer = item.get("expected", "")
-            chunks = retrieved_results.get(query_id, [])
-            context = "\n\n".join(c["text"] for c in chunks[:5]) if chunks else ""
-            ordered_items.append((query_id, predicted, context, gold_answer, category))
-
-    # Grounding: answer sentences vs each retrieved chunk (max over chunks,
-    # mean over sentences); not the gold answer.
-    _g = nli_context_faithfulness(
-        [{"query_id": qid, "predicted": pred,
-          "retrieved_chunks": retrieved_results.get(qid, [])[:5]}
-         for qid, pred, _, _, _ in ordered_items],
-        nli_model, max_chunks=5, batch_size=8,
-    )
-    grounding_scores_raw = [x["score"] for x in _g["per_sample"]]
-
-    has_gold = [bool(gold) for _, _, _, gold, _ in ordered_items]
-    faith_pairs = [
-        (gold, pred)
-        for (_, pred, _, gold, _), has in zip(ordered_items, has_gold)
-        if has
+    ordered = [(category, item) for category, items in sample_dict.items() for item in items]
+    preds = [
+        {"query_id": item.get("query_id", ""), "predicted": item.get("predicted", ""),
+         "expected": item.get("expected", ""),
+         "retrieved_chunks": retrieved_results.get(item.get("query_id", ""), [])}
+        for _, item in ordered
     ]
-    if faith_pairs:
-        faith_logits = nli_model.predict(faith_pairs, batch_size=8)
-        if faith_logits.ndim == 1:
-            faith_logits = faith_logits.reshape(1, -1)
-    else:
-        faith_logits = np.zeros((0, 3), dtype=np.float32)
+    grounding = nli_context_faithfulness(preds, nli_model, batch_size=8, threshold=threshold)
+    claims = nli_claim_recall(preds, nli_model, batch_size=8, threshold=threshold)
 
-    softmax = scipy_softmax
-
+    by_category: dict[str, dict] = {}
     per_sample = []
-    grounding_count = 0
-    faith_count = 0
-    faith_total = 0
-    by_category = {
-        "hits":    {"total": 0, "context_grounded": 0, "answer_faithful": 0},
-        "partial": {"total": 0, "context_grounded": 0, "answer_faithful": 0},
-        "misses":  {"total": 0, "context_grounded": 0, "answer_faithful": 0},
-    }
-
-    faith_idx = 0
-    for i, (query_id, predicted, context, gold_answer, category) in enumerate(ordered_items):
-        grounding_prob = grounding_scores_raw[i] if grounding_scores_raw[i] is not None else 0.0
-        is_grounded = grounding_prob >= 0.5
-
-        answer_faith_prob = None
-        is_answer_faithful = None
-        if has_gold[i]:
-            faith_probs = softmax(faith_logits[faith_idx])
-            answer_faith_prob = float(faith_probs[entailment_idx])
-            is_answer_faithful = answer_faith_prob >= 0.5
-            faith_idx += 1
-
-        if is_grounded:
-            grounding_count += 1
-            by_category[category]["context_grounded"] += 1
-        if is_answer_faithful:
-            faith_count += 1
-            faith_total += 1
-            by_category[category]["answer_faithful"] += 1
-        elif is_answer_faithful is False:
-            faith_total += 1
-
-        by_category[category]["total"] += 1
+    for (category, _), g, c, p in zip(ordered, grounding["per_sample"],
+                                      claims["per_sample"], preds):
+        cat = by_category.setdefault(category, {"total": 0, "context_grounded": 0,
+                                                 "supported_rate_sum": 0.0})
+        score = g["score"] if g["score"] is not None else 0.0
+        supported = g["supported_rate"] if g["supported_rate"] is not None else 0.0
+        grounded = score >= threshold
+        cat["total"] += 1
+        cat["context_grounded"] += int(grounded)
+        cat["supported_rate_sum"] += supported
         per_sample.append({
-            "query_id": query_id,
+            "query_id": p["query_id"],
             "category": category,
-            "predicted": predicted,
-            "context_grounding_score": grounding_prob,
-            "context_grounded": is_grounded,
-            "answer_faithfulness_score": answer_faith_prob,
-            "answer_faithful": is_answer_faithful,
+            "predicted": p["predicted"],
+            "context_grounding_score": score,
+            "context_supported_rate": supported,
+            "context_grounded": grounded,
+            "n_sentences": g["n_sentences"],
+            "gold_claim_recall": c["claim_recall"],
+            "n_gold_claims": c["n_claims"],
         })
+    for cat in by_category.values():
+        cat["context_supported_sentence_rate"] = (
+            cat.pop("supported_rate_sum") / cat["total"] if cat["total"] else None)
 
-    total = sum(c["total"] for c in by_category.values())
+    total = len(per_sample)
     grounding_scores = [s["context_grounding_score"] for s in per_sample]
-    faith_scores = [s["answer_faithfulness_score"] for s in per_sample if s["answer_faithfulness_score"] is not None]
+    claim_scores = [s["gold_claim_recall"] for s in per_sample
+                    if s["gold_claim_recall"] is not None]
 
     def _stats(vals):
         if not vals:
-            return {"mean": 0.0, "min": 0.0, "max": 0.0, "std": 0.0}
+            return {"mean": None, "min": None, "max": None, "std": None}
         return {
             "mean": float(np.mean(vals)),
             "min":  float(np.min(vals)),
@@ -199,25 +163,22 @@ def run_hallucination_analysis(
             "std":  float(np.std(vals)),
         }
 
-    context_grounding_rate = grounding_count / total if total > 0 else 0.0
-    answer_faithfulness_rate = faith_count / faith_total if faith_total > 0 else None
-
+    n_grounded = sum(s["context_grounded"] for s in per_sample)
     return {
         "summary": {
             "total": total,
-            "context_grounding_count": grounding_count,
-            "context_grounding_rate": context_grounding_rate,
-            "answer_faithfulness_count": faith_count,
-            "answer_faithfulness_total": faith_total,
-            "answer_faithfulness_rate": answer_faithfulness_rate,
-            # Explicit name for the legacy metric: NLI(gold answer -> predicted answer).
-            "gold_answer_entailment_rate": answer_faithfulness_rate,
-            "context_grounding_count": grounding_count,
-            "context_grounding_rate":  context_grounding_rate,
+            "threshold": threshold,
+            "context_supported_sentence_rate": (
+                float(np.mean([s["context_supported_rate"] for s in per_sample]))
+                if per_sample else None),
+            "context_grounding_count": n_grounded,
+            "context_grounding_rate": n_grounded / total if total else None,
+            "n_empty_or_no_context": grounding["n_skipped"],
+            "gold_claim_recall": float(np.mean(claim_scores)) if claim_scores else None,
+            "gold_claim_recall_n": len(claim_scores),
             "by_category": by_category,
-            "context_grounding_score_stats":  _stats(grounding_scores),
-            "answer_faithfulness_score_stats": _stats(faith_scores),
-            "score_stats": _stats(grounding_scores),
+            "context_grounding_score_stats": _stats(grounding_scores),
+            "gold_claim_recall_stats": _stats(claim_scores),
         },
         "per_sample": per_sample,
     }

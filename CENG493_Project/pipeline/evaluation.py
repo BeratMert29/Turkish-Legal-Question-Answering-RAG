@@ -165,20 +165,22 @@ def failure_rate_exceeded(failed: int, total: int, max_rate: float) -> bool:
 def run_hallucination_eval(
     predictions: list[dict],
     full_retrieved: dict[str, list],
-    sample_size: int,
+    sample_size: Optional[int],
     *,
     nli_model=None,
     llm_model: Optional[str] = None,
     gold_info: Optional[dict[str, dict]] = None,
-) -> tuple[dict, float, Any]:
+) -> tuple[dict, Optional[float], Any]:
     """Run hallucination analysis.
 
-    Loads NLI model if *nli_model* is ``None``.  Frees VRAM from the generation
+    *full_retrieved* maps query_id to the premise chunks, i.e. the context
+    the generator saw for that query.  *sample_size* None scores every
+    prediction.  Loads NLI model if *nli_model* is ``None``.  Frees VRAM from the generation
     LLM before loading the NLI cross-encoder.
 
     Returns
     -------
-    tuple[dict, float, Any]
+    tuple[dict, Optional[float], Any]
         ``(hallucination_result, faithful_rate, nli_model)``
     """
     import gc
@@ -226,12 +228,14 @@ def run_hallucination_eval(
         for p in predictions
     ]
     sample = stratified_sample(strat_input, sample_size)
-    hall = run_hallucination_analysis(sample, full_retrieved, nli_model)
+    hall = run_hallucination_analysis(
+        sample, full_retrieved, nli_model, threshold=config.NLI_SUPPORT_THRESHOLD,
+    )
 
-    # Faithfulness headline = NLI of the answer against its RETRIEVED context
-    # (context_grounding_rate); the gold-answer entailment rate is reported
-    # separately in hallucination_summary.
-    faithful_rate = hall["summary"].get("context_grounding_rate", 0.0)
+    # Faithfulness headline = mean fraction of answer sentences entailed by the
+    # context the generator saw; gold claim recall is reported separately in
+    # hallucination_summary.
+    faithful_rate = hall["summary"].get("context_supported_sentence_rate")
 
     return hall, faithful_rate, nli_model
 
@@ -446,7 +450,8 @@ def build_per_query(
                                       "answer_containment", "answer_len_words")},
             "semantic_similarity": sem.get(qid),
             "nli_context_grounding": n.get("context_grounding_score"),
-            "nli_gold_entailment": n.get("answer_faithfulness_score"),
+            "nli_context_supported": n.get("context_supported_rate"),
+            "nli_gold_claim_recall": n.get("gold_claim_recall"),
             "hallucination_category": n.get("category"),
         }
         for name, by in judge_by.items():
@@ -458,7 +463,8 @@ def build_per_query(
 _CI_METRICS = (
     "recall_at_5", "recall_at_10", "reciprocal_rank", "source_hit_at_5",
     "f1", "rouge_l", "answer_containment", "em", "semantic_similarity",
-    "nli_context_grounding", "judge_answer", "judge_faithfulness",
+    "nli_context_grounding", "nli_context_supported", "nli_gold_claim_recall",
+    "judge_answer", "judge_faithfulness",
     "judge_relevancy", "judge_coherence",
 )
 
@@ -843,35 +849,43 @@ def _run_supplemental_metrics(
 
 def _run_hallucination_phase(
     predictions: list[dict],
-    full_retrieved: dict[str, list],
     llm_model: str,
     gold_info: Optional[dict[str, dict]] = None,
-) -> tuple[dict, float]:
+) -> tuple[dict, Optional[float]]:
     """Evict perplexity/RAGAS models, run hallucination analysis, update NLI cache.
+
+    Each prediction is scored against its own ``retrieved_chunks`` -- the
+    context the generator actually saw (after graph-slot selection and the
+    context-window cut), not the raw retrieval list.
 
     The NLI cross-encoder is stored in and retrieved from the module-level
     ``_model_cache`` so it is reused across consecutive stages.
 
     Returns
     -------
-    tuple[dict, float]
+    tuple[dict, Optional[float]]
         ``(hallucination_result, faithful_rate)``
     """
     import config as _config
 
-    # Evict perplexity/RAGAS models before loading the NLI cross-encoder.
+    # Evict perplexity/RAGAS models before loading the NLI cross-encoder,
+    # but keep the NLI model itself for reuse.
+    nli_model = _model_cache.get("nli")
     evict_model_cache()
 
     print("  Hallucination analysis …")
+    contexts = {p["query_id"]: p.get("retrieved_chunks", []) for p in predictions}
     hall, faithful_rate, nli_model = run_hallucination_eval(
-        predictions, full_retrieved,
+        predictions, contexts,
         _config.HALLUCINATION_SAMPLE_SIZE,
-        nli_model=_model_cache.get("nli"),
+        nli_model=nli_model,
         llm_model=llm_model,
         gold_info=gold_info,
     )
     _model_cache["nli"] = nli_model  # reuse across stages
-    print(f"    Faithfulness={faithful_rate:.4f}")
+    _claims = hall.get("summary", {}).get("gold_claim_recall")
+    print(f"    Faithfulness (supported sentences)={_fmt_opt(faithful_rate)}  "
+          f"GoldClaimRecall={_fmt_opt(_claims)}")
     return hall, faithful_rate
 
 
@@ -1140,7 +1154,7 @@ def run_stage(
     )
 
     # -- Retrieval + retrieval metrics -------------------------------------
-    retrieved_all, retrieval_metrics, source_metrics, full_retrieved = (
+    retrieved_all, retrieval_metrics, source_metrics, _ = (
         _run_retrieval_phase(
             stage, qa_examples, retriever, bm25, reranker, graph_index,
             relevant_map,
@@ -1173,7 +1187,7 @@ def run_stage(
     # -- Hallucination -----------------------------------------------------
     metric_input, gold_info = _gold_info(qa_examples, retrieved_all, relevant_map)
     hall, faithful_rate = _run_hallucination_phase(
-        predictions, full_retrieved, llm_model, gold_info=gold_info,
+        predictions, llm_model, gold_info=gold_info,
     )
 
     # -- LLM Judge ---------------------------------------------------------

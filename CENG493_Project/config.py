@@ -138,7 +138,12 @@ TRUST_REMOTE_CODE = False
 LLM_JUDGE_MODEL = "llama3.1:8b"
 
 # Evaluation
-HALLUCINATION_SAMPLE_SIZE = 150
+# NLI faithfulness sample per stage; None = every successful prediction, so all
+# stages are scored on the same queries (NLI is cheap next to generation).
+HALLUCINATION_SAMPLE_SIZE = None
+# Entailment probability at/above which an answer sentence (or gold claim) is
+# counted as supported.
+NLI_SUPPORT_THRESHOLD = 0.5
 
 # NLI model for hallucination analysis (multilingual, covers Turkish).
 NLI_MODEL = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
@@ -148,10 +153,6 @@ SEMANTIC_SIM_MAX_SEQ_LEN = 512  # encoder window; longer answers are chunked
 # Number of predictions sampled for each LLM-judge metric call.  None = judge
 # every prediction (needed for tight CIs); an int caps cost (Ollama calls).
 LLM_JUDGE_SAMPLE_SIZE = None
-
-# Hallucination stratification thresholds (applied to top-1 retrieval score)
-HALLUCINATION_HIT_THRESHOLD = 0.7
-HALLUCINATION_PARTIAL_THRESHOLD = 0.4
 
 # BM25 tokenization
 BM25_MIN_TOKEN_LENGTH = 2
