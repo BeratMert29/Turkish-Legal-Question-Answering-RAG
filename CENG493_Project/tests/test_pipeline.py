@@ -497,3 +497,55 @@ class TestEvalHelpers:
             f"metadata.jsonl not committed at {meta}; "
             "CI will silently skip data-dependent tests without it."
         )
+
+    def test_run_hallucination_eval_annotation_returns_three(self):
+        """run_hallucination_eval type annotation must match its 3-element return."""
+        import inspect
+        from pipeline.evaluation import run_hallucination_eval
+
+        hints = inspect.get_annotations(run_hallucination_eval, eval_str=False)
+        ret = hints.get("return")
+        # The annotation must be tuple[dict, float, Any], not the old tuple[dict, float].
+        # We check the string representation is not the old 2-arg form.
+        ret_str = str(ret)
+        assert "Any" in ret_str, (
+            f"run_hallucination_eval return annotation missing 'Any' (nli_model): {ret_str}"
+        )
+
+    def test_run_llm_judge_eval_uses_config_default(self):
+        """run_llm_judge_eval must fall back to config.LLM_JUDGE_SAMPLE_SIZE when
+        sample_size is not supplied."""
+        import config
+        from pipeline.evaluation import run_llm_judge_eval
+        from unittest.mock import patch
+
+        captured: list[int] = []
+
+        def _fake_judge(preds, base_url, model, sample_size=20, results_dir=None):
+            captured.append(len(preds))
+            return {"score": 0.5, "per_sample": [], "parse_fail_count": 0, "sample_size": len(preds)}
+
+        qa = [_FakeQA(f"q{i}", f"Q{i}", f"A{i}", "Law") for i in range(50)]
+        preds = [
+            {"query_id": qa[i].query_id, "predicted": f"ans{i}",
+             "expected": qa[i].answer, "retrieved_chunks": []}
+            for i in range(50)
+        ]
+
+        with patch("evaluation.llm_judge.llm_judge_answer", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_faithfulness", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_relevancy", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_coherence", side_effect=_fake_judge):
+            # Call WITHOUT sample_size so the config default is used.
+            run_llm_judge_eval(
+                preds, qa,
+                base_url="http://localhost:11434/v1",
+                judge_model="mock",
+            )
+
+        expected_n = min(config.LLM_JUDGE_SAMPLE_SIZE, 50)
+        for n in captured:
+            assert n == expected_n, (
+                f"judge called with {n} samples; expected {expected_n} "
+                f"(config.LLM_JUDGE_SAMPLE_SIZE={config.LLM_JUDGE_SAMPLE_SIZE})"
+            )
