@@ -16,7 +16,7 @@ The system is fully parameterized — you can plug in your own document collecti
 pip install -r requirements.txt
 
 # Pull the LLM used for answer generation (requires Ollama)
-ollama pull qwen2.5:14b
+ollama pull qwen2.5:7b
 ```
 
 Ollama install: https://ollama.com/download
@@ -140,8 +140,8 @@ results/
 
 | Stage ID | Description |
 |----------|-------------|
-| `base` | BGE-M3 dense retrieval + Qwen2.5:14b |
-| `rrf_rerank` | BM25 + dense RRF + BGE reranker + Qwen2.5:14b |
+| `base` | BGE-M3 dense retrieval + Qwen2.5:7b |
+| `rrf_rerank` | BM25 + dense RRF + BGE reranker + Qwen2.5:7b |
 | `emb_ft` | Fine-tuned BGE-M3 + RRF rerank (requires trained model) |
 | `llm_ft` | Dense retrieval + fine-tuned LLM (requires Ollama model) |
 | `full` | Fine-tuned embedding + rerank + fine-tuned LLM |
@@ -156,14 +156,14 @@ Pass multiple stages as comma-separated: `--stages base,rrf_rerank,emb_ft`
 
 ```bash
 pip install -r requirements.txt
-ollama pull qwen2.5:14b
+ollama pull qwen2.5:7b
 ```
 
 Ollama server settings (set before `ollama serve`):
 
 ```bash
 # One model resident at a time: generation LLM, then judge LLM, never both
-# (the 14B generator + 70B judge do not fit together).
+# (a 12 GB GPU cannot hold the 7B generator and the 8B judge together).
 export OLLAMA_MAX_LOADED_MODELS=1
 # Same context window for the base and the fine-tuned LLM (config.LLM_NUM_CTX);
 # the OpenAI-compatible endpoint cannot set num_ctx per request.
@@ -188,13 +188,52 @@ PYTHONUTF8=1 python scripts/14_eval_all_stages.py --stages base,rrf_rerank
 
 ---
 
+## Local run (12 GB GPU)
+
+Tested target: RTX 4070 Super 12 GB. Run from `CENG493_Project/`; the 7B
+generator (`qwen2.5:7b`) and 8B judge (`llama3.1:8b`) are loaded one at a time.
+The 14B generator and `llama3.3:70b` judge are options on a larger GPU, but then
+the LoRA must be retrained on the matching base.
+
+```bash
+# 1. Terminal A: Ollama server, one model resident, 8192-token context
+OLLAMA_MAX_LOADED_MODELS=1 OLLAMA_CONTEXT_LENGTH=8192 ollama serve
+
+# 2. Terminal B: models
+ollama pull qwen2.5:7b
+ollama pull llama3.1:8b
+# optional, only for the llm_ft / full stages:
+python scripts/13_export_lora_to_ollama.py
+
+# 3. Python deps
+pip install -r requirements.txt
+
+# 4. Optional: standalone index + graph (needed only for run_baseline.py,
+#    scripts/03 and the graph stage's graph.json; scripts/14 builds its own
+#    in-memory FAISS index and auto-builds graph.json)
+PYTHONUTF8=1 python scripts/02_build_index.py --corpus ../results/processed_data/corpus_chunks.jsonl
+PYTHONUTF8=1 python scripts/15_build_graph.py
+
+# 5. Smoke run (10 questions, two stages)
+PYTHONUTF8=1 python scripts/14_eval_all_stages.py --stages base rrf_rerank --limit 10
+
+# 6. Full run (all stages whose prerequisites exist; the default eval set)
+PYTHONUTF8=1 python scripts/14_eval_all_stages.py
+```
+
+Re-export the LoRA with `13_export_lora_to_ollama.py` only if the Modelfile
+changed (it bakes in `LLM_NUM_CTX` and `LLM_MAX_TOKENS`); the 7B adapter already
+matches the base, no retraining is needed.
+
+---
+
 ## Architecture
 
 The system includes five evaluation stages that progressively add components:
 
 | Stage | Components | Key Addition |
 |-------|-----------|--------------|
-| **base** | Dense retrieval (BGE-M3) + Qwen2.5:14b | Baseline system |
+| **base** | Dense retrieval (BGE-M3) + Qwen2.5:7b | Baseline system |
 | **rrf_rerank** | BM25 + dense RRF + BGE-reranker-v2-m3 | Hybrid retrieval + cross-encoder |
 | **emb_ft** | Fine-tuned BGE-M3 + RRF rerank | Task-specific embeddings |
 | **llm_ft** | Dense retrieval + QLoRA fine-tuned LLM | Legal QA instruction tuning |
@@ -203,8 +242,9 @@ The system includes five evaluation stages that progressively add components:
 ### Ablation design (one factor per step)
 
 - **Base vs fine-tuned LLM** differ only in the LoRA weights: both use the same
-  base size (`config.LLM_BASE_FOR_ABLATION` = `qwen2.5:14b`, adapter trained
-  from `config.LORA_BASE_HF_MODEL` with `08_finetune_llm.py --backend qlora`),
+  base size (`config.LLM_BASE_FOR_ABLATION` = `qwen2.5:7b`; the committed
+  adapter in `results/model_configs/qwen25_lora` is trained on
+  `config.LORA_BASE_HF_MODEL` = `Qwen/Qwen2.5-7B-Instruct`, so they match),
   the same `LLM_MAX_TOKENS` and the same `LLM_NUM_CTX`.  Each stage's
   `baseline_metrics.json` records `llm_model`, `llm_max_tokens`, `llm_num_ctx`.
 - **rrf vs rrf_rerank**: both fuse the same top-`RERANKER_CANDIDATES` (50)
@@ -239,7 +279,7 @@ The system includes five evaluation stages that progressively add components:
 
 - **Embedding**: BAAI/bge-m3 (base and fine-tuned variants)
 - **Reranker**: BAAI/bge-reranker-v2-m3
-- **LLM**: Qwen2.5:14b via Ollama (local inference, no API key required)
+- **LLM**: Qwen2.5:7b via Ollama (local inference, no API key required)
 
 ---
 
@@ -295,7 +335,7 @@ CENG493_Project/
 # Fine-tune Qwen2.5-3B (safe fp16 LoRA, fits on 16GB GPU)
 PYTHONUTF8=1 python scripts/08_finetune_llm.py --backend safe
 
-# Fine-tune Qwen2.5-14B (4-bit QLoRA, requires 40GB+ VRAM)
+# Fine-tune Qwen2.5-7B (4-bit QLoRA; the base the ablation uses)
 PYTHONUTF8=1 python scripts/08_finetune_llm.py --backend qlora
 
 # Export LoRA adapter to Ollama
@@ -332,14 +372,14 @@ All settings are in `config.py`. Key values:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `LLM_MODEL` | `qwen2.5:14b` | Ollama model for generation |
+| `LLM_MODEL` | `qwen2.5:7b` | Ollama model for generation |
 | `EMBEDDING_MODEL` | `BAAI/bge-m3` | Embedding model |
 | `EMBEDDING_BATCH_SIZE` | `8` | Batch size (increase to 64 on A100) |
 | `TOP_K_RETRIEVAL` | 10 | Chunks retrieved per query |
 | `TOP_K_FOR_GENERATION` | 5 | Chunks passed to LLM |
 | `RERANKER_CANDIDATES` | 50 | Candidates fed to reranker |
 | `CHUNK_SIZE` | 1400 | Characters per chunk |
-| `LLM_BASE_FOR_ABLATION` | `qwen2.5:14b` | Base LLM; must match the LoRA base |
+| `LLM_BASE_FOR_ABLATION` | `qwen2.5:7b` | Base LLM; must match the LoRA base |
 | `LLM_NUM_CTX` | 8192 | Context window for both LLMs |
 | `LLM_JUDGE_SAMPLE_SIZE` | `None` | Judge every answer (int = cap) |
 | `NLI_MODEL` | mDeBERTa xnli | Multilingual NLI for faithfulness |
