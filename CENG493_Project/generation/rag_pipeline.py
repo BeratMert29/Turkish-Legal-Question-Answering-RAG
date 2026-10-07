@@ -134,9 +134,12 @@ class RAGPipeline:
 
         Chunks flagged ``graph_neighbor`` come from GraphIndex.expand and sit
         right after their parent.  Up to ``graph_neighbor_budget`` of the
-        ``top_k_for_generation`` slots go to neighbours (preferring those whose
-        parent is among the kept top results); the rest go to the top-ranked
-        regular chunks.  List order (parent, then its neighbours) is kept.
+        ``top_k_for_generation`` slots go to neighbours of the kept top-ranked
+        chunks (or to directly injected article chunks, which have no parent);
+        the rest go to the top-ranked regular chunks.  A slot is reserved only
+        when such a neighbour exists, so a top-ranked chunk is never displaced
+        by a neighbour of a chunk that was not kept.  List order (parent, then
+        its neighbours) is kept.
         """
         k = self.top_k_for_generation
         budget = self.graph_neighbor_budget
@@ -144,14 +147,17 @@ class RAGPipeline:
         if budget <= 0 or not neighbours:
             return chunks[:k]
         regular = [c for c in chunks if not c.get("graph_neighbor")]
-        n_nb = min(budget, len(neighbours), max(k - 1, 0))
-        keep_regular = regular[:k - n_nb]
-        kept_ids = {c["chunk_id"] for c in keep_regular}
-        # neighbours of kept parents first (list order), then any others
-        preferred = [c for c in neighbours if c.get("graph_root") in kept_ids]
-        others = [c for c in neighbours if c not in preferred]
-        chosen = {id(c) for c in (preferred + others)[:n_nb]}
-        keep_ids = {id(c) for c in keep_regular} | chosen
+        keep_regular, chosen = regular[:k], []
+        # Largest reservation n that neighbours of the kept parents can fill.
+        for n_nb in range(min(budget, len(neighbours), max(k - 1, 0)), 0, -1):
+            cand_regular = regular[:k - n_nb]
+            kept_ids = {c["chunk_id"] for c in cand_regular}
+            eligible = [c for c in neighbours
+                        if c.get("graph_root") is None or c.get("graph_root") in kept_ids]
+            if len(eligible) >= n_nb:
+                keep_regular, chosen = cand_regular, eligible[:n_nb]
+                break
+        keep_ids = {id(c) for c in keep_regular} | {id(c) for c in chosen}
         return [c for c in chunks if id(c) in keep_ids]
 
     def assemble_context(self, chunks: list) -> tuple[str, list]:

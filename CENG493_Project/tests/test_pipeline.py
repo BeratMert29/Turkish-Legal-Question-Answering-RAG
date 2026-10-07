@@ -674,6 +674,22 @@ class TestGraphGenerationContext:
         assert len(ids) == 5
         assert ids == ["r0", "n0", "r1", "n1", "r2"]
 
+    def test_neighbours_of_unkept_parents_do_not_displace_top_chunks(self):
+        reg = [{"chunk_id": f"r{i}", "text": "t", "source": "S", "score": 1.0 - i / 10}
+               for i in range(10)]
+        nb = [{"chunk_id": cid, "text": "t", "source": "S", "score": .1,
+               "graph_neighbor": True, "graph_parent": root, "graph_root": root}
+              for cid, root in (("n7a", "r7"), ("n7b", "r7"), ("n8a", "r8"))]
+        chunks = [*reg[:8], nb[0], nb[1], reg[8], nb[2], reg[9]]
+        sel = self._pipe(3)._select_for_generation(chunks)
+        assert [c["chunk_id"] for c in sel] == ["r0", "r1", "r2", "r3", "r4"]
+
+    def test_reservation_shrinks_to_available_neighbours(self):
+        # only r0 has a neighbour: one slot is reserved, not the full budget of 3
+        sel = self._pipe(3)._select_for_generation(
+            [c for c in self._chunks() if c["chunk_id"] != "n1"])
+        assert [c["chunk_id"] for c in sel] == ["r0", "n0", "r1", "r2", "r3"]
+
     def test_budget_zero_just_cuts_to_top_k(self):
         sel = self._pipe(0)._select_for_generation(self._chunks())
         assert [c["chunk_id"] for c in sel] == ["r0", "n0", "r1", "n1", "r2"]
