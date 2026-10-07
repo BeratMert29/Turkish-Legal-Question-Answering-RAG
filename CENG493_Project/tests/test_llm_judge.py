@@ -21,6 +21,7 @@ from evaluation.llm_judge import (
     _subsample,
     _aggregate,
     save_raw_responses,
+    sample_judge_query_ids,
     llm_judge_answer,
     llm_judge_faithfulness,
     llm_judge_relevancy,
@@ -354,3 +355,50 @@ class TestDistinctSeeds:
         # With different seeds, at least one query should differ between the two sets
         # (statistically guaranteed for n=50, sample=10 with seeds 42 vs 45)
         assert answer_set != coherence_set or len(answer_set) == 0
+
+
+# ---------------------------------------------------------------------------
+# sample_judge_query_ids + cross-metric consistent sampling
+# ---------------------------------------------------------------------------
+
+class TestSampleJudgeQueryIds:
+    def test_returns_subsample(self):
+        ids = [f"q{i}" for i in range(100)]
+        result = sample_judge_query_ids(ids, 10)
+        assert len(result) == 10
+        assert all(r in ids for r in result)
+
+    def test_deterministic(self):
+        ids = [f"q{i}" for i in range(50)]
+        assert sample_judge_query_ids(ids, 20) == sample_judge_query_ids(ids, 20)
+
+    def test_all_four_metrics_same_query_ids(self):
+        """When query_ids is passed, all four llm_judge_* evaluate the same items."""
+        predictions = [
+            {
+                "query_id": f"q{i}",
+                "question": f"Soru {i}?",
+                "expected": f"Beklenen {i}",
+                "predicted": f"Tahmin {i}",
+                "retrieved_chunks": [{"text": f"Bağlam {i}"}],
+            }
+            for i in range(20)
+        ]
+        shared_ids = sample_judge_query_ids(
+            [p["query_id"] for p in predictions], n=10
+        )
+        assert len(shared_ids) == 10
+
+        with patch("evaluation.llm_judge._ollama_generate", return_value="0.8"):
+            r_ans  = llm_judge_answer(predictions, "http://x", "m", query_ids=shared_ids)
+            r_faith = llm_judge_faithfulness(predictions, "http://x", "m", query_ids=shared_ids)
+            r_rel  = llm_judge_relevancy(predictions, "http://x", "m", query_ids=shared_ids)
+            r_coh  = llm_judge_coherence(predictions, "http://x", "m", query_ids=shared_ids)
+
+        def _qids(result):
+            return {s["query_id"] for s in result["per_sample"]}
+
+        assert _qids(r_ans) == _qids(r_faith) == _qids(r_rel) == _qids(r_coh), (
+            "All four metrics must evaluate the same query IDs when query_ids is passed"
+        )
+        assert _qids(r_ans) == set(shared_ids)

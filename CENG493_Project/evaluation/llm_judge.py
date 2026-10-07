@@ -22,14 +22,20 @@ Bug fix: _parse_score now returns None on failure instead of 0.5, so failed
 parses are excluded from the mean rather than biasing it toward 0.5.
 
 Identical-score investigation: base stage had judge==coherence==0.2675 exactly.
-Root cause: with temperature=0.0 the judge LLM is deterministic; _subsample used
-seed=42 for every function, so all four metrics sampled the same 20 items.
-When Ollama is unavailable or the model returns unparseable text (e.g. long
-reasoning before the score), _parse_score used to silently return 0.5 for all
-samples, and partial failures (some real scores + some 0.5 fallbacks) could
-accidentally produce the same mean across two metrics if the failure pattern
-was identical.  Fix: return None on failure + exclude from mean + use
-per-function seed offsets so subsamples differ across metrics.
+Root cause: with temperature=0.0 the judge LLM is deterministic; _subsample
+originally used seed=42 for every function, so all four metrics sampled the
+same 20 items.  When Ollama is unavailable or the model returns unparseable
+text (e.g. long reasoning before the score), _parse_score used to silently
+return 0.5 for all samples, and partial failures (some real scores + some 0.5
+fallbacks) could accidentally produce the same mean across two metrics if the
+failure pattern was identical.
+
+Fix: return None on failure + exclude from mean + use per-function seed offsets
+(42/43/44/45) so independent subsamples differ across metrics by default.
+
+For intentional cross-metric comparison on the same items, call
+``sample_judge_query_ids`` once and pass the result to all four functions via
+their ``query_ids`` parameter; per-function sampling is then bypassed.
 """
 
 from __future__ import annotations
@@ -152,6 +158,30 @@ def _subsample(items: list, sample_size: int, seed: int = 42) -> list:
     return rng.sample(items, sample_size)
 
 
+def sample_judge_query_ids(
+    query_ids: "list[str]",
+    n: int,
+    seed: int = 42,
+) -> "list[str]":
+    """Sample *n* query IDs for consistent cross-metric LLM judging.
+
+    Call this once before running the four ``llm_judge_*`` functions and pass
+    the returned list to all of them via their ``query_ids`` parameter.  Each
+    function will then filter its predictions to exactly those IDs, ensuring
+    every metric is evaluated on an identical subset and per-query score
+    comparisons are valid.
+
+    Args:
+        query_ids: All available query IDs (e.g. from the predictions list).
+        n:         Maximum number of IDs to sample.
+        seed:      RNG seed for reproducibility (default 42).
+
+    Returns:
+        Deterministic subsample of up to *n* query IDs.
+    """
+    return _subsample(query_ids, n, seed=seed)
+
+
 def save_raw_responses(
     metric_name: str,
     per_sample: list[dict],
@@ -207,6 +237,7 @@ def llm_judge_answer(
     model: str,
     sample_size: int = _DEFAULT_SAMPLE_SIZE,
     results_dir: "str | Path | None" = None,
+    query_ids: "list[str] | None" = None,
 ) -> dict:
     """Judge answer quality.
 
@@ -218,14 +249,21 @@ def llm_judge_answer(
         model:          Ollama model name.
         sample_size:    Maximum number of samples to judge (default from config).
         results_dir:    If provided, raw responses are saved to this directory.
+        query_ids:      When provided, judge only these query IDs (bypasses
+                        per-function sampling).  Use ``sample_judge_query_ids``
+                        to obtain a consistent set shared across all four metrics.
 
     Returns:
         {"score": float|None, "per_sample": [...], "parse_fail_count": int,
          "sample_size": int}
     """
-    # seed=42 for answer quality; distinct seed from coherence to avoid
-    # accidentally identical subsamples across metrics (see module docstring).
-    sample = _subsample(predictions, sample_size, seed=42)
+    if query_ids is not None:
+        qid_set = set(query_ids)
+        sample = [p for p in predictions if p.get("query_id") in qid_set]
+    else:
+        # seed=42 for answer quality; distinct seed avoids accidentally identical
+        # subsamples across metrics (see module docstring).
+        sample = _subsample(predictions, sample_size, seed=42)
     per_sample = []
 
     for item in sample:
@@ -263,6 +301,7 @@ def llm_judge_faithfulness(
     model: str,
     sample_size: int = _DEFAULT_SAMPLE_SIZE,
     results_dir: "str | Path | None" = None,
+    query_ids: "list[str] | None" = None,
 ) -> dict:
     """Judge faithfulness of answer to context.
 
@@ -275,12 +314,18 @@ def llm_judge_faithfulness(
         model:          Ollama model name.
         sample_size:    Maximum number of samples to judge.
         results_dir:    If provided, raw responses are saved to this directory.
+        query_ids:      When provided, judge only these query IDs (bypasses
+                        per-function sampling).
 
     Returns:
         {"score": float|None, "per_sample": [...], "parse_fail_count": int,
          "sample_size": int}
     """
-    sample = _subsample(predictions, sample_size, seed=43)
+    if query_ids is not None:
+        qid_set = set(query_ids)
+        sample = [p for p in predictions if p.get("query_id") in qid_set]
+    else:
+        sample = _subsample(predictions, sample_size, seed=43)
     per_sample = []
 
     for item in sample:
@@ -318,6 +363,7 @@ def llm_judge_relevancy(
     model: str,
     sample_size: int = _DEFAULT_SAMPLE_SIZE,
     results_dir: "str | Path | None" = None,
+    query_ids: "list[str] | None" = None,
 ) -> dict:
     """Judge whether answer is relevant to question.
 
@@ -329,12 +375,18 @@ def llm_judge_relevancy(
         model:          Ollama model name.
         sample_size:    Maximum number of samples to judge.
         results_dir:    If provided, raw responses are saved to this directory.
+        query_ids:      When provided, judge only these query IDs (bypasses
+                        per-function sampling).
 
     Returns:
         {"score": float|None, "per_sample": [...], "parse_fail_count": int,
          "sample_size": int}
     """
-    sample = _subsample(predictions, sample_size, seed=44)
+    if query_ids is not None:
+        qid_set = set(query_ids)
+        sample = [p for p in predictions if p.get("query_id") in qid_set]
+    else:
+        sample = _subsample(predictions, sample_size, seed=44)
     per_sample = []
 
     for item in sample:
@@ -370,6 +422,7 @@ def llm_judge_coherence(
     model: str,
     sample_size: int = _DEFAULT_SAMPLE_SIZE,
     results_dir: "str | Path | None" = None,
+    query_ids: "list[str] | None" = None,
 ) -> dict:
     """Judge linguistic coherence of answer.
 
@@ -381,15 +434,19 @@ def llm_judge_coherence(
         model:          Ollama model name.
         sample_size:    Maximum number of samples to judge.
         results_dir:    If provided, raw responses are saved to this directory.
+        query_ids:      When provided, judge only these query IDs (bypasses
+                        per-function sampling).
 
     Returns:
         {"score": float|None, "per_sample": [...], "parse_fail_count": int,
          "sample_size": int}
     """
-    # seed=45 — distinct from answer (42), faithfulness (43), relevancy (44) so
-    # the four metrics never accidentally sample the same subset from predictions,
-    # which was the root cause of the identical-score issue (judge==coherence==0.2675).
-    sample = _subsample(predictions, sample_size, seed=45)
+    if query_ids is not None:
+        qid_set = set(query_ids)
+        sample = [p for p in predictions if p.get("query_id") in qid_set]
+    else:
+        # seed=45 — distinct from answer (42), faithfulness (43), relevancy (44).
+        sample = _subsample(predictions, sample_size, seed=45)
     per_sample = []
 
     for item in sample:
