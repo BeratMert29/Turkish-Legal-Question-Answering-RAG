@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -19,7 +20,68 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ── Presentation-aligned result data ──────────────────────────────────────────
+# ── Results written by scripts/14_eval_all_stages.py ────────────────────────
+def load_run_summaries() -> dict[str, dict]:
+    """{run directory name: ablation_summary.json} under config.RESULTS_ROOT."""
+    runs = {}
+    for path in sorted(Path(config.RESULTS_ROOT).glob("*/ablation_summary.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and "stages" in data:
+            runs[path.parent.name] = data
+    return runs
+
+
+def run_frame(stages: dict) -> pd.DataFrame:
+    """One row per stage with the headline metrics of the current pipeline."""
+    from pipeline.stages import DEFAULT_STAGE_ORDER
+
+    def ci(r, metric):
+        c = (r.get("confidence_intervals") or {}).get(metric) or {}
+        lo, hi = c.get("ci_low"), c.get("ci_high")
+        return f"[{lo:.3f}, {hi:.3f}]" if lo is not None and hi is not None else None
+
+    rows = []
+    for key in [k for k in DEFAULT_STAGE_ORDER if k in stages]:
+        r = stages[key]
+        qa = r.get("qa_metrics") or {}
+        ret = r.get("retrieval_metrics") or {}
+        art = ret.get("article_level") or {}
+        cite = (qa.get("citation_article_level") or {}).get("native") or {}
+        name = (r.get("hyperparameters") or {}).get("stage_name", key)
+        rows.append({
+            "Stage": name if r.get("status", "ok") == "ok" else f"{name} [FAILED]",
+            "Article Hit@5": art.get("hit_at_5"),
+            "Article MRR": art.get("mrr"),
+            "Chunk R@5": ret.get("recall_at_5"),
+            "F1": qa.get("f1"),
+            "F1 95% CI": ci(r, "f1"),
+            "Token recall": qa.get("token_recall"),
+            "chrF++": qa.get("chrf"),
+            "Faithfulness (NLI)": r.get("faithfulness_rate"),
+            "Gold claim recall": r.get("gold_claim_recall"),
+            "Citation precision": cite.get("precision"),
+            "Citation (random)": cite.get("random_precision"),
+            "LLM-Judge": r.get("llm_judge_score"),
+            "Answer words": qa.get("mean_answer_len_words"),
+            "Truncated": qa.get("truncated_rate"),
+        })
+    return pd.DataFrame(rows)
+
+
+def comparison_frame(comparisons: dict) -> pd.DataFrame:
+    rows = [
+        {"Metric": metric, "Pair": pair, "Δ mean": r["mean_diff"],
+         "CI low": r["ci_low"], "CI high": r["ci_high"], "p (Holm)": r.get("p_holm"),
+         "Significant": bool(r.get("significant_holm")), "n": r["n"]}
+        for metric, pairs in (comparisons or {}).items() for pair, r in pairs.items()
+    ]
+    return pd.DataFrame(rows)
+
+
+# ── Legacy presentation numbers (May 2026 runs; superseded, not comparable) ──
 HMGS_RESULTS = [
     {
         "Pipeline": "Base RAG",
@@ -336,15 +398,39 @@ with tab_ablation:
     hmgs = result_frame(HMGS_RESULTS)
     qa300 = result_frame(QA300_RESULTS)
 
-    st.subheader("Presentation Results")
-    st.caption(
-        "Updated from `CENG493_Presentation.html`: HMGS benchmark, QA-300 ablation, "
-        "and rubric scenario scores."
+    sub_current, sub_hmgs, sub_qa300, sub_scenarios = st.tabs(
+        ["Current run", "Legacy: HMGS 2025 (161)", "Legacy: QA-300", "Legacy: Rubric Scenarios"]
     )
 
-    sub_hmgs, sub_qa300, sub_scenarios = st.tabs(
-        ["HMGS 2025 (161)", "QA-300 Ablation", "Rubric Scenarios"]
-    )
+    with sub_current:
+        runs = load_run_summaries()
+        if not runs:
+            st.info(
+                "No results yet. Run `python scripts/14_eval_all_stages.py` from "
+                f"`CENG493_Project/`; summaries appear under `{config.RESULTS_ROOT}`."
+            )
+        else:
+            run_name = st.selectbox("Run", list(runs), index=0)
+            data = runs[run_name]
+            prov = (data.get("run") or {}).get("provenance") or {}
+            st.caption(
+                f"Eval set `{(data.get('run') or {}).get('eval_set')}` · "
+                f"n={prov.get('eval_n')} · commit `{(prov.get('git') or {}).get('commit', '?')[:10]}` · "
+                f"{prov.get('timestamp_utc', '')}"
+            )
+            st.dataframe(run_frame(data.get("stages") or {}), width="stretch", hide_index=True)
+            comp = comparison_frame(data.get("comparisons"))
+            if not comp.empty:
+                st.subheader("Paired stage comparisons (same queries, Holm-corrected)")
+                st.dataframe(comp, width="stretch", hide_index=True)
+
+    for _legacy_tab in (sub_hmgs, sub_qa300, sub_scenarios):
+        with _legacy_tab:
+            st.warning(
+                "Legacy numbers from the May 2026 presentation: produced by older "
+                "evaluation code, on different query sets and base LLMs per stage. "
+                "They are not comparable with each other or with the current run."
+            )
 
     with sub_hmgs:
         c1, c2, c3, c4 = st.columns(4)
