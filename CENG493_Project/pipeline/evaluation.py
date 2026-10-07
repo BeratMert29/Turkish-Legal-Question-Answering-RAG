@@ -69,9 +69,12 @@ def prepare_metric_input(
     full_retrieved: dict[str, list] = {}
 
     for qa, chunks in zip(qa_examples, retrieved_all):
+        # Retrieval metrics use the pre-expansion ranking: graph neighbours
+        # (flagged ``graph_neighbor``) are spliced in only to feed generation.
+        ranked = [c for c in chunks if not c.get("graph_neighbor")]
         seen: set[str] = set()
         deduped: list[str] = []
-        for c in chunks:
+        for c in ranked:
             if c["chunk_id"] not in seen:
                 seen.add(c["chunk_id"])
                 deduped.append(c["chunk_id"])
@@ -80,7 +83,7 @@ def prepare_metric_input(
             "relevant": relevant_map.get(qa.query_id, []),
             "retrieved": deduped,
             "source_law": qa.source,
-            "retrieved_sources": [c.get("source", "") for c in chunks],
+            "retrieved_sources": [c.get("source", "") for c in ranked],
         })
         full_retrieved[qa.query_id] = chunks
 
@@ -113,13 +116,17 @@ def run_generation_loop(
     ):
         try:
             ctx, ctx_chunks = pipeline.assemble_context(chunks)
-            answer = pipeline.generate(qa.question, ctx)
+            native_answer = pipeline.generate(qa.question, ctx)
+            answer = native_answer
             if inject_citations_fn is not None:
-                answer = inject_citations_fn(answer, ctx_chunks)
+                answer = inject_citations_fn(native_answer, ctx_chunks)
             predictions.append({
                 "query_id": qa.query_id,
                 "question": qa.question,
                 "predicted": answer,
+                # answer exactly as the LLM wrote it (before citation injection)
+                "predicted_native": native_answer,
+                "answer_len_words": len(native_answer.split()),
                 "expected": qa.answer,
                 "retrieved_sources": [c["source"] for c in ctx_chunks],
                 "expected_source": qa.source,
@@ -142,6 +149,10 @@ def run_generation_loop(
     return predictions
 
 
+def _fmt_opt(v) -> str:
+    return f"{v:.4f}" if isinstance(v, (int, float)) else "N/A"
+
+
 def failure_rate_exceeded(failed: int, total: int, max_rate: float) -> bool:
     """True when failed/total is strictly greater than *max_rate*."""
     return total > 0 and (failed / total) > max_rate
@@ -158,6 +169,7 @@ def run_hallucination_eval(
     *,
     nli_model=None,
     llm_model: Optional[str] = None,
+    gold_info: Optional[dict[str, dict]] = None,
 ) -> tuple[dict, float, Any]:
     """Run hallucination analysis.
 
@@ -171,8 +183,8 @@ def run_hallucination_eval(
     """
     import gc
     import torch
-    from sentence_transformers import CrossEncoder
     from evaluation.hallucination import run_hallucination_analysis, stratified_sample
+    from evaluation.nli import load_nli_model
     import config
 
     gc.collect()
@@ -205,23 +217,21 @@ def run_hallucination_eval(
 
     if nli_model is None:
         print("    Loading NLI model …")
-        try:
-            nli_model = CrossEncoder(
-                "cross-encoder/nli-deberta-v3-small", device=_nli_device,
-            )
-        except torch.cuda.OutOfMemoryError:
-            nli_model = CrossEncoder(
-                "cross-encoder/nli-deberta-v3-small", device="cpu",
-            )
+        nli_model = load_nli_model(config.NLI_MODEL, device=_nli_device)
 
-    sample = stratified_sample(predictions, sample_size)
+    # Stratify by whether the gold chunk/law was retrieved (hit@k), using the
+    # pre-expansion ranking; falls back to source-level gold when unlabeled.
+    strat_input = [
+        {**p, **(gold_info or {}).get(str(p.get("query_id")), {})}
+        for p in predictions
+    ]
+    sample = stratified_sample(strat_input, sample_size)
     hall = run_hallucination_analysis(sample, full_retrieved, nli_model)
 
-    afr = hall["summary"].get("answer_faithfulness_rate")
-    faithful_rate = (
-        afr if afr is not None
-        else hall["summary"].get("context_grounding_rate", 0.0)
-    )
+    # Faithfulness headline = NLI of the answer against its RETRIEVED context
+    # (context_grounding_rate); the gold-answer entailment rate is reported
+    # separately in hallucination_summary.
+    faithful_rate = hall["summary"].get("context_grounding_rate", 0.0)
 
     return hall, faithful_rate, nli_model
 
@@ -264,7 +274,7 @@ def run_llm_judge_eval(
     import random as _random_mod
 
     if sample_size is None:
-        sample_size = _config.LLM_JUDGE_SAMPLE_SIZE
+        sample_size = _config.LLM_JUDGE_SAMPLE_SIZE  # None => judge everything
 
     result: dict = {
         "score": None,
@@ -272,6 +282,7 @@ def run_llm_judge_eval(
         "relevancy": None,
         "coherence": None,
         "parse_failures": None,
+        "per_sample": {},
         "failure_count": 0,
         "call_count": 0,
     }
@@ -294,7 +305,10 @@ def run_llm_judge_eval(
         _shared_judge_preds = [p for p in judge_preds if p["query_id"] in _shared_ids]
     else:
         _rng = _random_mod.Random(42)
-        _n = min(sample_size, len(predictions))
+        _n = (
+            len(predictions) if sample_size is None
+            else min(sample_size, len(predictions))
+        )
         if len(predictions) > _n:
             _built_ids: set[str] = set(
                 _rng.sample([p["query_id"] for p in predictions], _n)
@@ -332,6 +346,12 @@ def run_llm_judge_eval(
     result["faithfulness"] = faith_result["score"]
     result["relevancy"] = relev_result["score"]
     result["coherence"] = coher_result["score"]
+    result["per_sample"] = {
+        "answer": judge_result.get("per_sample", []),
+        "faithfulness": faith_result.get("per_sample", []),
+        "relevancy": relev_result.get("per_sample", []),
+        "coherence": coher_result.get("per_sample", []),
+    }
     result["parse_failures"] = {
         "answer": judge_result.get("parse_fail_count", 0),
         "faithfulness": faith_result.get("parse_fail_count", 0),
@@ -364,6 +384,118 @@ def run_llm_judge_eval(
 
 
 # ---------------------------------------------------------------------------
+# Per-query arrays and confidence intervals
+# ---------------------------------------------------------------------------
+
+def _retrieval_per_query(metric_input: list[dict]) -> dict[str, dict]:
+    """Per-query recall@5/10, reciprocal rank (gold-labeled queries only) and
+    source-hit@5 (queries with a known gold law)."""
+    from utils import normalize_turkish
+
+    out: dict[str, dict] = {}
+    for m in metric_input:
+        rel = set(m.get("relevant") or [])
+        ranked = m.get("retrieved", [])
+        rec: dict = {"recall_at_5": None, "recall_at_10": None,
+                     "reciprocal_rank": None, "source_hit_at_5": None}
+        if rel:
+            rec["recall_at_5"] = len(rel & set(ranked[:5])) / len(rel)
+            rec["recall_at_10"] = len(rel & set(ranked[:10])) / len(rel)
+            first = next((i for i, c in enumerate(ranked, 1) if c in rel), None)
+            rec["reciprocal_rank"] = 1.0 / first if first else 0.0
+        gold = normalize_turkish(str(m.get("source_law") or "").strip())
+        if gold:
+            srcs = [normalize_turkish(str(x).strip())
+                    for x in m.get("retrieved_sources", [])[:5]]
+            rec["source_hit_at_5"] = float(gold in srcs)
+        out[str(m["query_id"])] = rec
+    return out
+
+
+def build_per_query(
+    all_predictions: list[dict],
+    metric_input: list[dict],
+    hall: dict,
+    sem_per_sample: list[dict],
+    judge: dict,
+) -> list[dict]:
+    """One record per query merging retrieval, QA, similarity, NLI and judge
+    scores (None where a metric was not computed for that query)."""
+    from evaluation.qa_metrics import compute_per_query_qa_metrics
+
+    qa_rows = {r["query_id"]: r for r in compute_per_query_qa_metrics(all_predictions)}
+    ret_rows = _retrieval_per_query(metric_input)
+    sem = {str(r.get("query_id")): r.get("similarity") for r in sem_per_sample}
+    nli = {str(r.get("query_id")): r for r in hall.get("per_sample", [])}
+    judge_ps = judge.get("per_sample") or {}
+    judge_by = {
+        name: {str(r.get("query_id")): r.get("score") for r in rows}
+        for name, rows in judge_ps.items()
+    }
+
+    records = []
+    for p in all_predictions:
+        qid = str(p["query_id"])
+        q = qa_rows.get(p["query_id"], {})
+        n = nli.get(qid, {})
+        rec = {
+            "query_id": qid,
+            "generation_failed": not p.get("predicted"),
+            **ret_rows.get(qid, {}),
+            **{k: q.get(k) for k in ("em", "f1", "rouge_l", "bleu",
+                                      "answer_containment", "answer_len_words")},
+            "semantic_similarity": sem.get(qid),
+            "nli_context_grounding": n.get("context_grounding_score"),
+            "nli_gold_entailment": n.get("answer_faithfulness_score"),
+            "hallucination_category": n.get("category"),
+        }
+        for name, by in judge_by.items():
+            rec[f"judge_{name}"] = by.get(qid)
+        records.append(rec)
+    return records
+
+
+_CI_METRICS = (
+    "recall_at_5", "recall_at_10", "reciprocal_rank", "source_hit_at_5",
+    "f1", "rouge_l", "answer_containment", "em", "semantic_similarity",
+    "nli_context_grounding", "judge_answer", "judge_faithfulness",
+    "judge_relevancy", "judge_coherence",
+)
+
+
+def compute_confidence_intervals(per_query: list[dict]) -> dict[str, dict]:
+    """95% bootstrap CI of the mean for each per-query metric."""
+    from evaluation.stats import bootstrap_ci
+
+    return {
+        m: bootstrap_ci([r.get(m) for r in per_query])
+        for m in _CI_METRICS
+        if any(r.get(m) is not None for r in per_query)
+    }
+
+
+def _gold_info(qa_examples, retrieved_all, relevant_map):
+    """``(metric_input, gold_info)``; gold_info maps str(query_id) to the
+    relevant/retrieved ids used to stratify hallucination by hit@k."""
+    metric_input, _ = prepare_metric_input(qa_examples, retrieved_all, relevant_map)
+    gold_info = {
+        str(m["query_id"]): {"relevant": m["relevant"], "retrieved": m["retrieved"]}
+        for m in metric_input
+    }
+    return metric_input, gold_info
+
+
+def _persist_stage(final, all_predictions, metric_input, hall, sem_per_sample,
+                   judge, results_dir) -> Path:
+    """Attach bootstrap CIs, then write metrics, predictions and per-query arrays."""
+    per_query = build_per_query(
+        all_predictions, metric_input, hall, sem_per_sample, judge,
+    )
+    final["confidence_intervals"] = compute_confidence_intervals(per_query)
+    return save_stage_results(final, all_predictions, results_dir, per_query=per_query)
+
+
+# ---------------------------------------------------------------------------
 # Saving helpers
 # ---------------------------------------------------------------------------
 
@@ -371,8 +503,10 @@ def save_stage_results(
     final: dict,
     predictions: list[dict],
     results_dir: Path,
+    per_query: Optional[list[dict]] = None,
 ) -> Path:
-    """Write baseline_metrics.json and predictions.jsonl to *results_dir*.
+    """Write baseline_metrics.json, predictions.jsonl and (optionally)
+    per_query.jsonl to *results_dir*.
 
     Returns the path to baseline_metrics.json.
     """
@@ -390,6 +524,14 @@ def save_stage_results(
         for p in predictions:
             f.write(json.dumps(p, ensure_ascii=False) + "\n")
     os.replace(_tmp_pred, pred_path)
+
+    if per_query is not None:
+        pq_path = results_dir / "per_query.jsonl"
+        _tmp_pq = pq_path.with_suffix(".tmp")
+        with open(_tmp_pq, "w", encoding="utf-8") as f:
+            for r in per_query:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(_tmp_pq, pq_path)
 
     return out_path
 
@@ -526,28 +668,30 @@ def _run_generation_and_qa(
     short_answer_mode: bool,
     inject_citations_fn,
     max_failure_rate: float,
-) -> tuple[list[dict], int, int, int, bool, dict]:
+) -> tuple[list[dict], int, int, int, bool, dict, list[dict]]:
     """Run generation loop, failure filtering, and QA metrics.
 
     Returns
     -------
     tuple
-        ``(predictions, n_total, n_failed, n_errors, generation_failed, qa_metrics)``
+        ``(predictions, n_total, n_failed, n_errors, generation_failed,
+        qa_metrics, all_predictions)``; *predictions* holds successful
+        generations only, *all_predictions* includes failures (saved to disk).
     """
     import config
     from generation.rag_pipeline import RAGPipeline
     from evaluation.qa_metrics import compute_all_qa_metrics_with_citation
 
-    max_tokens = (
-        config.LLM_FINETUNED_MAX_TOKENS
-        if stage.llm == "finetuned"
-        else config.LLM_MAX_TOKENS
-    )
+    # One-factor rule: both LLMs share max_tokens (and num_ctx, see config).
     pipeline = RAGPipeline(
         retriever,
         model=llm_model,
-        max_tokens=max_tokens,
+        max_tokens=config.LLM_MAX_TOKENS,
         short_answer_mode=short_answer_mode,
+        graph_neighbor_budget=(
+            config.GRAPH_NEIGHBOR_BUDGET
+            if stage.use_graph and config.GRAPH_CONTEXT_RESERVE else 0
+        ),
     )
     predictions = run_generation_loop(
         pipeline, qa_examples, retrieved_all,
@@ -557,9 +701,16 @@ def _run_generation_and_qa(
     n_total = len(predictions)
     failed = [p for p in predictions if not p.get("predicted")]
     n_errors = sum(1 for p in predictions if p.get("generation_error"))
-    predictions = [p for p in predictions if p.get("predicted")]
+    # Failed generations stay in the denominator and score 0 on every QA
+    # metric (empty prediction); dropping them would inflate the means.  Only
+    # successful predictions go on to the LLM-based metrics.
+    all_predictions = predictions
+    predictions = [p for p in all_predictions if p.get("predicted")]
     if failed:
-        print(f"    Filtered {len(failed)} failed generation(s) from QA metrics.")
+        print(
+            f"    {len(failed)}/{n_total} failed generation(s) scored 0 on "
+            f"QA metrics (kept in the denominator)."
+        )
 
     gen_failed = failure_rate_exceeded(len(failed), n_total, max_failure_rate)
     if gen_failed:
@@ -568,13 +719,19 @@ def _run_generation_and_qa(
             f"(> {max_failure_rate:.0%}); stage {stage_key} marked FAILED !!!"
         )
 
-    qa_metrics = compute_all_qa_metrics_with_citation(predictions)
+    qa_metrics = compute_all_qa_metrics_with_citation(all_predictions)
+    qa_metrics["n_generation_failed_scored_zero"] = len(failed)
     print(
         f"    F1={qa_metrics.get('f1', 0):.4f}  "
         f"ROUGE-L={qa_metrics.get('rouge_l', 0):.4f}  "
-        f"Citation={qa_metrics.get('citation_accuracy', 0):.4f}"
+        f"Cite(native)={_fmt_opt(qa_metrics.get('citation_accuracy_native'))}  "
+        f"Cite(injected)={_fmt_opt(qa_metrics.get('citation_accuracy_injected'))}  "
+        f"AnsLen={qa_metrics.get('mean_answer_len_words', 0):.1f}w"
     )
-    return predictions, n_total, len(failed), n_errors, gen_failed, qa_metrics
+    return (
+        predictions, n_total, len(failed), n_errors, gen_failed, qa_metrics,
+        all_predictions,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +845,7 @@ def _run_hallucination_phase(
     predictions: list[dict],
     full_retrieved: dict[str, list],
     llm_model: str,
+    gold_info: Optional[dict[str, dict]] = None,
 ) -> tuple[dict, float]:
     """Evict perplexity/RAGAS models, run hallucination analysis, update NLI cache.
 
@@ -710,6 +868,7 @@ def _run_hallucination_phase(
         _config.HALLUCINATION_SAMPLE_SIZE,
         nli_model=_model_cache.get("nli"),
         llm_model=llm_model,
+        gold_info=gold_info,
     )
     _model_cache["nli"] = nli_model  # reuse across stages
     print(f"    Faithfulness={faithful_rate:.4f}")
@@ -746,6 +905,7 @@ def _run_judge_phase(
 
     score = faithfulness = relevancy = coherence = None
     parse_failures: Optional[dict] = None
+    per_sample: dict = {}
     failure_count = 0
     call_count = 0
     crashed = False
@@ -764,6 +924,7 @@ def _run_judge_phase(
         relevancy = j["relevancy"]
         coherence = j["coherence"]
         parse_failures = j["parse_failures"]
+        per_sample = j.get("per_sample", {})
         failure_count = j["failure_count"]
         call_count = j["call_count"]
     except Exception as exc:
@@ -784,6 +945,7 @@ def _run_judge_phase(
         "relevancy": relevancy,
         "coherence": coherence,
         "parse_failures": parse_failures,
+        "per_sample": per_sample,
         "failure_count": failure_count,
         "call_count": call_count,
         "crashed": crashed,
@@ -791,10 +953,13 @@ def _run_judge_phase(
     }
 
 
-def _run_semantic_sim_phase(predictions: list[dict]) -> Optional[float]:
-    """Compute mean semantic similarity between predicted and expected answers.
+def _run_semantic_sim_phase(
+    predictions: list[dict],
+) -> tuple[Optional[float], list[dict]]:
+    """Mean semantic similarity between predicted and expected answers.
 
-    Returns ``None`` on failure (non-fatal; recorded as null in results).
+    Returns ``(mean, per_sample)``; ``(None, [])`` on failure (non-fatal;
+    recorded as null in results).
     """
     print("  Semantic similarity …")
     try:
@@ -803,10 +968,10 @@ def _run_semantic_sim_phase(predictions: list[dict]) -> Optional[float]:
         sem_result = compute_semantic_similarity(predictions)
         sem_sim = sem_result["mean_similarity"]
         print(f"    SemanticSim={sem_sim:.4f}")
-        return sem_sim
+        return sem_sim, sem_result.get("per_sample", [])
     except Exception as exc:
         print(f"    WARNING: Semantic similarity failed (recorded as null): {exc}")
-        return None
+        return None, []
 
 
 def _assemble_final_result(
@@ -888,6 +1053,13 @@ def _assemble_final_result(
                 stage.retrieval + ("_rerank" if stage.use_rerank else "")
             ),
             "llm_model": llm_model,
+            "llm_max_tokens": _config.LLM_MAX_TOKENS,
+            "llm_num_ctx": _config.LLM_NUM_CTX,
+            "llm_base_for_ablation": _config.LLM_BASE_FOR_ABLATION,
+            "graph_context_reserve": (
+                _config.GRAPH_NEIGHBOR_BUDGET
+                if stage.use_graph and _config.GRAPH_CONTEXT_RESERVE else 0
+            ),
             "inject_citations": stage.inject_citations,
             "chunk_size": _config.CHUNK_SIZE,
             "chunk_overlap": _config.CHUNK_OVERLAP,
@@ -986,6 +1158,7 @@ def run_stage(
         n_generation_errors,
         generation_failed,
         qa_metrics,
+        all_predictions,
     ) = _run_generation_and_qa(
         stage_key, stage, qa_examples, retrieved_all,
         retriever, llm_model, short_answer_mode,
@@ -998,8 +1171,9 @@ def run_stage(
     )
 
     # -- Hallucination -----------------------------------------------------
+    metric_input, gold_info = _gold_info(qa_examples, retrieved_all, relevant_map)
     hall, faithful_rate = _run_hallucination_phase(
-        predictions, full_retrieved, llm_model,
+        predictions, full_retrieved, llm_model, gold_info=gold_info,
     )
 
     # -- LLM Judge ---------------------------------------------------------
@@ -1008,7 +1182,7 @@ def run_stage(
     )
 
     # -- Semantic Similarity -----------------------------------------------
-    sem_sim = _run_semantic_sim_phase(predictions)
+    sem_sim, sem_per_sample = _run_semantic_sim_phase(predictions)
 
     # -- Assemble, score & save --------------------------------------------
     final = _assemble_final_result(
@@ -1020,7 +1194,10 @@ def run_stage(
         generation_failed, _max_rate,
     )
 
-    out_path = save_stage_results(final, predictions, stage.results_dir)
+    out_path = _persist_stage(
+        final, all_predictions, metric_input, hall, sem_per_sample, judge,
+        stage.results_dir,
+    )
     print(f"  ✓ Results → {out_path}")
     return final
 
@@ -1085,6 +1262,16 @@ def print_ablation_table(
             str(ret.get("num_queries", "?")),
         ]
 
+    def _ci(r, metric) -> str:
+        ci = (r.get("confidence_intervals") or {}).get(metric) or {}
+        lo, hi = ci.get("ci_low"), ci.get("ci_high")
+        if lo is None or hi is None:
+            return "N/A"
+        return f"[{lo * 100:.1f},{hi * 100:.1f}]"
+
+    def _len(v) -> str:
+        return f"{v:.1f}" if isinstance(v, (int, float)) else "N/A"
+
     src_hdr = ["SrcHit@5", "SrcHit@10", "SrcMRR", "SrcPrec@5", "n_src"]
     chunk_hdr = ["R@5", "R@10", "MRR", "nDCG@10", "n_gold"]
 
@@ -1110,16 +1297,17 @@ def print_ablation_table(
     h1 = (
         f"| {'Stage':<26} | "
         + " | ".join(f"{h:>{w}}" for h, w in zip(head_hdr, [8, 9, 7, 9, 6]))
-        + f" | {'F1':>6} | {'Contain':>7} | {'ROUGE-L':>7} | {'Citation':>8} | "
-        f"{'Faith.':>7} | {'LLM-J':>6} | {'SemSim':>7} |"
+        + f" | {'F1':>6} | {'F1 95% CI':>13} | {'Contain':>7} | {'ROUGE-L':>7} | "
+        f"{'Cite-nat':>8} | {'Cite-inj':>8} | {'Ctx-NLI':>7} | {'LLM-J':>6} | "
+        f"{'SemSim':>7} | {'AnsLen':>6} |"
     )
     sep1 = "|" + "|".join(
-        ["-" * w for w in [28, 10, 11, 9, 11, 8, 8, 9, 9, 10, 9, 8, 9]]
+        ["-" * w for w in [28, 10, 11, 9, 11, 8, 15, 9, 9, 10, 10, 9, 8, 9, 8]]
     ) + "|"
 
-    print("\n\n" + "=" * 140)
+    print("\n\n" + "=" * 180)
     print(f"  PRIMARY ABLATION TABLE  ({head_title})")
-    print("=" * 140)
+    print("=" * 180)
     print(h1)
     print(sep1)
 
@@ -1135,14 +1323,17 @@ def print_ablation_table(
         print(
             f"| {stage_name:<26} | {cells} | "
             f"{_pct(qa.get('f1')):>6} | "
+            f"{_ci(r, 'f1'):>13} | "
             f"{_pct(qa.get('answer_containment')):>7} | "
             f"{_pct(qa.get('rouge_l')):>7} | "
-            f"{_pct(qa.get('citation_accuracy')):>8} | "
+            f"{_pct(qa.get('citation_accuracy_native')):>8} | "
+            f"{_pct(qa.get('citation_accuracy_injected', qa.get('citation_accuracy'))):>8} | "
             f"{_pct(r.get('faithfulness_rate')):>7} | "
             f"{_f4(r.get('llm_judge_score')):>6} | "
-            f"{_f4(r.get('semantic_similarity')):>7} |"
+            f"{_f4(r.get('semantic_similarity')):>7} | "
+            f"{_len(qa.get('mean_answer_len_words')):>6} |"
         )
-    print("=" * 140 + "\n")
+    print("=" * 180 + "\n")
 
     # -- Table 2: SECONDARY ------------------------------------------------
     h2 = (

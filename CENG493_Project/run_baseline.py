@@ -100,12 +100,12 @@ def _parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def build_index(processor, embedder, chunks=None):
+def build_index(processor, embedder, chunks=None, holdout=False):
     from retrieval.retriever import Retriever
 
     if chunks is None:
         log.info("Building corpus chunks …")
-        chunks = list(processor.build_corpus_chunks())
+        chunks = list(processor.build_corpus_chunks(holdout=holdout))
     log.info("  %d chunks total", len(chunks))
 
     texts = [c.text for c in chunks]
@@ -193,7 +193,10 @@ def main() -> None:
         summary = processor.load_and_validate()
         log.info("Dataset summary: %s", summary)
         log.info("Building corpus chunks for reuse …")
-        corpus_chunks = list(processor.build_corpus_chunks())
+        # Eval rows are held out of the index only for the Kaggle-split eval set.
+        corpus_chunks = list(processor.build_corpus_chunks(
+            holdout=(args.eval_set == "kaggle" and not args.hmgs)
+        ))
 
     from retrieval.embedder import Embedder
 

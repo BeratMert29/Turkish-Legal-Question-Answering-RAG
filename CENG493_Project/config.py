@@ -9,7 +9,6 @@ CORPUS_DOC_MIN_CHARS = 180
 # Minimum chunk character length; shared by _char_chunk and _article_chunk
 MIN_CHUNK_CHARS = 180
 ARTICLE_CHUNKING_ENABLED = True  # True → split at MADDE boundaries first
-ARTICLE_REGEX = r'(?=(?:MADDE|Madde)\s+\d+)'
 
 # Data
 QA_EVAL_EXPECTED = 300
@@ -85,11 +84,13 @@ RERANKER_CANDIDATES = 50   # fetch more candidates than TOP_K so reranker has a 
 RRF_K = 60                 # RRF smoothing constant
 
 GRAPH_FILE = "graph.json"
-GRAPH_EXPANSION_ENABLED = False
 GRAPH_HOPS = 1
 GRAPH_NEIGHBOR_BUDGET = 3
-GRAPH_EDGE_KINDS = ("adj", "intra", "cross")
-GRAPH_DECAY = {"adj": 0.85, "intra": 0.70, "cross": 0.60}
+# When True, up to GRAPH_NEIGHBOR_BUDGET of the TOP_K_FOR_GENERATION context
+# slots are reserved for graph neighbours of the top-ranked chunks, so graph
+# expansion can change generation.  Retrieval metrics (recall/MRR/nDCG/source
+# hit) always use the pre-expansion ranking.
+GRAPH_CONTEXT_RESERVE = True
 
 # Direct madde lookup: when True, queries that explicitly reference a law article
 # (e.g. "TCK 86. madde") inject that article's chunks via _source_madde_lookup.
@@ -97,24 +98,43 @@ GRAPH_DECAY = {"adj": 0.85, "intra": 0.70, "cross": 0.60}
 DIRECT_MADDE_LOOKUP_ENABLED = False
 
 # LLM (Ollama — free, no API key)
-LLM_MODEL = "qwen2.5:14b"
+# Ablation one-factor rule: the base-LLM stages and the fine-tuned-LLM stages
+# must differ ONLY in the LoRA weights.  LLM_BASE_FOR_ABLATION is therefore the
+# Ollama tag of the exact base that the LoRA adapter is trained on
+# (LORA_BASE_HF_MODEL); both use LLM_MAX_TOKENS and LLM_NUM_CTX.  Train the
+# adapter with `scripts/08_finetune_llm.py --backend qlora` (14B) so the
+# sizes match.
+LLM_BASE_FOR_ABLATION = "qwen2.5:14b"
+LORA_BASE_HF_MODEL = "Qwen/Qwen2.5-14B-Instruct"
+LLM_MODEL = LLM_BASE_FOR_ABLATION
 LLM_FINETUNED_MODEL = "qwen25-legal-ft"   # created by scripts/13_export_lora_to_ollama.py
 LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_API_KEY = "ollama"
 LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 512
+# Context window for BOTH LLMs.  Baked into the fine-tuned Modelfile; for the
+# base model start Ollama with OLLAMA_CONTEXT_LENGTH=8192 (the OpenAI-compatible
+# endpoint cannot set num_ctx per request).
+LLM_NUM_CTX = 8192
 # Stage is marked failed when more than this fraction of generations / judge calls fail
 MAX_FAILURE_RATE = 0.2
-LLM_FINETUNED_MAX_TOKENS = 256  # shorter cap for fine-tuned model to reduce runaway generation
+# trust_remote_code executes code shipped with a model repo.  Qwen2.5 and
+# BGE-M3 are natively supported by transformers, so keep False.  Set True only
+# for a model that really needs custom modelling code.
+TRUST_REMOTE_CODE = False
 LLM_JUDGE_MODEL = "llama3.3:70b"   # separate judge model to avoid self-evaluation bias
-
-KAGGLE_MIN_SCORE = 6
 
 # Evaluation
 HALLUCINATION_SAMPLE_SIZE = 150
-# Number of predictions sampled for each LLM-judge metric call.
-# Increase for higher-fidelity estimates (at the cost of more Ollama calls).
-LLM_JUDGE_SAMPLE_SIZE = 20
+
+# NLI model for hallucination analysis (multilingual, covers Turkish).
+NLI_MODEL = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+# Multilingual sentence-embedding model for answer semantic similarity.
+SEMANTIC_SIM_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+SEMANTIC_SIM_MAX_SEQ_LEN = 512  # encoder window; longer answers are chunked
+# Number of predictions sampled for each LLM-judge metric call.  None = judge
+# every prediction (needed for tight CIs); an int caps cost (Ollama calls).
+LLM_JUDGE_SAMPLE_SIZE = None
 
 # Hallucination stratification thresholds (applied to top-1 retrieval score)
 HALLUCINATION_HIT_THRESHOLD = 0.7
@@ -122,13 +142,6 @@ HALLUCINATION_PARTIAL_THRESHOLD = 0.4
 
 # BM25 tokenization
 BM25_MIN_TOKEN_LENGTH = 2
-
-# Oracle relevance (scripts/03_evaluate_retrieval.py)
-TOP_K_ORACLE = 5
-
-# Maximum number of chunks assigned as relevant by strategy-3 (source-level fallback).
-# Caps the per-query relevant set so MRR/Recall/NDCG remain meaningful for HMGS queries.
-MAX_STRATEGY3_RELEVANT = 20
 
 # Custom corpus / benchmark support
 CUSTOM_CORPUS_FILE = "corpus_chunks_custom.jsonl"

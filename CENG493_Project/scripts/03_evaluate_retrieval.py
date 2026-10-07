@@ -139,7 +139,7 @@ def main():
         print(f"\nLoading data from {config.RAW_DATA_PATH}")
         processor = DataProcessor(config.RAW_DATA_PATH)
         processor.load_and_validate()
-        corpus_chunks = list(processor.build_corpus_chunks())
+        corpus_chunks = list(processor.build_corpus_chunks(holdout=True)  # matches scripts/01 (Kaggle eval rows held out))
 
     # ── Load QA examples ───────────────────────────────────────────────────
     if args.eval_data:
