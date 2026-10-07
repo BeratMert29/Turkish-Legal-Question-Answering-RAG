@@ -266,7 +266,7 @@ def main() -> None:
     print("\n✅  Export complete!")
     print(f"   Model      : {OLLAMA_NAME}")
     print(f"   Config key : LLM_FINETUNED_MODEL = \"{OLLAMA_NAME}\"")
-    print(f"   Next step  : python scripts/14_eval_all_stages.py --stages llm_ft")
+    print("   Next step  : python scripts/14_eval_all_stages.py --stages llm_ft")
 
 
 if __name__ == "__main__":

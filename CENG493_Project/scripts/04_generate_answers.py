@@ -11,7 +11,6 @@ _project_root = str(Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.append(_project_root)
 import config
-from data.data_processor import DataProcessor
 from data.qa_loader import resolve_qa_set
 from data.corpus_loader import resolve_corpus, load_corpus_jsonl
 from retrieval.embedder import Embedder
@@ -26,7 +25,7 @@ def check_ollama():
         r.raise_for_status()
     except Exception as e:
         print("ERROR: Ollama is not running.")
-        print(f"  Start it with: ollama serve")
+        print("  Start it with: ollama serve")
         print(f"  Then pull the model: ollama pull {config.LLM_MODEL}")
         print(f"  Details: {e}")
         sys.exit(1)

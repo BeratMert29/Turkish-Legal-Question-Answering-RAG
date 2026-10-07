@@ -14,7 +14,6 @@ Output:
 """
 
 import argparse
-import json
 import logging
 import sys
 import time
@@ -100,10 +99,10 @@ def main() -> None:
 
     # Stats
     stats = graph_stats(graph)
-    print(f"\nGraph statistics:")
+    print("\nGraph statistics:")
     print(f"  Nodes with edges : {stats['total_nodes']:,}")
     print(f"  Total edges      : {stats['total_edges']:,}")
-    print(f"  Edges by type:")
+    print("  Edges by type:")
     for kind, count in sorted(stats["by_kind"].items()):
         print(f"    {kind:<8}: {count:,}")
 

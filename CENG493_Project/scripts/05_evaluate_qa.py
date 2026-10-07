@@ -67,7 +67,7 @@ def main():
     qa_metrics = compute_all_qa_metrics_with_citation(qa_input)
     qa_metrics["error_count"] = len(errors)
 
-    print(f"\n=== QA Metrics ===")
+    print("\n=== QA Metrics ===")
     for k, v in qa_metrics.items():
         print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 

@@ -212,7 +212,7 @@ def main() -> None:
         for t in triplets:
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
 
-    print(f"\nDone.")
+    print("\nDone.")
     print(f"  Triplets saved : {len(triplets):,}  ->  {OUTPUT_PATH}")
     print(f"  Skipped        : {skipped_low_score:,}  (positive score < {MIN_POSITIVE_SCORE})")
     print(f"  Positives by   : {strategy_counts}")

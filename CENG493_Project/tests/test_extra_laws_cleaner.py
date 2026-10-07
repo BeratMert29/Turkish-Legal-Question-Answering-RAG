@@ -1,5 +1,4 @@
 """Tests for data.extra_laws_cleaner and unique chunk_ids in build_corpus_chunks."""
-import collections
 import json
 
 import pandas as pd

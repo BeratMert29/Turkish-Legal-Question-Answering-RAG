@@ -123,7 +123,7 @@ def main() -> None:
 
     n = len(records)
     avg_ctx = total_ctx_len / n if n else 0
-    print(f"\nDone.")
+    print("\nDone.")
     print(f"  Output       : {out_path}")
     print(f"  Examples     : {n}")
     print(f"  Avg ctx len  : {avg_ctx:.0f} chars")

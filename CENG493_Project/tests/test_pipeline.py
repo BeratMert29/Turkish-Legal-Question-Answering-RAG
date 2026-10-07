@@ -10,14 +10,11 @@ Covers:
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 
 _PROJECT = Path(__file__).resolve().parent.parent
 
@@ -36,7 +33,7 @@ class TestPipelineImports:
         assert hasattr(pipeline, "DEFAULT_STAGE_ORDER")
 
     def test_import_stages(self):
-        from pipeline.stages import StageConfig, STAGE_REGISTRY, DEFAULT_STAGE_ORDER
+        from pipeline.stages import STAGE_REGISTRY, DEFAULT_STAGE_ORDER
         assert isinstance(STAGE_REGISTRY, dict)
         assert isinstance(DEFAULT_STAGE_ORDER, list)
         assert len(STAGE_REGISTRY) > 0
@@ -463,7 +460,7 @@ class TestEvalHelpers:
 
         with patch.object(_eval, "evict_model_cache") as mock_evict, \
              patch.object(_eval, "run_hallucination_eval",
-                          return_value=(fake_hall, 0.9, fake_nli)) as mock_rhe:
+                          return_value=(fake_hall, 0.9, fake_nli)):
             _eval._model_cache.clear()
             hall, rate = _eval._run_hallucination_phase([], "mock-model")
 
@@ -553,8 +550,7 @@ class TestEvalHelpers:
         """_run_judge_phase must call sample_judge_query_ids once and pass
         the returned IDs as query_ids= to run_llm_judge_eval."""
         from pipeline import evaluation as _eval
-        from unittest.mock import patch, MagicMock, call
-        import config
+        from unittest.mock import patch, MagicMock
 
         sampled = [f"q{i}" for i in range(20)]
         fake_stage = MagicMock()

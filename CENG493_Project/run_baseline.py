@@ -166,7 +166,7 @@ def main() -> None:
     if args.corpus and args.docs_path:
         sys.exit("ERROR: --corpus and --docs-path are mutually exclusive")
 
-    from data.data_processor import DataProcessor, CorpusChunk
+    from data.data_processor import DataProcessor
     from pipeline.data_loading import load_external_corpus, load_external_qa
     from pipeline.retrieval import retrieve
     from utils import set_seeds, check_ollama

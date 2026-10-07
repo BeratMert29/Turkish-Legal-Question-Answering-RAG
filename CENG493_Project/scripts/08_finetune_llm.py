@@ -338,7 +338,7 @@ def main() -> None:
     with open(config_out_path, "w", encoding="utf-8") as f:
         json.dump(TRAINING_CONFIG, f, ensure_ascii=False, indent=2)
 
-    print(f"\nTraining complete.")
+    print("\nTraining complete.")
     print(f"  Adapter saved to       : {ADAPTER_DIR}")
     print(f"  Training config saved  : {config_out_path}")
     print("\nFinal GPU memory:")

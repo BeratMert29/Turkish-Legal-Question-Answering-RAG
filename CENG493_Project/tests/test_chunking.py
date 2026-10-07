@@ -161,7 +161,6 @@ class TestArticleChunk:
 
     def test_oversized_article_sub_chunks_share_madde_no(self):
         """When an article exceeds CHUNK_SIZE, all its sub-chunks share madde_no."""
-        import config
         long_article = "MADDE 99- " + ("uzun metin içeriği. " * 500)
         chunks = DataProcessor._article_chunk(long_article, "kaggle_x", "BigSource")
         # All sub-chunks should have the same madde_no

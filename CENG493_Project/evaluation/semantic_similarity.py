@@ -22,14 +22,6 @@ else:
     _DEVICE = "cpu"
 
 
-def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two 1-D vectors."""
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0.0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
-
-
 _DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 _DEFAULT_MAX_SEQ = 512
 

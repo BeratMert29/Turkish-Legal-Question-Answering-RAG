@@ -59,8 +59,8 @@ def load_txt_text(path: pathlib.Path) -> str:
 def load_pdf_text(path: pathlib.Path) -> str:
     try:
         from pypdf import PdfReader  # type: ignore[import-untyped]
-    except ImportError:
-        raise ImportError("pypdf required for PDF support: pip install pypdf")
+    except ImportError as exc:
+        raise ImportError("pypdf required for PDF support: pip install pypdf") from exc
     reader = PdfReader(str(path))
     pages = []
     for page in reader.pages:

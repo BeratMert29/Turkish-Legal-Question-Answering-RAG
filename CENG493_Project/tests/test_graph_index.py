@@ -14,7 +14,6 @@ from retrieval.graph_builder import (
     graph_stats,
     lookup_by_source_madde,
     _extract_madde_no,
-    _parse_chunk_suffix,
 )
 from retrieval.graph_index import GraphIndex
 

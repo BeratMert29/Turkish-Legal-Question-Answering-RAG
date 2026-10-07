@@ -16,11 +16,6 @@ from typing import Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     from pipeline.stages import StageConfig
-    from retrieval.bm25_retriever import BM25Index
-    from retrieval.embedder import Embedder
-    from retrieval.reranker import Reranker
-    from retrieval.retriever import Retriever
-    from retrieval.graph_index import GraphIndex
 
 
 # ---------------------------------------------------------------------------

@@ -132,7 +132,7 @@ def main() -> None:
 
     index_path = config.INDEX_DIR / config.INDEX_FILE
     metadata_path = config.INDEX_DIR / config.METADATA_FILE
-    print(f"\nLoading FAISS index ...")
+    print("\nLoading FAISS index ...")
     embedder = Embedder()
     embedder.load_model()
     retriever = Retriever(embedder)

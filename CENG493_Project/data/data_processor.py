@@ -6,7 +6,6 @@ import json
 import pathlib
 import re
 
-import numpy as np
 import pandas as pd
 import config
 from utils import read_jsonl as _read_jsonl
