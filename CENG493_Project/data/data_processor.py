@@ -193,7 +193,7 @@ def _title_start(text: str, line_start: int, floor: int = 0) -> int:
     "İKİNCİ BÖLÜM") on the lines just above "Madde N –".  Up to
     _TITLE_MAX_LINES short lines without sentence-final punctuation are
     taken, blank lines skipped; another heading or a sentence stops the walk.
-    Never goes below *floor* (the previous heading line).
+    Never goes below *floor* (the line after the previous heading line).
     """
     start = i = line_start
     taken = 0
@@ -224,7 +224,9 @@ def _article_parts(text: str) -> "list[str]":
         if cuts and cut <= cuts[-1]:
             continue
         cuts.append(cut)
-        floor = line_start + 1
+        # Title lines of the next article must come after this heading line.
+        line_end = text.find("\n", m.end())
+        floor = len(text) if line_end == -1 else line_end + 1
     bounds = [0, *cuts, len(text)]
     return [text[a:b] for a, b in zip(bounds, bounds[1:])]
 

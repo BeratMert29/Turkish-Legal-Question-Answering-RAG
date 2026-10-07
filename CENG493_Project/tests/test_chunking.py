@@ -303,3 +303,14 @@ class TestArticleBoundaries:
         assert all(c.madde_no == "9" for c in chunks)
         assert all(len(c.text) >= 180 for c in chunks)
         assert chunks[-1].text.rstrip().endswith("Son.")
+
+
+def test_consecutive_repealed_articles_are_not_cut_inside_a_heading():
+    text = ("A. Kuruluş\n\nMadde 109 – (Mülga: 21/1/2017-6771/16 md.)\n\n \n\n"
+            "B. Göreve başlama\n\nMadde 110 – (Mülga: 21/1/2017-6771/16 md.)\n\n"
+            "C. Görev\n\nMadde 111 – Hüküm metni burada yer alır.")
+    by = {c.madde_no: c.text for c in DataProcessor._article_chunk(text, "d", "A")}
+    assert by["109"].startswith("A. Kuruluş\n\nMadde 109")
+    assert by["110"].startswith("B. Göreve başlama\n\nMadde 110")
+    assert by["111"].startswith("C. Görev\n\nMadde 111")
+    assert all("\nadde" not in t and not t.startswith("adde") for t in by.values())
