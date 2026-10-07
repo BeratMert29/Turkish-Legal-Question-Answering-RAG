@@ -642,9 +642,8 @@ class DataProcessor:
             _re.IGNORECASE,
         )
 
-        # VUK rows are misattributed (3/5 questions are actually about HMK /
-        # Avukatlık Kanunu) — drop the entire source to avoid noise.
-        _DROPPED_SOURCES = {"213 sayılı Vergi Usul Kanunu"}
+        # Sources excluded despite corpus coverage (see config.HMGS_DROPPED_SOURCES).
+        _DROPPED_SOURCES = config.HMGS_DROPPED_SOURCES
 
         source_map = config.HMGS_SOURCE_MAP
         examples: list[QAExample] = []

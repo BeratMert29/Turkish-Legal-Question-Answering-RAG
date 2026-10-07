@@ -7,7 +7,7 @@ and prints a comparative ablation table at the end.
 
 Prerequisites:
   - Ollama running: ollama serve
-  - Base model pulled: ollama pull qwen2.5:14b
+  - Base model pulled: ollama pull qwen2.5:7b
   - Fine-tuned LLM (optional): python scripts/13_export_lora_to_ollama.py
   - Fine-tuned embedding (optional): python scripts/12_finetune_embeddings.py
 
@@ -24,13 +24,13 @@ Usage:
         --eval-data datasets/rag_eval.json                # external rag eval
 
 Available stages:
-    base         BGE-M3 base    + dense          + qwen2.5:14b
-    hybrid       BGE-M3 base    + hybrid BM25    + qwen2.5:14b
-    rrf          BGE-M3 base    + RRF            + qwen2.5:14b
-    rrf_rerank   BGE-M3 base    + RRF+rerank     + qwen2.5:14b   <- best retrieval
-    graph        BGE-M3 base    + RRF+rerank+graph + qwen2.5:14b  <- requires graph.json
+    base         BGE-M3 base    + dense          + qwen2.5:7b
+    hybrid       BGE-M3 base    + hybrid BM25    + qwen2.5:7b
+    rrf          BGE-M3 base    + RRF            + qwen2.5:7b
+    rrf_rerank   BGE-M3 base    + RRF+rerank     + qwen2.5:7b   <- best retrieval
+    graph        BGE-M3 base    + RRF+rerank+graph + qwen2.5:7b  <- requires graph.json
     llm_ft       BGE-M3 base    + dense          + qwen25-legal-ft (fine-tuned)
-    emb_ft       BGE-M3 ft*     + RRF+rerank     + qwen2.5:14b   <- requires emb training
+    emb_ft       BGE-M3 ft*     + RRF+rerank     + qwen2.5:7b   <- requires emb training
     full         BGE-M3 ft*     + RRF+rerank     + qwen25-legal-ft  <- best overall
 """
 

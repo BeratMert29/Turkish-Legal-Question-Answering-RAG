@@ -11,7 +11,7 @@ if _project_root not in sys.path:
 import config
 from generation.rag_pipeline import TURKISH_PROMPT, SHORT_ANSWER_PROMPT
 
-HF_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+HF_MODEL_ID = config.LORA_BASE_HF_MODEL
 DEFAULT_ADAPTER_DIR = config.BASE_DIR / "models" / "qwen25_lora"
 
 
