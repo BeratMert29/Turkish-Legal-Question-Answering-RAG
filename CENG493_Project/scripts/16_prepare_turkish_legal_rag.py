@@ -22,6 +22,11 @@ flagged ``label_conflict: true``.  They are NOT silently fixed and NOT in the
 default set: they go to ``qa_turkish_legal_rag.label_conflicts.jsonl`` and the
 report records the count.
 
+Next step: run scripts/17_check_tlr_labels.py, which checks every HF label
+against the law text (many are off by 1-3 articles), records the corrected
+label next to the original (``madde_no_hf``) and re-admits conflict rows whose
+label it can confirm or correct.
+
 Usage:
     python scripts/16_prepare_turkish_legal_rag.py
     python scripts/16_prepare_turkish_legal_rag.py --input rows.json

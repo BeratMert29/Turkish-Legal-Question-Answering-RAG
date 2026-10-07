@@ -70,6 +70,10 @@ TLR_PROCESSED_DIR = BASE_DIR.parent / "results" / "processed_data"
 TLR_METADATA_PATH = BASE_DIR.parent / "results" / "index" / "metadata.jsonl"
 TLR_GOLD_FILE = "qa_turkish_legal_rag.jsonl"
 TLR_DATA_PATH = TLR_PROCESSED_DIR / TLR_GOLD_FILE
+# Use the gold article labels checked against the law text by
+# scripts/17_check_tlr_labels.py (data/tlr_labels.py).  False = the original
+# HF labels (madde_no_hf) and the original conflict exclusions.
+TLR_USE_LABEL_FIXES = True
 # HF ``kaynak`` spellings that differ from corpus source names
 TLR_SOURCE_ALIASES = {
     "Bilgi Edinme Hakkı Kanunu": "Bilgi Edinme Kanunu",

@@ -787,12 +787,22 @@ class DataProcessor:
 
     @staticmethod
     def build_turkish_legal_rag_eval_set(path=None) -> list[QAExample]:
-        """Load the committed turkish_legal_rag eval set (see scripts/16).
+        """Load the committed turkish_legal_rag eval set (see scripts/16, 17).
 
         Rows keep their explicit ``source`` and ``madde_no`` so that
         :meth:`build_relevant_chunk_map` can label gold chunks directly.
+        With ``config.TLR_USE_LABEL_FIXES`` the labels checked against the
+        law text by scripts/17 are used, otherwise the original HF labels.
         """
         p = pathlib.Path(path) if path else pathlib.Path(config.TLR_DATA_PATH)
+        fixed = config.TLR_USE_LABEL_FIXES
+        rows = list(_read_jsonl(p))
+        if not fixed:
+            # original HF labels and conflict exclusions (rows re-admitted by
+            # scripts/17 carry label_conflict_hf=True)
+            rows = [{**r, "madde_no": r.get("madde_no_hf", r.get("madde_no")),
+                     "label_conflict": r.get("label_conflict_hf", r.get("label_conflict"))}
+                    for r in rows]
         return [
             QAExample(
                 query_id=r["query_id"],
@@ -804,7 +814,7 @@ class DataProcessor:
                 madde_no=r.get("madde_no"),
                 hf_row_id=r.get("hf_row_id"),
             )
-            for r in _read_jsonl(p)
+            for r in rows
             if not r.get("label_conflict")
         ]
 
