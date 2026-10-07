@@ -210,12 +210,14 @@ def main() -> None:
         # Gold labels, BM25 and the graph are built from corpus_chunks; an
         # index built from another corpus (another chunker or corpus file)
         # silently makes gold chunks unretrievable.
-        index_ids = [m.get("chunk_id") for m in retriever.metadata]
-        if index_ids != [c.chunk_id for c in corpus_chunks]:
+        # Chunk ids are positional, so compare ids AND texts: a re-chunked
+        # corpus can reuse every id for different text.
+        from utils import corpus_fingerprint
+        if corpus_fingerprint(retriever.metadata) != corpus_fingerprint(corpus_chunks):
             sys.exit(
-                f"ERROR: the saved index ({len(index_ids)} chunks, {config.INDEX_DIR}) "
-                f"does not match this run's corpus ({len(corpus_chunks)} chunks).\n"
-                f"  Re-run with --build-index."
+                f"ERROR: the saved index ({len(retriever.metadata)} chunks, "
+                f"{config.INDEX_DIR}) does not match this run's corpus "
+                f"({len(corpus_chunks)} chunks).\n  Re-run with --build-index."
             )
 
     graph_index = None
