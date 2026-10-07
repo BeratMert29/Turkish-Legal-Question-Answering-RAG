@@ -31,6 +31,11 @@ def compute_source_hit_metrics(results: list[dict]) -> dict:
             source_labeled_queries   : number of queries with a known source law
             total_queries            : total queries passed in
     """
+    from utils import normalize_turkish
+
+    def _norm(s) -> str:
+        return normalize_turkish(str(s or "").strip())
+
     hit5 = hit10 = 0
     prec5_sum = prec10_sum = 0.0
     mrr_sum = 0.0
@@ -38,11 +43,11 @@ def compute_source_hit_metrics(results: list[dict]) -> dict:
     total = len(results)
 
     for r in results:
-        law = (r.get("source_law") or "").strip()
+        law = _norm(r.get("source_law"))
         if not law:
             continue
         source_labeled += 1
-        srcs = r.get("retrieved_sources", [])
+        srcs = [_norm(s) for s in r.get("retrieved_sources", [])]
         top5  = srcs[:5]
         top10 = srcs[:10]
         hits5  = sum(1 for s in top5  if s == law)
@@ -71,88 +76,99 @@ def compute_source_hit_metrics(results: list[dict]) -> dict:
     }
 
 
-def compute_all_metrics(results: list[dict]) -> dict:  # noqa: C901
+_CHUNK_METRIC_KEYS = (
+    "recall_at_5", "recall_at_10", "mrr", "ndcg_at_10",
+    "hit_at_5", "hit_at_10", "capped_recall_at_5", "capped_recall_at_10",
+    "precision_at_5", "precision_at_10",
+)
+
+
+def _dedup(ids) -> list[str]:
+    """String ids in first-occurrence order (a repeated id keeps its best rank)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for d in ids:
+        d = str(d)
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def compute_all_metrics(results: list[dict]) -> dict:
     """
-    Compute retrieval metrics using ranx.
+    Compute chunk-level retrieval metrics using ranx.
 
     Args:
         results: list of {"query_id": str, "retrieved": [chunk_id, ...], "relevant": [chunk_id, ...]}
                  Queries with empty relevant sets are excluded from metric computation.
 
+    Every metric is computed from one ranking per query: ``retrieved`` is
+    de-duplicated (a repeated chunk id keeps its first, best rank) before
+    ranx and the set-based metrics see it, so they always score the same list.
+    Query ids must be unique.
+
+    ``hit_at_k`` is chunk-level (a gold chunk in the top-k); the law-level
+    counterpart is :func:`compute_source_hit_metrics`.
+
     Returns:
-        {"recall_at_5": float, "recall_at_10": float, "mrr": float, "ndcg_at_10": float, "num_queries": int}
+        recall_at_5/10, mrr, ndcg_at_10, hit_at_5/10, capped_recall_at_5/10,
+        precision_at_5/10 (all None when no query has gold labels),
+        num_queries (gold-labeled) and total_queries.
     """
-    # Build qrels: only include queries that have at least one relevant doc
-    qrels_dict = {}
-    run_dict = {}
+    qrels_dict: dict[str, dict] = {}
+    run_dict: dict[str, dict] = {}
+    ranked: dict[str, list[str]] = {}
+    seen_qids: set[str] = set()
     total_queries = 0
-    num_queries = 0
 
     for r in results:
         qid = str(r["query_id"])
-        relevant = r.get("relevant", [])
-        retrieved = r.get("retrieved", [])
-
+        if qid in seen_qids:
+            raise ValueError(f"compute_all_metrics: duplicate query_id {qid!r}")
+        seen_qids.add(qid)
         total_queries += 1
+
+        relevant = _dedup(r.get("relevant") or [])
         if not relevant:
             continue  # skip queries with no ground-truth relevant docs
 
-        num_queries += 1
-        qrels_dict[qid] = {str(doc_id): 1 for doc_id in relevant}
+        retrieved = _dedup(r.get("retrieved") or [])
+        qrels_dict[qid] = {doc_id: 1 for doc_id in relevant}
+        ranked[qid] = retrieved
         # Score by inverse rank so ranx sorts correctly
-        run_dict[qid] = {str(doc_id): 1.0 / (rank + 1) for rank, doc_id in enumerate(retrieved)}
+        run_dict[qid] = {doc_id: 1.0 / (rank + 1) for rank, doc_id in enumerate(retrieved)}
         if not run_dict[qid]:
             # ranx crashes on an empty run entry; a single non-relevant
             # placeholder doc scores the query as 0 on every metric.
             run_dict[qid] = {"__no_retrieval__": 1.0}
 
-    if not qrels_dict:
-        return {"recall_at_5": 0.0, "recall_at_10": 0.0, "mrr": 0.0, "ndcg_at_10": 0.0, "source_hit_at_5": 0.0, "source_hit_at_10": 0.0, "capped_recall_at_5": 0.0, "capped_recall_at_10": 0.0, "precision_at_5": 0.0, "precision_at_10": 0.0, "num_queries": 0, "total_queries": total_queries}
+    n = len(qrels_dict)
+    if not n:
+        # No gold labels: the metrics are unknown, not zero.
+        return {**{k: None for k in _CHUNK_METRIC_KEYS},
+                "num_queries": 0, "total_queries": total_queries}
 
     from ranx import Qrels, Run, evaluate as ranx_evaluate  # lazy import; ranx optional
-    qrels = Qrels(qrels_dict)
-    run = Run(run_dict)
+    raw = ranx_evaluate(Qrels(qrels_dict), Run(run_dict),
+                        ["recall@5", "recall@10", "mrr", "ndcg@10"])
 
-    raw = ranx_evaluate(qrels, run, ["recall@5", "recall@10", "mrr", "ndcg@10"])
-
-    # source_hit_at_k: fraction of queries where at least one retrieved
-    # chunk (top-k) is in the relevant set.  More interpretable than
-    # recall when relevance is defined at source (law) level.
-    hit_at_5 = 0
-    hit_at_10 = 0
-    capped_recall_5_sum = 0.0
-    capped_recall_10_sum = 0.0
-    precision_5_sum = 0.0
-    precision_10_sum = 0.0
-    for r in results:
-        qid = str(r["query_id"])
-        if qid not in qrels_dict:
-            continue
-        relevant_set = set(str(d) for d in r.get("relevant", []))
-        retrieved = [str(d) for d in r.get("retrieved", [])]
-        if set(retrieved[:5]) & relevant_set:
-            hit_at_5 += 1
-        if set(retrieved[:10]) & relevant_set:
-            hit_at_10 += 1
-        hits_5 = len(set(retrieved[:5]) & relevant_set)
-        hits_10 = len(set(retrieved[:10]) & relevant_set)
-        capped_recall_5_sum += hits_5 / min(5, len(relevant_set))
-        capped_recall_10_sum += hits_10 / min(10, len(relevant_set))
-        precision_5_sum += hits_5 / 5
-        precision_10_sum += hits_10 / 10
-    n = len(qrels_dict)
+    sums = dict.fromkeys(("hit_at_5", "hit_at_10", "capped_recall_at_5",
+                          "capped_recall_at_10", "precision_at_5", "precision_at_10"), 0.0)
+    for qid, rel in qrels_dict.items():
+        relevant_set = set(rel)
+        for k in (5, 10):
+            hits = len(set(ranked[qid][:k]) & relevant_set)
+            sums[f"hit_at_{k}"] += 1.0 if hits else 0.0
+            sums[f"capped_recall_at_{k}"] += hits / min(k, len(relevant_set))
+            sums[f"precision_at_{k}"] += hits / k
 
     return {
         "recall_at_5":      float(raw["recall@5"]),
         "recall_at_10":     float(raw["recall@10"]),
         "mrr":              float(raw["mrr"]),
         "ndcg_at_10":       float(raw["ndcg@10"]),
-        "source_hit_at_5":  hit_at_5 / n,
-        "source_hit_at_10": hit_at_10 / n,
-        "capped_recall_at_5":  capped_recall_5_sum / n,
-        "capped_recall_at_10": capped_recall_10_sum / n,
-        "precision_at_5":      precision_5_sum / n,
-        "precision_at_10":     precision_10_sum / n,
-        "num_queries":      num_queries,
+        **{k: v / n for k, v in sums.items()},
+        "num_queries":      n,
         "total_queries":    total_queries,
     }

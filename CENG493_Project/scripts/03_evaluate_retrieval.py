@@ -256,10 +256,13 @@ def main():
 
     print(f"\n{'Mode':20s}  {'R@5':>8s}  {'R@10':>8s}  {'MRR':>8s}  {'nDCG@10':>8s}")
     print("-" * 66)
+    def _c(v) -> str:
+        return f"{v:8.4f}" if isinstance(v, (int, float)) else f"{'N/A':>8s}"
+
     for mode_name, m in all_modes.items():
-        print(f"  {mode_name:18s}  {m.get('recall_at_5',0):8.4f}  "
-              f"{m.get('recall_at_10',0):8.4f}  {m.get('mrr',0):8.4f}  "
-              f"{m.get('ndcg_at_10',0):8.4f}")
+        print(f"  {mode_name:18s}  {_c(m.get('recall_at_5'))}  "
+              f"{_c(m.get('recall_at_10'))}  {_c(m.get('mrr'))}  "
+              f"{_c(m.get('ndcg_at_10'))}")
 
     out = {
         "dense_metrics":          dense_metrics,

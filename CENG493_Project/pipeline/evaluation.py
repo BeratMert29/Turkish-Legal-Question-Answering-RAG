@@ -786,10 +786,10 @@ def _run_retrieval_phase(
     )
     print(
         f"    [chunk-level, gold-labeled subset n={_n_gold}]  "
-        f"R@5={retrieval_metrics.get('recall_at_5', 0):.4f}  "
-        f"R@10={retrieval_metrics.get('recall_at_10', 0):.4f}  "
-        f"MRR={retrieval_metrics.get('mrr', 0):.4f}  "
-        f"nDCG@10={retrieval_metrics.get('ndcg_at_10', 0):.4f}"
+        f"R@5={_fmt_opt(retrieval_metrics.get('recall_at_5'))}  "
+        f"R@10={_fmt_opt(retrieval_metrics.get('recall_at_10'))}  "
+        f"MRR={_fmt_opt(retrieval_metrics.get('mrr'))}  "
+        f"nDCG@10={_fmt_opt(retrieval_metrics.get('ndcg_at_10'))}"
     )
     return retrieved_all, retrieval_metrics, source_metrics, full_retrieved
 
