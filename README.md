@@ -159,6 +159,23 @@ pip install -r requirements.txt
 ollama pull qwen2.5:14b
 ```
 
+Ollama server settings (set before `ollama serve`):
+
+```bash
+# One model resident at a time: generation LLM, then judge LLM, never both
+# (the 14B generator + 70B judge do not fit together).
+export OLLAMA_MAX_LOADED_MODELS=1
+# Same context window for the base and the fine-tuned LLM (config.LLM_NUM_CTX);
+# the OpenAI-compatible endpoint cannot set num_ctx per request.
+export OLLAMA_CONTEXT_LENGTH=8192
+```
+
+New model downloads on first use: the NLI model
+(`MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7`) and the
+multilingual semantic-similarity model
+(`paraphrase-multilingual-mpnet-base-v2`).  The embedder and reranker load in
+fp16 on CUDA, so rebuild the FAISS index after upgrading.
+
 ### Build index and evaluate
 
 ```bash
@@ -182,6 +199,34 @@ The system includes five evaluation stages that progressively add components:
 | **emb_ft** | Fine-tuned BGE-M3 + RRF rerank | Task-specific embeddings |
 | **llm_ft** | Dense retrieval + QLoRA fine-tuned LLM | Legal QA instruction tuning |
 | **full** | Fine-tuned embedding + rerank + fine-tuned LLM | All components combined |
+
+### Ablation design (one factor per step)
+
+- **Base vs fine-tuned LLM** differ only in the LoRA weights: both use the same
+  base size (`config.LLM_BASE_FOR_ABLATION` = `qwen2.5:14b`, adapter trained
+  from `config.LORA_BASE_HF_MODEL` with `08_finetune_llm.py --backend qlora`),
+  the same `LLM_MAX_TOKENS` and the same `LLM_NUM_CTX`.  Each stage's
+  `baseline_metrics.json` records `llm_model`, `llm_max_tokens`, `llm_num_ctx`.
+- **rrf vs rrf_rerank**: both fuse the same top-`RERANKER_CANDIDATES` (50)
+  dense and BM25 candidates; only the cross-encoder reorder differs.
+- **graph** adds neighbours (adjacent chunks) of the top results.  Up to
+  `GRAPH_NEIGHBOR_BUDGET` of the `TOP_K_FOR_GENERATION` context slots are
+  reserved for them (`GRAPH_CONTEXT_RESERVE`), so the graph can change the
+  generated answer.  Retrieval metrics (Recall/MRR/nDCG/source-hit) are always
+  computed on the pre-expansion ranking, so graph and rrf_rerank have identical
+  retrieval numbers by construction; the effect shows up in QA metrics.
+- Failed generations stay in the QA-metric denominator and score 0; the count
+  is reported (`qa_metrics.n_generation_failed_scored_zero`).
+- Each stage writes `per_query.jsonl` (per-query metric arrays) and
+  `confidence_intervals` (95% bootstrap CIs); the ablation table shows an F1 CI.
+- Faithfulness (`Ctx-NLI`) is multilingual NLI of the answer against its
+  retrieved context; hallucination samples are stratified by whether the gold
+  chunk/law was retrieved at rank 1, 2-5 or missed.  Citation accuracy is
+  reported for the model's own citations (`native`) and after citation
+  injection (`injected`, mostly reflects retrieval overlap).
+- The corpus holds out eval rows only for `--eval-set kaggle`.
+  `14_eval_all_stages.py` aborts if fewer than 50% of `turkish_legal_rag`
+  queries have gold chunk labels (stale index/corpus).
 
 ### Retrieval Pipeline
 
@@ -232,7 +277,10 @@ CENG493_Project/
 └── scripts/
     ├── 02_build_index.py      # build FAISS index (--corpus or --docs-path)
     ├── 08_finetune_llm.py     # QLoRA fine-tune Qwen2.5
+    ├── 10_build_rag_train_data.py
+    ├── 11_build_embedding_triplets.py
     ├── 12_finetune_embeddings.py  # fine-tune BGE-M3
+    ├── 12b_finetune_reranker.py
     ├── 13_export_lora_to_ollama.py
     └── 14_eval_all_stages.py  # main evaluation entry point
 ```
@@ -291,6 +339,11 @@ All settings are in `config.py`. Key values:
 | `TOP_K_FOR_GENERATION` | 5 | Chunks passed to LLM |
 | `RERANKER_CANDIDATES` | 50 | Candidates fed to reranker |
 | `CHUNK_SIZE` | 1400 | Characters per chunk |
+| `LLM_BASE_FOR_ABLATION` | `qwen2.5:14b` | Base LLM; must match the LoRA base |
+| `LLM_NUM_CTX` | 8192 | Context window for both LLMs |
+| `LLM_JUDGE_SAMPLE_SIZE` | `None` | Judge every answer (int = cap) |
+| `NLI_MODEL` | mDeBERTa xnli | Multilingual NLI for faithfulness |
+| `TRUST_REMOTE_CODE` | `False` | Passed to HF `from_pretrained` |
 
 ---
 
@@ -323,11 +376,14 @@ Rebuild the set (outputs `results/processed_data/qa_turkish_legal_rag.jsonl` and
 python CENG493_Project/scripts/16_prepare_turkish_legal_rag.py
 ```
 
-Colab run (default set is `turkish_legal_rag`):
+Run the ablation (default set is `turkish_legal_rag`):
 
 ```bash
 python scripts/14_eval_all_stages.py --stages base rrf_rerank graph emb_ft full
 ```
+
+`scripts/10_eval_finetuned.py` was removed (superseded by
+`14_eval_all_stages.py --stages llm_ft full`).
 
 HMGS is still available with `--eval-set hmgs` (Kaggle with `--eval-set kaggle`).
 
