@@ -116,7 +116,8 @@ def main() -> None:
     print(f"Loading corpus from {config.RAW_DATA_PATH} ...")
     processor = DataProcessor(config.RAW_DATA_PATH)
     processor.load_and_validate()
-    corpus_chunks = list(processor.build_corpus_chunks(holdout=True)  # keep eval rows out of training)
+    # keep eval rows out of training
+    corpus_chunks = list(processor.build_corpus_chunks(holdout=True))
     print(f"  Corpus chunks: {len(corpus_chunks)}")
 
     # Combine Kaggle 300 eval + HMGS gold as annotation source

@@ -8,6 +8,23 @@ on a pure-CPU machine with only the packages in requirements-test.txt.
 """
 
 import importlib
+import pathlib
+import py_compile
+
+import pytest
+
+_PROJECT = pathlib.Path(__file__).resolve().parent.parent
+_SOURCES = sorted(
+    p for p in [*_PROJECT.rglob("*.py"), _PROJECT.parent / "demo.py"]
+    if p.exists() and "__pycache__" not in p.parts
+)
+
+
+@pytest.mark.parametrize("path", _SOURCES, ids=lambda p: str(p.relative_to(_PROJECT.parent)))
+def test_source_compiles(path):
+    """Every script and module must at least parse: scripts are never imported
+    by the tests, so a syntax error there would otherwise go unnoticed."""
+    py_compile.compile(str(path), doraise=True)
 
 
 # ---------------------------------------------------------------------------
