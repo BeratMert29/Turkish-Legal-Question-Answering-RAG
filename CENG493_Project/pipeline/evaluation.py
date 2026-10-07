@@ -496,6 +496,8 @@ def build_per_query(
                                       "rouge_l", "bleu", "chrf",
                                       "answer_containment", "answer_len_words")},
             "semantic_similarity": sem.get(qid),
+            "cite_precision_native": p.get("cite_precision_native"),
+            "cite_recall_native": p.get("cite_recall_native"),
             "nli_context_grounding": n.get("context_grounding_score"),
             "nli_context_supported": n.get("context_supported_rate"),
             "nli_gold_claim_recall": n.get("gold_claim_recall"),
@@ -512,6 +514,7 @@ _CI_METRICS = (
     "article_hit_at_5", "article_reciprocal_rank",
     "f1", "token_precision", "token_recall", "rouge_l", "chrf",
     "answer_containment", "em", "semantic_similarity",
+    "cite_precision_native", "cite_recall_native",
     "nli_context_grounding", "nli_context_supported", "nli_gold_claim_recall",
     "judge_answer", "judge_faithfulness",
     "judge_relevancy", "judge_coherence",
@@ -544,6 +547,7 @@ ABLATION_PAIRS: tuple[tuple[str, str], ...] = (
 COMPARISON_METRICS: tuple[str, ...] = (
     "recall_at_5", "reciprocal_rank", "article_reciprocal_rank",
     "f1", "token_recall", "chrf", "answer_containment", "rouge_l",
+    "cite_precision_native",
     "semantic_similarity", "nli_context_supported", "nli_gold_claim_recall",
     "judge_answer",
 )
@@ -601,6 +605,24 @@ def print_comparison_table(comparisons: dict[str, dict[str, dict]]) -> None:
                   f"[{r['ci_low']:+.4f},{r['ci_high']:+.4f}] | "
                   f"{r['p_holm']:6.4f}{star} | {r['n']:>4} |")
     print("=" * 100 + "\n")
+
+
+def _add_citation_metrics(qa_metrics: dict, predictions: list[dict],
+                          metric_input: list[dict], chunk_articles: dict) -> None:
+    """Article-level citation precision/recall (native and injected) into
+    ``qa_metrics["citation_article_level"]``; per-query values are attached
+    to the predictions as ``cite_precision_native`` / ``cite_recall_native``."""
+    from evaluation.citation_metrics import compute_citation_metrics
+
+    gold = {str(m["query_id"]): m.get("relevant_articles") or [] for m in metric_input}
+    summary, per_query = compute_citation_metrics(predictions, gold, chunk_articles)
+    qa_metrics["citation_article_level"] = summary
+    for p in predictions:
+        p.update(per_query.get(str(p.get("query_id")), {}))
+    nat = summary.get("native") or {}
+    print(f"    Citations (article, native): precision={_fmt_opt(nat.get('precision'))} "
+          f"vs random={_fmt_opt(nat.get('random_precision'))}  "
+          f"recall={_fmt_opt(nat.get('recall'))}  presence={_fmt_opt(nat.get('presence_rate'))}")
 
 
 def _gold_info(qa_examples, retrieved_all, relevant_map, chunk_articles=None):
@@ -1117,7 +1139,7 @@ def _run_semantic_sim_phase(
 
         sem_result = compute_semantic_similarity(predictions)
         sem_sim = sem_result["mean_similarity"]
-        print(f"    SemanticSim={sem_sim:.4f}")
+        print(f"    SemanticSim={_fmt_opt(sem_sim)}")
         return sem_sim, sem_result.get("per_sample", [])
     except Exception as exc:
         print(f"    WARNING: Semantic similarity failed (recorded as null): {exc}")
@@ -1369,6 +1391,7 @@ def run_stage(
     )
     metric_input, gold_info = _gold_info(
         qa_examples, retrieved_all, relevant_map, chunk_articles)
+    _add_citation_metrics(qa_metrics, all_predictions, metric_input, chunk_articles)
 
     if generation_failed:
         print("  Skipping LLM-based metrics: generation failure rate exceeded.")
@@ -1510,11 +1533,11 @@ def print_ablation_table(
         f"| {'Stage':<26} | "
         + " | ".join(f"{h:>{w}}" for h, w in zip(head_hdr, [8, 9, 7, 9, 6]))
         + f" | {'F1':>6} | {'F1 95% CI':>13} | {'Contain':>7} | {'ROUGE-L':>7} | {'chrF++':>6} | "
-        f"{'Cite-nat':>8} | {'Cite-inj':>8} | {'Ctx-NLI':>7} | {'ClaimR':>6} | "
+        f"{'CiteP-nat':>9} | {'CiteP-rnd':>9} | {'Ctx-NLI':>7} | {'ClaimR':>6} | "
         f"{'LLM-J':>6} | {'SemSim':>7} | {'AnsLen':>6} |"
     )
     sep1 = "|" + "|".join(
-        ["-" * w for w in [28, 10, 11, 9, 11, 8, 8, 15, 9, 9, 8, 10, 10, 9, 8, 8, 9, 8]]
+        ["-" * w for w in [28, 10, 11, 9, 11, 8, 8, 15, 9, 9, 8, 11, 11, 9, 8, 8, 9, 8]]
     ) + "|"
 
     print("\n\n" + "=" * 190)
@@ -1528,6 +1551,7 @@ def print_ablation_table(
             continue
         r = results[stage_key]
         qa = r.get("qa_metrics", {})
+        cite = (qa.get("citation_article_level") or {}).get("native") or {}
         stage_name = _name(r, stage_key)
         cells = " | ".join(
             f"{c:>{w}}" for c, w in zip(head_cells(r), [8, 9, 7, 9, 6])
@@ -1539,8 +1563,8 @@ def print_ablation_table(
             f"{_pct(qa.get('answer_containment')):>7} | "
             f"{_pct(qa.get('rouge_l')):>7} | "
             f"{_pct(qa.get('chrf')):>6} | "
-            f"{_pct(qa.get('citation_accuracy_native')):>8} | "
-            f"{_pct(qa.get('citation_accuracy_injected', qa.get('citation_accuracy'))):>8} | "
+            f"{_pct(cite.get('precision')):>9} | "
+            f"{_pct(cite.get('random_precision')):>9} | "
             f"{_pct(r.get('faithfulness_rate')):>7} | "
             f"{_pct(r.get('gold_claim_recall')):>6} | "
             f"{_f4(r.get('llm_judge_score')):>6} | "
