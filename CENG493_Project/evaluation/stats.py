@@ -115,3 +115,39 @@ def holm_adjust(pvalues: Mapping[str, float | None]) -> dict[str, float | None]:
         running = max(running, min(1.0, (m - i) * p))
         out[k] = running
     return out
+
+
+def cohen_kappa(a: Sequence, b: Sequence, labels: Sequence | None = None,
+                weights: str | None = None) -> float | None:
+    """Cohen's kappa between two raters' labels on the same items.
+
+    ``weights=None`` is the unweighted kappa; ``"linear"`` / ``"quadratic"``
+    weight disagreements by label distance (labels taken in the given
+    order, e.g. ``[0, 0.5, 1]``).  Pairs with a None label are dropped.
+    Returns None for fewer than two items or no variation in expected
+    disagreement.
+    """
+    pairs = [(x, y) for x, y in zip(a, b) if x is not None and y is not None]
+    if len(pairs) < 2:
+        return None
+    labels = list(labels) if labels is not None else sorted({v for p in pairs for v in p})
+    idx = {v: i for i, v in enumerate(labels)}
+    k = len(labels)
+    obs = np.zeros((k, k))
+    for x, y in pairs:
+        obs[idx[x], idx[y]] += 1
+    obs /= obs.sum()
+    exp = np.outer(obs.sum(axis=1), obs.sum(axis=0))
+    i, j = np.indices((k, k))
+    if weights is None:
+        w = (i != j).astype(float)
+    elif weights == "linear":
+        w = np.abs(i - j) / max(k - 1, 1)
+    elif weights == "quadratic":
+        w = ((i - j) / max(k - 1, 1)) ** 2
+    else:
+        raise ValueError(f"unknown weights {weights!r}")
+    denom = float((w * exp).sum())
+    if denom == 0:
+        return None
+    return 1.0 - float((w * obs).sum()) / denom
