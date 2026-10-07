@@ -75,7 +75,7 @@ def _chunk_matches_article(chunk: "CorpusChunk", madde_no: int) -> bool:
     # 1. Explicit madde_no field (set by corpus builder for article-chunked corpora)
     stored = getattr(chunk, "madde_no", None)
     if stored is not None:
-        return int(stored) == madde_no
+        return str(stored).strip() == str(madde_no)
 
     # 2. doc_id pattern — e.g. "Anayasa_madde_44" / "law_madde_44_2"
     if re.search(rf"madde[_\s]{madde_no}(?:[^\d]|$)", chunk.doc_id, re.IGNORECASE):
@@ -86,6 +86,28 @@ def _chunk_matches_article(chunk: "CorpusChunk", madde_no: int) -> bool:
         if int(m.group(1)) == madde_no:
             return True
 
+    return False
+
+
+def _chunk_matches_madde_str(chunk: "CorpusChunk", madde_no: str) -> bool:
+    """Return True if *chunk* belongs to the article named by the normalised
+    string *madde_no* (``"12"``, ``"183-a"``, ``"ek-3"``, ``"gecici-2"``)."""
+    want = str(madde_no).strip().lower()
+    stored = getattr(chunk, "madde_no", None)
+    if stored is not None and str(stored).strip().lower() == want:
+        return True
+    # The stored/leading article can differ from the one asked for when the
+    # chunk opens with a section title or holds several articles, so also scan
+    # every line-anchored article heading in the chunk text.
+    for m in _MADDE_HEADING_RE.finditer(chunk.text):
+        if m.group(1):
+            found = f"ek-{_normalize_madde_suffix(m.group(1))}"
+        elif m.group(2) or m.group(3):
+            found = f"gecici-{_normalize_madde_suffix(m.group(2) or m.group(3))}"
+        else:
+            found = _normalize_madde_suffix(m.group(4))
+        if found == want:
+            return True
     return False
 
 
@@ -128,32 +150,50 @@ def _silver_lexical_score(query_tokens: "list[str]", chunk_text: str) -> float:
     return matched / len(query_tokens)
 
 
+# Anchored to line-start ((?m)^\s*) so mid-text references like
+# "Madde 5 uyarınca" are never mistaken for article headings.
+# Suffix "[/-][A-Za-z]" captures "183/A" or "183-A"; normalised to
+# "183-a" by _madde_no_from_text() via _normalize_madde_suffix().
+# group 1: ek-N   — "Ek Madde 3", "EK MADDE 3" (case-insensitive MADDE)
+# group 2: gecici-N — "Geçici Madde 7"
+# group 3: gecici-N all-caps — "GEÇİCİ MADDE 4"
+# group 4: regular N — "MADDE 86", "MADDE 183/A"
 _MADDE_HEADING_RE = re.compile(
-    r"(?:"
-    r"(?:Ek|EK)\s+[Mm]adde\s+(\d+)"          # group 1: ek-N
-    r"|[Gg]eçici\s+[Mm]adde\s+(\d+)"          # group 2: gecici-N
-    r"|(?:GEÇİCİ\s+MADDE)\s+(\d+)"            # group 3: gecici-N (all caps)
-    r"|(?:MADDE|Madde)\s+(\d+)"               # group 4: N
+    r"(?m)^\s*(?:"
+    r"(?:Ek|EK)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(\d+(?:[/-][A-Za-z])?)"   # g1: ek-N
+    r"|[Gg]eçici\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(\d+(?:[/-][A-Za-z])?)"  # g2: gecici-N
+    r"|(?:GEÇİCİ\s+MADDE)\s+(\d+(?:[/-][A-Za-z])?)"                    # g3: gecici-N caps
+    r"|(?:MADDE|Madde)\s+(\d+(?:[/-][A-Za-z])?)"                       # g4: N
     r")"
 )
+
+
+def _normalize_madde_suffix(raw: str) -> str:
+    """Normalise a MADDE number: ``'183/A'`` → ``'183-a'``, ``'5'`` → ``'5'``."""
+    return re.sub(r"[/-]([A-Za-z])", lambda m: f"-{m.group(1).lower()}", raw)
 
 
 def _madde_no_from_text(text: str) -> "str | None":
     """Return the leading article number from text, or None if absent.
 
+    Only matches headings anchored to a line boundary so that inline
+    references such as "Madde 5 uyarınca" do not set the chunk's article.
+
     Returns:
-        "N" for a regular article, "ek-N" for supplementary articles
-        (Ek Madde), "gecici-N" for transitory articles (Geçici Madde).
+        ``"N"`` for a regular article (e.g. ``"86"`` or ``"183-a"``),
+        ``"ek-N"`` for supplementary articles (Ek Madde),
+        ``"gecici-N"`` for transitory articles (Geçici Madde),
+        or ``None`` when no heading is found.
     """
     m = _MADDE_HEADING_RE.search(text[:600])
     if m is None:
         return None
     if m.group(1):
-        return f"ek-{m.group(1)}"
+        return f"ek-{_normalize_madde_suffix(m.group(1))}"
     if m.group(2) or m.group(3):
         n = m.group(2) or m.group(3)
-        return f"gecici-{n}"
-    return m.group(4)
+        return f"gecici-{_normalize_madde_suffix(n)}"
+    return _normalize_madde_suffix(m.group(4))
 
 
 @dataclass
@@ -174,6 +214,8 @@ class QAExample:
     context: str    # "" for test/train rows (null in CSV)
     source: str
     data_type: str
+    madde_no: "str | None" = None   # explicit gold article (turkish_legal_rag)
+    hf_row_id: "str | None" = None
 
 
 class DataProcessor:
@@ -359,7 +401,7 @@ class DataProcessor:
         if len(text) < config.CORPUS_DOC_MIN_CHARS:
             return []
 
-        if getattr(config, "ARTICLE_CHUNKING_ENABLED", False):
+        if config.ARTICLE_CHUNKING_ENABLED:
             return DataProcessor._article_chunk(text, doc_id, source)
         return DataProcessor._char_chunk(text, doc_id, source)
 
@@ -400,13 +442,9 @@ class DataProcessor:
         # Load supplementary law texts (HMK, TTK, İYUK, İİK, VUK, DMK, …)
         extra_path = pathlib.Path(config.BASE_DIR) / "data" / "extra_laws.jsonl"
         if extra_path.exists():
+            from utils import read_jsonl
             extra_kept = 0
-            with open(extra_path, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    entry = json.loads(line)
+            for entry in read_jsonl(extra_path):
                     text   = entry.get("text", "")
                     source = entry.get("source", "")
                     doc_id = entry.get("doc_id", "")
@@ -513,7 +551,7 @@ class DataProcessor:
         # Avukatlık Kanunu) — drop the entire source to avoid noise.
         _DROPPED_SOURCES = {"213 sayılı Vergi Usul Kanunu"}
 
-        source_map = getattr(config, "HMGS_SOURCE_MAP", {})
+        source_map = config.HMGS_SOURCE_MAP
         examples: list[QAExample] = []
         skipped = 0
         skipped_mc = 0
@@ -554,8 +592,8 @@ class DataProcessor:
             "build_gold_eval_set: kept=%d  dropped=no_corpus:%d  mc_ref:%d  noisy_src:%d",
             len(examples), skipped, skipped_mc, skipped_src,
         )
-        expected = getattr(config, "HMGS_EVAL_EXPECTED", None)
-        if expected and len(examples) < expected * 0.8:
+        expected = config.HMGS_EVAL_EXPECTED
+        if len(examples) < expected * 0.8:
             log.warning(
                 "build_gold_eval_set: only %d examples built, expected ~%d. "
                 "Check HMGS CSV filtering or HMGS_SOURCE_MAP.",
@@ -566,6 +604,28 @@ class DataProcessor:
     # ------------------------------------------------------------------
     # Ground-truth relevance map
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def build_turkish_legal_rag_eval_set(path=None) -> list[QAExample]:
+        """Load the committed turkish_legal_rag eval set (see scripts/16).
+
+        Rows keep their explicit ``source`` and ``madde_no`` so that
+        :meth:`build_relevant_chunk_map` can label gold chunks directly.
+        """
+        p = pathlib.Path(path) if path else pathlib.Path(config.TLR_DATA_PATH)
+        return [
+            QAExample(
+                query_id=r["query_id"],
+                question=r["question"],
+                answer=r.get("answer", ""),
+                context=r.get("context", ""),
+                source=r.get("source", ""),
+                data_type=r.get("data_type", ""),
+                madde_no=r.get("madde_no"),
+                hf_row_id=r.get("hf_row_id"),
+            )
+            for r in DataProcessor.load_jsonl(p)
+        ]
 
     @staticmethod
     def build_relevant_chunk_map(
@@ -580,6 +640,8 @@ class DataProcessor:
 
         Strategy (in order):
         0. gold_source_ids: exact chunk IDs from evaluator benchmark
+        0.5 explicit source + madde_no fields (turkish_legal_rag): chunks of that
+           law whose article matches exactly
         1. Context hash match: re-chunk qa.context and match by text hash
         2. doc_id match: chunk.doc_id == qa.query_id
         2.5. Answer substring: chunk.text contains a significant portion of qa.answer
@@ -622,13 +684,13 @@ class DataProcessor:
         # label_strategy tracks how each query was labeled (for coverage reporting)
         label_strategy_map: dict[str, str] = {}
         # Coverage counters — one per labeling strategy
-        labeled_s0 = labeled_s1 = labeled_s2 = labeled_s25 = labeled_s3 = 0
+        labeled_s0 = labeled_s05 = labeled_s1 = labeled_s2 = labeled_s25 = labeled_s3 = 0
         labeled_silver = 0
         unlabeled = 0
         # Silver config (read once for performance)
-        silver_enabled = getattr(config, "RELEVANCE_SILVER_LEXICAL", False)
-        silver_top_m = getattr(config, "SILVER_TOP_M", 3)
-        silver_threshold = getattr(config, "SILVER_THRESHOLD", 0.10)
+        silver_enabled = config.RELEVANCE_SILVER_LEXICAL
+        silver_top_m = config.SILVER_TOP_M
+        silver_threshold = config.SILVER_THRESHOLD
 
         for qa in qa_examples:
             relevant: list[str] = []
@@ -653,6 +715,21 @@ class DataProcessor:
                     label_strategy_map[qa_query_id] = "gold"
                     relevant_map[qa_query_id] = relevant
                     continue  # Skip remaining strategies — ground truth is exact.
+
+            # Strategy 0.5: explicit source + madde_no fields (turkish_legal_rag).
+            # The gold article is given directly, so label the corpus chunks of
+            # that law and article without any text heuristics.
+            explicit_madde = qa.get("madde_no") if _is_dict else getattr(qa, "madde_no", None)
+            if explicit_madde and qa_source:
+                relevant = [
+                    c.chunk_id for c in by_source.get(qa_source, [])
+                    if _chunk_matches_madde_str(c, explicit_madde)
+                ]
+                if relevant:
+                    labeled_s05 += 1
+                    label_strategy_map[qa_query_id] = "explicit_madde"
+                    relevant_map[qa_query_id] = relevant
+                    continue
 
             # Strategy 1: context-hash match — re-chunk qa.context using the same
             # chunking path as the corpus index build (article or char chunking).
@@ -753,10 +830,10 @@ class DataProcessor:
         log.info(
             "build_relevant_chunk_map coverage: "
             "total=%d  labeled=%d (%.0f%%)  unlabeled=%d  "
-            "[s0(gold)=%d s1(ctx_hash)=%d s2(doc_id)=%d s2.5(ans_substr)=%d "
+            "[s0(gold)=%d s0.5(explicit_madde)=%d s1(ctx_hash)=%d s2(doc_id)=%d s2.5(ans_substr)=%d "
             "s3(article)=%d s3.5(silver_lexical)=%d]",
             n_total, labeled, 100 * labeled / n_total if n_total else 0,
-            unlabeled, labeled_s0, labeled_s1, labeled_s2, labeled_s25,
+            unlabeled, labeled_s0, labeled_s05, labeled_s1, labeled_s2, labeled_s25,
             labeled_s3, labeled_silver,
         )
         if unlabeled:
@@ -776,6 +853,7 @@ class DataProcessor:
             "unlabeled": unlabeled,
             "by_strategy": {
                 "gold":          labeled_s0,
+                "explicit_madde": labeled_s05,
                 "context_hash":  labeled_s1,
                 "doc_id":        labeled_s2,
                 "answer_substr": labeled_s25,
@@ -805,7 +883,13 @@ class DataProcessor:
 
     @staticmethod
     def load_jsonl(path) -> list[dict]:
-        """Load a JSONL file and return a list of raw dicts."""
+        """Load a JSONL file and return a list of raw dicts.
+
+        Delegates to :func:`utils.read_jsonl` which logs a warning (with file
+        name and 1-based line number) and skips any line that cannot be parsed
+        as JSON.
+        """
+        from utils import read_jsonl
         p = pathlib.Path(path)
         MAX_JSONL_BYTES = 2 * 1024 ** 3  # 2 GB
         file_size = p.stat().st_size
@@ -813,10 +897,4 @@ class DataProcessor:
             raise ValueError(
                 f"JSONL file too large to load: {file_size / 1024**3:.1f} GB > 2 GB limit: {p}"
             )
-        results: list[dict] = []
-        with p.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    results.append(json.loads(line))
-        return results
+        return list(read_jsonl(p))

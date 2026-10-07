@@ -19,8 +19,15 @@ _QUERY_KANUN_RE = re.compile(
     r"(?:Kanunu?|Yasası?)[a-zçğıöşü]*",
 )
 
-# "madde 86" / "MADDE 86" — used in the window after a law reference, or standalone.
-_QUERY_MADDE_NUM_RE = re.compile(r"(?:madde|MADDE)\s*(\d{1,4})", re.IGNORECASE)
+# "madde 86" / "MADDE 86" / "md. 86" / "86. madde" / "86. md." — used in the window
+# after a law reference, or standalone.
+# group 1: madde/md prefix form  e.g. "madde 86", "md. 86"
+# group 2: number-first form     e.g. "86. madde", "86. md.", "5. md"
+_QUERY_MADDE_NUM_RE = re.compile(
+    r"(?:madde|md)\.?\s*(\d{1,4})"         # g1: "madde 86", "md. 86"
+    r"|(\d{1,4})\s*\.?\s*(?:madde|md)\.?", # g2: "86. madde", "86. md.", "5. md"
+    re.IGNORECASE,
+)
 
 # Common Turkish law abbreviations → normalized source name.
 _LAW_ABBREVS: dict[str, str] = {
@@ -36,13 +43,55 @@ _LAW_ABBREVS: dict[str, str] = {
     "Anayasa": "Türkiye Cumhuriyeti Anayasası",
 }
 
-# "TCK madde 86" or "TCK 86. madde"
-_ABBREV_MADDE_RE = re.compile(
-    r"\b(TCK|CMK|TMK|TBK|HMK|TTK|İYUK|İİK|DMK|Anayasa)\b"
-    r"[^\n]{0,60}"
-    r"(?:(?:madde|MADDE)\s*(\d{1,4})|(\d{1,4})\s*\.?\s*madde)",
+
+def _abbrev_key(s: str) -> str:
+    """Turkish-aware key: all i/İ/ı/I variants collapse to İ, then upper()."""
+    return s.translate(str.maketrans("iIı", "İİİ")).upper()
+
+
+_LAW_ABBREVS_NORM: dict[str, str] = {_abbrev_key(k): v for k, v in _LAW_ABBREVS.items()}
+
+_TR_LETTER = "A-Za-zÇĞİIıÖŞÜçğöşü"
+_I = "[İIiı]"
+
+# Law abbreviation (case-insensitive, Turkish i/İ/ı/I variants accepted).
+_ABBREV_RE = re.compile(
+    rf"(?<![{_TR_LETTER}])"
+    rf"(TCK|CMK|TMK|TBK|HMK|TTK|{_I}YUK|{_I}{_I}K|DMK|Anayasa)"
+    rf"(?![{_TR_LETTER}])",
     re.IGNORECASE,
 )
+
+# Article number right after a law name, within that law's own window:
+# "madde 86", "md. 5", "m. 49", "86. madde", "86. maddesi", "86'ncı maddesi",
+# "86. md.", "5. md" (number-first forms with md abbreviation).
+_MADDE_AFTER_ABBREV_RE = re.compile(
+    rf"(?<![{_TR_LETTER}])(?:madde|md|m)\.?\s*(?<!\d)(\d{{1,4}})(?!\d)"
+    r"|(?<!\d)(\d{1,4})(?!\d)"
+    r"(?:\s*['\u2019]?\s*(?:inci|ıncı|nci|ncı|üncü|uncu))?"
+    r"\s*\.?\s*(?:madde|md)\.?",
+    re.IGNORECASE,
+)
+
+_ABBREV_WINDOW = 60  # max chars after an abbreviation to look for its madde
+
+
+def find_abbrev_maddes(query: str) -> list[tuple[str, str]]:
+    """Return [(abbrev_key, madde_no)] binding each number to the nearest
+    preceding law abbreviation; each abbreviation's window ends at the next one."""
+    ams = list(_ABBREV_RE.finditer(query))
+    out: list[tuple[str, str]] = []
+    for i, am in enumerate(ams):
+        end = am.end() + _ABBREV_WINDOW
+        if i + 1 < len(ams):
+            end = min(end, ams[i + 1].start())
+        window = query[am.end(): end]
+        window = window.split("\n", 1)[0]
+        mm = _MADDE_AFTER_ABBREV_RE.search(window)
+        if mm:
+            out.append((_abbrev_key(am.group(1)), mm.group(1) or mm.group(2)))
+    return out
+
 
 _LOOKUP_WINDOW = 250  # chars after law name to search for madde number
 
@@ -58,8 +107,14 @@ class GraphIndex:
         self._load_metadata(Path(metadata_path))
 
     def _load_graph(self, path: Path) -> None:
+        """Load graph from *path*, propagating JSONDecodeError on corrupt files.
+
+        Callers (e.g. :meth:`from_config`) catch ``json.JSONDecodeError`` and
+        trigger an automatic rebuild so that a corrupt graph.json never causes
+        a hard crash.
+        """
         with path.open(encoding="utf-8") as fh:
-            raw: dict = json.load(fh)
+            raw: dict = json.load(fh)  # raises json.JSONDecodeError if corrupt
         for key, edges in raw.items():
             if key == "_source_madde_lookup":
                 # Store lookup table; values may be lists or dicts depending on
@@ -72,20 +127,16 @@ class GraphIndex:
                 self._graph[key] = [(nb_id, kind) for nb_id, kind in edges]
 
     def _load_metadata(self, path: Path) -> None:
-        with path.open(encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                record: dict = json.loads(line)
-                cid = record.get("chunk_id")
-                if cid is None:
-                    continue
-                self._chunk_meta[cid] = {
-                    "text": record.get("text", ""),
-                    "doc_id": record.get("doc_id", ""),
-                    "source": record.get("source", ""),
-                }
+        from utils import read_jsonl
+        for record in read_jsonl(path):
+            cid = record.get("chunk_id")
+            if cid is None:
+                continue
+            self._chunk_meta[cid] = {
+                "text": record.get("text", ""),
+                "doc_id": record.get("doc_id", ""),
+                "source": record.get("source", ""),
+            }
 
     # ── direct madde injection ────────────────────────────────────────────
 
@@ -144,16 +195,13 @@ class GraphIndex:
                 window = query[lm.end(): lm.end() + _LOOKUP_WINDOW]
                 mm = _QUERY_MADDE_NUM_RE.search(window)
                 if mm:
-                    _add_chunks(src, mm.group(1))
+                    _add_chunks(src, mm.group(1) or mm.group(2))
 
         # Pattern B: abbreviation like "TCK madde 86" / "TCK 86. madde"
-        for am in _ABBREV_MADDE_RE.finditer(query):
-            abbrev = am.group(1).upper()
-            src = _LAW_ABBREVS.get(abbrev)
+        for abbrev, madde_no in find_abbrev_maddes(query):
+            src = _LAW_ABBREVS_NORM.get(abbrev)
             if src:
-                madde_no = am.group(2) or am.group(3)
-                if madde_no:
-                    _add_chunks(src, madde_no)
+                _add_chunks(src, madde_no)
 
         return results
 
@@ -231,8 +279,26 @@ class GraphIndex:
 
     @classmethod
     def from_config(cls) -> "GraphIndex":
+        """Load GraphIndex from paths defined in config.
+
+        If ``graph.json`` exists but is corrupt (``json.JSONDecodeError``), it
+        is rebuilt automatically from the metadata file and the fresh index is
+        returned.
+        """
         import config
-        return cls(
-            config.INDEX_DIR / config.GRAPH_FILE,
-            config.INDEX_DIR / config.METADATA_FILE,
-        )
+        graph_path = config.INDEX_DIR / config.GRAPH_FILE
+        meta_path = config.INDEX_DIR / config.METADATA_FILE
+        try:
+            return cls(graph_path, meta_path)
+        except json.JSONDecodeError:
+            log.warning(
+                "graph.json at %s is corrupt — rebuilding from %s",
+                graph_path,
+                meta_path,
+            )
+            from utils import read_jsonl
+            from retrieval.graph_builder import build_graph_from_metadata, save_graph
+            metadata = list(read_jsonl(meta_path))
+            graph = build_graph_from_metadata(metadata)
+            save_graph(graph, graph_path)
+            return cls(graph_path, meta_path)

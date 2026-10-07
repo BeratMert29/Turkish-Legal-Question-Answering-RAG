@@ -126,8 +126,8 @@ class TestEvalAllStagesCLI:
         finally:
             sys.path.pop(0)
 
-        # Default eval set is hmgs
-        assert args.eval_set == "hmgs"
+        # Default eval set is turkish_legal_rag (hmgs stays selectable)
+        assert args.eval_set == "turkish_legal_rag"
         assert args.limit is None
         assert args.corpus is None
         assert args.eval_data is None
@@ -400,3 +400,243 @@ class TestDryRun:
         assert "recall_at_5" in metrics
         assert "mrr" in metrics
         assert metrics["num_queries"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# New helper / fix tests
+# ---------------------------------------------------------------------------
+
+class TestEvalHelpers:
+    """Unit tests for helpers added in the improvements/2026-10 branch."""
+
+    def test_evict_model_cache_clears(self):
+        """evict_model_cache() must empty _model_cache without raising."""
+        from pipeline.evaluation import _model_cache, evict_model_cache
+
+        _model_cache["nli"] = object()
+        evict_model_cache()
+        assert "nli" not in _model_cache
+
+    def test_build_stage_components_importable(self):
+        from pipeline.evaluation import _build_stage_components
+        assert callable(_build_stage_components)
+
+    def test_run_generation_and_qa_importable(self):
+        from pipeline.evaluation import _run_generation_and_qa
+        assert callable(_run_generation_and_qa)
+
+    def test_run_stage_phase_helpers_importable(self):
+        """All phase helpers extracted from run_stage must be importable."""
+        from pipeline.evaluation import (
+            _run_retrieval_phase,
+            _run_supplemental_metrics,
+            _run_hallucination_phase,
+            _run_judge_phase,
+            _run_semantic_sim_phase,
+            _assemble_final_result,
+        )
+        for fn in (
+            _run_retrieval_phase, _run_supplemental_metrics,
+            _run_hallucination_phase, _run_judge_phase,
+            _run_semantic_sim_phase, _assemble_final_result,
+        ):
+            assert callable(fn)
+
+    def test_run_stage_slimmed(self):
+        """run_stage body must be shorter than the old 295-line monolith."""
+        import inspect
+        from pipeline.evaluation import run_stage
+
+        src = inspect.getsource(run_stage)
+        lines = [l for l in src.splitlines() if l.strip()]
+        assert len(lines) < 90, (
+            f"run_stage is {len(lines)} non-blank lines; expected < 90 after extraction"
+        )
+
+    def test_hallucination_phase_uses_model_cache(self):
+        """_run_hallucination_phase must store nli_model in _model_cache['nli']."""
+        from unittest.mock import patch, MagicMock
+        from pipeline import evaluation as _eval
+
+        fake_hall = {"summary": {"context_grounding_rate": 0.9}}
+        fake_nli = MagicMock()
+
+        with patch.object(_eval, "evict_model_cache") as mock_evict, \
+             patch.object(_eval, "run_hallucination_eval",
+                          return_value=(fake_hall, 0.9, fake_nli)) as mock_rhe:
+            _eval._model_cache.clear()
+            hall, rate = _eval._run_hallucination_phase([], {}, "mock-model")
+
+        mock_evict.assert_called_once()
+        assert _eval._model_cache.get("nli") is fake_nli
+        assert rate == 0.9
+        assert hall is fake_hall
+
+    def test_no_run_stage_nli_attribute(self):
+        """run_stage must not cache NLI on a function attribute."""
+        from pipeline.evaluation import run_stage
+        assert not hasattr(run_stage, "_nli_model"), (
+            "run_stage._nli_model found; NLI must go through _model_cache"
+        )
+
+    def test_save_stage_results_atomic(self, tmp_path):
+        """save_stage_results must produce an intact JSON even if called twice."""
+        from pipeline.evaluation import save_stage_results
+
+        out = save_stage_results({"v": 1}, [], tmp_path / "r")
+        assert out.exists()
+        import json
+        assert json.loads(out.read_text())["v"] == 1
+        # Second call overwrites atomically — must not raise or leave .tmp files.
+        save_stage_results({"v": 2}, [], tmp_path / "r")
+        assert json.loads(out.read_text())["v"] == 2
+        assert not (tmp_path / "r" / "baseline_metrics.tmp").exists()
+
+    def test_run_llm_judge_eval_shared_sample(self):
+        """run_llm_judge_eval must call each judge function with the same query IDs."""
+        from pipeline.evaluation import run_llm_judge_eval
+
+        calls: dict[str, list] = {}
+
+        def _fake_judge(preds, base_url, model, sample_size=20, results_dir=None,
+                        query_ids=None):
+            calls[model + str(len(calls))] = [p["query_id"] for p in preds]
+            return {"score": 0.5, "per_sample": [], "parse_fail_count": 0, "sample_size": len(preds)}
+
+        qa = [_FakeQA(f"q{i}", f"Q{i}", f"A{i}", "Law") for i in range(30)]
+        preds = [
+            {
+                "query_id": qa[i].query_id,
+                "predicted": f"ans{i}",
+                "expected": qa[i].answer,
+                "retrieved_chunks": [],
+            }
+            for i in range(30)
+        ]
+
+        from unittest.mock import patch
+        with patch("evaluation.llm_judge.llm_judge_answer", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_faithfulness", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_relevancy", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_coherence", side_effect=_fake_judge):
+            run_llm_judge_eval(
+                preds, qa,
+                base_url="http://localhost:11434/v1",
+                judge_model="mock",
+                sample_size=10,
+            )
+
+        id_sets = [set(v) for v in calls.values()]
+        assert len(id_sets) == 4
+        # All four metrics must have received the same set of query IDs.
+        assert id_sets[0] == id_sets[1] == id_sets[2] == id_sets[3]
+
+    def test_run_judge_phase_samples_once_via_sample_judge_query_ids(self):
+        """_run_judge_phase must call sample_judge_query_ids once and pass
+        the returned IDs as query_ids= to run_llm_judge_eval."""
+        from pipeline import evaluation as _eval
+        from unittest.mock import patch, MagicMock, call
+        import config
+
+        sampled = [f"q{i}" for i in range(config.LLM_JUDGE_SAMPLE_SIZE)]
+        fake_stage = MagicMock()
+        fake_stage.results_dir = None
+
+        preds = [
+            {"query_id": f"q{i}", "predicted": f"a{i}",
+             "expected": f"e{i}", "retrieved_chunks": []}
+            for i in range(50)
+        ]
+        qa = [_FakeQA(f"q{i}", f"Q{i}", f"A{i}", "Law") for i in range(50)]
+
+        with patch("evaluation.llm_judge.sample_judge_query_ids",
+                   return_value=sampled) as mock_sji, \
+             patch.object(_eval, "run_llm_judge_eval",
+                          return_value={
+                              "score": 0.5, "faithfulness": 0.5,
+                              "relevancy": 0.5, "coherence": 0.5,
+                              "parse_failures": {}, "failure_count": 0,
+                              "call_count": len(sampled),
+                          }) as mock_rje:
+            _eval._run_judge_phase(preds, qa, fake_stage, "test", 0.2)
+
+        # sample_judge_query_ids called exactly once
+        mock_sji.assert_called_once()
+        # run_llm_judge_eval called with the sampled IDs
+        _, kwargs = mock_rje.call_args
+        assert kwargs.get("query_ids") == sampled
+
+    def test_retrieval_pipeline_file_no_leak(self, tmp_path):
+        """auto_build_graph must not leak a file handle (use with)."""
+        # Smoke test: call with a non-existent candidate so it exits early.
+        import config as _cfg
+        from unittest.mock import patch
+        from pipeline.retrieval import auto_build_graph
+
+        fake_path = tmp_path / "graph.json"
+        # No metadata candidates exist → function returns without opening files.
+        with patch.object(_cfg, "INDEX_DIR", tmp_path), \
+             patch.object(_cfg, "BASE_DIR", tmp_path):
+            auto_build_graph(fake_path)
+        assert not fake_path.exists()
+
+    def test_real_metadata_path_resolves(self, repo_root):
+        """results/index/metadata.jsonl is committed and resolves from repo root."""
+        meta = repo_root / "results" / "index" / "metadata.jsonl"
+        assert meta.exists(), (
+            f"metadata.jsonl not committed at {meta}; "
+            "CI will silently skip data-dependent tests without it."
+        )
+
+    def test_run_hallucination_eval_annotation_returns_three(self):
+        """run_hallucination_eval type annotation must match its 3-element return."""
+        import inspect
+        from pipeline.evaluation import run_hallucination_eval
+
+        hints = inspect.get_annotations(run_hallucination_eval, eval_str=False)
+        ret = hints.get("return")
+        # The annotation must be tuple[dict, float, Any], not the old tuple[dict, float].
+        # We check the string representation is not the old 2-arg form.
+        ret_str = str(ret)
+        assert "Any" in ret_str, (
+            f"run_hallucination_eval return annotation missing 'Any' (nli_model): {ret_str}"
+        )
+
+    def test_run_llm_judge_eval_uses_config_default(self):
+        """run_llm_judge_eval must fall back to config.LLM_JUDGE_SAMPLE_SIZE when
+        sample_size is not supplied."""
+        import config
+        from pipeline.evaluation import run_llm_judge_eval
+        from unittest.mock import patch
+
+        captured: list[int] = []
+
+        def _fake_judge(preds, base_url, model, sample_size=20, results_dir=None,
+                        query_ids=None):
+            captured.append(len(preds))
+            return {"score": 0.5, "per_sample": [], "parse_fail_count": 0, "sample_size": len(preds)}
+
+        qa = [_FakeQA(f"q{i}", f"Q{i}", f"A{i}", "Law") for i in range(50)]
+        preds = [
+            {"query_id": qa[i].query_id, "predicted": f"ans{i}",
+             "expected": qa[i].answer, "retrieved_chunks": []}
+            for i in range(50)
+        ]
+
+        with patch("evaluation.llm_judge.llm_judge_answer", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_faithfulness", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_relevancy", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_coherence", side_effect=_fake_judge):
+            # Call WITHOUT sample_size so the config default is used.
+            run_llm_judge_eval(
+                preds, qa,
+                base_url="http://localhost:11434/v1",
+                judge_model="mock",
+            )
+
+        expected_n = min(config.LLM_JUDGE_SAMPLE_SIZE, 50)
+        for n in captured:
+            assert n == expected_n, (
+                f"judge called with {n} samples; expected {expected_n} "
+                f"(config.LLM_JUDGE_SAMPLE_SIZE={config.LLM_JUDGE_SAMPLE_SIZE})"
+            )

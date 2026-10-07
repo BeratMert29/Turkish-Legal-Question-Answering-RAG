@@ -14,7 +14,7 @@ Prerequisites:
 Usage:
     python scripts/14_eval_all_stages.py                           # all available stages (CSV format)
     python scripts/14_eval_all_stages.py --stages base,rrf_rerank,llm_ft
-    python scripts/14_eval_all_stages.py --stages base --dataset hmgs
+    python scripts/14_eval_all_stages.py --stages base --eval-set hmgs
     python scripts/14_eval_all_stages.py --list-stages
     python scripts/14_eval_all_stages.py \
         --corpus /content/datasets/corpus.jsonl \
@@ -59,20 +59,23 @@ def _parse_args(argv=None):
     )
     parser.add_argument(
         "--stages",
-        default=",".join(DEFAULT_STAGE_ORDER),
+        nargs="+",
+        default=[",".join(DEFAULT_STAGE_ORDER)],
         help=(
-            f"Comma-separated stages to run. Default: all. "
+            f"Stages to run, comma- or space-separated. Default: all. "
             f"Options: {', '.join(DEFAULT_STAGE_ORDER)}"
         ),
     )
     parser.add_argument(
         "--eval-set", "--dataset",
         dest="eval_set",
-        choices=["kaggle", "hmgs"],
-        default="hmgs",
+        choices=config.EVAL_SET_CHOICES,
+        default=config.DEFAULT_EVAL_SET,
         help=(
-            "Evaluation dataset for ALL stages (default: hmgs, ~161 questions). "
-            "Use 'kaggle' for the Kaggle-split eval set (~300 questions). "
+            "Evaluation dataset for ALL stages (default: turkish_legal_rag, "
+            "~195 questions with explicit law+article gold labels). "
+            "Use 'hmgs' for the HMGS exam set (~161 questions) or 'kaggle' "
+            "for the Kaggle-split eval set (~300 questions). "
             "All stages in a single run MUST use the same eval set so that "
             "ablation comparisons are valid.  Previously, different invocations "
             "used different datasets (base/hybrid/rrf/rrf_rerank with hmgs n=161 "
@@ -118,7 +121,9 @@ def _parse_args(argv=None):
             "Mutually exclusive with --corpus."
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.stages = ",".join(args.stages)
+    return args
 
 
 def main() -> None:
@@ -152,6 +157,14 @@ def main() -> None:
             graph_path = config.INDEX_DIR / config.GRAPH_FILE
             if not graph_path.exists():
                 auto_build_graph(graph_path)
+            # Rebuild if the existing file is corrupt JSON.
+            if graph_path.exists():
+                try:
+                    with graph_path.open(encoding="utf-8") as _gf:
+                        json.load(_gf)
+                except json.JSONDecodeError:
+                    print(f"  graph.json is corrupt — rebuilding …")
+                    auto_build_graph(graph_path)
             if not graph_path.exists():
                 print(
                     f"INFO: Stage '{key}' skipped -- "
@@ -170,10 +183,36 @@ def main() -> None:
                 continue
         if stage.llm == "finetuned":
             import subprocess
-            result = subprocess.run(
-                ["ollama", "list"], capture_output=True, text=True,
+            try:
+                _ollama_result = subprocess.run(
+                    ["ollama", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except FileNotFoundError:
+                print(
+                    f"INFO: Stage '{key}' skipped -- "
+                    f"'ollama' executable not found in PATH."
+                )
+                continue
+            except subprocess.TimeoutExpired:
+                print(
+                    f"INFO: Stage '{key}' skipped -- "
+                    f"'ollama list' timed out."
+                )
+                continue
+            # Exact name match: compare first column, allowing ':latest' suffix.
+            _target = config.LLM_FINETUNED_MODEL
+            _found = any(
+                (parts := line.split()) and (
+                    parts[0] == _target
+                    or parts[0] == _target + ":latest"
+                )
+                for line in _ollama_result.stdout.splitlines()
+                if line.strip()
             )
-            if config.LLM_FINETUNED_MODEL not in result.stdout:
+            if not _found:
                 print(
                     f"INFO: Stage '{key}' skipped -- "
                     f"Ollama model '{config.LLM_FINETUNED_MODEL}' not found.\n"
@@ -219,6 +258,8 @@ def main() -> None:
         short_answer_mode = args.eval_set == "hmgs"
         if args.eval_set == "hmgs":
             qa_examples = DataProcessor.build_gold_eval_set()
+        elif args.eval_set == "turkish_legal_rag":
+            qa_examples = DataProcessor.build_turkish_legal_rag_eval_set()
         else:
             if not args.corpus:
                 pass  # processor already initialised above

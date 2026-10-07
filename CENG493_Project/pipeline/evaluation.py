@@ -7,10 +7,12 @@ loads on a CPU-only / light-deps test environment.
 
 from __future__ import annotations
 
+import gc as _gc
 import json
+import os
 import time
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     from pipeline.stages import StageConfig
@@ -19,6 +21,32 @@ if TYPE_CHECKING:  # pragma: no cover
     from retrieval.reranker import Reranker
     from retrieval.retriever import Retriever
     from retrieval.graph_index import GraphIndex
+
+
+# ---------------------------------------------------------------------------
+# Module-level model cache
+# ---------------------------------------------------------------------------
+
+#: Stores loaded heavy models (e.g. NLI cross-encoder) so they can be reused
+#: across stages without re-loading. Call :func:`evict_model_cache` to free
+#: GPU/CPU memory when switching between phases that have conflicting VRAM needs.
+_model_cache: dict[str, Any] = {}
+
+
+def evict_model_cache() -> None:
+    """Clear cached models and release GPU memory.
+
+    Call between pipeline stages to avoid having the 14B generation LLM,
+    the 70B judge, and the NLI cross-encoder all resident simultaneously.
+    """
+    _model_cache.clear()
+    _gc.collect()
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +135,16 @@ def run_generation_loop(
                 "retrieved_sources": [],
                 "expected_source": qa.source,
                 "retrieved_chunks": [],
+                "generation_error": True,
+                "error": f"{type(exc).__name__}: {exc}",
             })
 
     return predictions
+
+
+def failure_rate_exceeded(failed: int, total: int, max_rate: float) -> bool:
+    """True when failed/total is strictly greater than *max_rate*."""
+    return total > 0 and (failed / total) > max_rate
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +158,7 @@ def run_hallucination_eval(
     *,
     nli_model=None,
     llm_model: Optional[str] = None,
-) -> tuple[dict, float]:
+) -> tuple[dict, float, Any]:
     """Run hallucination analysis.
 
     Loads NLI model if *nli_model* is ``None``.  Frees VRAM from the generation
@@ -131,8 +166,8 @@ def run_hallucination_eval(
 
     Returns
     -------
-    tuple[dict, float]
-        ``(hallucination_result, faithful_rate)``
+    tuple[dict, float, Any]
+        ``(hallucination_result, faithful_rate, nli_model)``
     """
     import gc
     import torch
@@ -201,10 +236,19 @@ def run_llm_judge_eval(
     *,
     base_url: str,
     judge_model: str,
-    sample_size: int = 20,
+    sample_size: Optional[int] = None,
+    query_ids: Optional[list[str]] = None,
     results_dir: Optional[Path] = None,
 ) -> dict:
     """Run all four LLM judge metrics.
+
+    Parameters
+    ----------
+    query_ids:
+        When supplied (pre-sampled by the caller via
+        ``sample_judge_query_ids``), all four judge functions receive exactly
+        these IDs and per-function sampling is bypassed.  When ``None`` the
+        function builds a shared sample internally.
 
     Returns a dict with keys: ``score``, ``faithfulness``, ``relevancy``,
     ``coherence``, ``parse_failures``.
@@ -216,40 +260,72 @@ def run_llm_judge_eval(
         llm_judge_coherence,
     )
 
+    import config as _config
+    import random as _random_mod
+
+    if sample_size is None:
+        sample_size = _config.LLM_JUDGE_SAMPLE_SIZE
+
     result: dict = {
         "score": None,
         "faithfulness": None,
         "relevancy": None,
         "coherence": None,
         "parse_failures": None,
+        "failure_count": 0,
+        "call_count": 0,
     }
 
+    # O(Q) dict lookup instead of O(P*Q) next() scan.
+    _qa_question_map: dict[str, str] = {
+        qa.query_id: qa.question for qa in qa_examples
+    }
     judge_preds = [
-        {
-            **p,
-            "question": next(
-                (qa.question for qa in qa_examples if qa.query_id == p["query_id"]),
-                p.get("query_id", ""),
-            ),
-        }
+        {**p, "question": _qa_question_map.get(p["query_id"], p.get("query_id", ""))}
         for p in predictions
     ]
 
+    # Shared sample: either use caller-supplied query_ids or build internally.
+    # All four judge metrics must evaluate the same subset so cross-metric
+    # comparisons are valid.
+    if query_ids is not None:
+        _shared_ids: set[str] = set(query_ids)
+        _shared_preds = [p for p in predictions if p["query_id"] in _shared_ids]
+        _shared_judge_preds = [p for p in judge_preds if p["query_id"] in _shared_ids]
+    else:
+        _rng = _random_mod.Random(42)
+        _n = min(sample_size, len(predictions))
+        if len(predictions) > _n:
+            _built_ids: set[str] = set(
+                _rng.sample([p["query_id"] for p in predictions], _n)
+            )
+            _shared_preds = [p for p in predictions if p["query_id"] in _built_ids]
+            _shared_judge_preds = [
+                p for p in judge_preds if p["query_id"] in _built_ids
+            ]
+        else:
+            _shared_preds = predictions
+            _shared_judge_preds = judge_preds
+    _actual_n = len(_shared_preds)
+    # When caller supplied query_ids, pass them through so the judge functions
+    # skip their own per-function sampling entirely.
+    _qids_arg = list(query_ids) if query_ids is not None else None
+
     judge_result = llm_judge_answer(
-        judge_preds, base_url, judge_model,
-        sample_size=sample_size, results_dir=results_dir,
+        _shared_judge_preds, base_url, judge_model,
+        sample_size=_actual_n, results_dir=results_dir, query_ids=_qids_arg,
     )
     faith_result = llm_judge_faithfulness(
-        predictions, base_url, judge_model,
-        sample_size=sample_size, results_dir=results_dir,
+        _shared_preds, base_url, judge_model,
+        sample_size=_actual_n, results_dir=results_dir, query_ids=_qids_arg,
     )
     relev_result = llm_judge_relevancy(
-        judge_preds, base_url, judge_model,
-        sample_size=sample_size, results_dir=results_dir,
+        _shared_judge_preds, base_url, judge_model,
+        sample_size=_actual_n, results_dir=results_dir, query_ids=_qids_arg,
     )
     coher_result = llm_judge_coherence(
-        predictions, base_url, judge_model,
-        sample_size=sample_size, results_dir=results_dir,
+        _shared_preds, base_url, judge_model,
+        sample_size=_actual_n, results_dir=results_dir, query_ids=_qids_arg,
     )
 
     result["score"] = judge_result["score"]
@@ -262,6 +338,10 @@ def run_llm_judge_eval(
         "relevancy": relev_result.get("parse_fail_count", 0),
         "coherence": coher_result.get("parse_fail_count", 0),
     }
+
+    _all = (judge_result, faith_result, relev_result, coher_result)
+    result["failure_count"] = sum(r.get("parse_fail_count", 0) for r in _all)
+    result["call_count"] = sum(r.get("sample_size", 0) for r in _all)
 
     _fmt = lambda v: f"{v:.4f}" if v is not None else "N/A"
     print(
@@ -299,49 +379,43 @@ def save_stage_results(
     results_dir.mkdir(parents=True, exist_ok=True)
 
     out_path = results_dir / "baseline_metrics.json"
-    with open(out_path, "w", encoding="utf-8") as f:
+    _tmp_out = out_path.with_suffix(".tmp")
+    with open(_tmp_out, "w", encoding="utf-8") as f:
         json.dump(final, f, ensure_ascii=False, indent=2)
+    os.replace(_tmp_out, out_path)
 
     pred_path = results_dir / "predictions.jsonl"
-    with open(pred_path, "w", encoding="utf-8") as f:
+    _tmp_pred = pred_path.with_suffix(".tmp")
+    with open(_tmp_pred, "w", encoding="utf-8") as f:
         for p in predictions:
             f.write(json.dumps(p, ensure_ascii=False) + "\n")
+    os.replace(_tmp_pred, pred_path)
 
     return out_path
 
 
 # ---------------------------------------------------------------------------
-# run_stage -- full single-stage orchestration (used by 14_eval_all_stages)
+# run_stage helpers
 # ---------------------------------------------------------------------------
 
-def run_stage(
-    stage_key: str,
+def _build_stage_components(
     stage: "StageConfig",
-    qa_examples,
     corpus_chunks,
-    *,
     embedder_cache: dict,
     retriever_cache: dict,
     bm25_cache: dict,
     reranker_cache: dict,
-    relevant_map: dict,
-    short_answer_mode: bool,
-    eval_set_name: str = "hmgs",
-    labeling_coverage: Optional[dict] = None,
-) -> dict:
-    """Run a single ablation stage end-to-end.
+) -> tuple:
+    """Load/retrieve embedder, FAISS index, BM25, reranker, graph index, and LLM.
 
-    Returns the final_results dict (same JSON schema as run_baseline).
+    Returns
+    -------
+    tuple
+        ``(embedder, retriever, bm25, reranker, graph_index, llm_model)``
     """
     import config
-    from pipeline.retrieval import retrieve
-    from utils import inject_citations as _inject_citations
 
-    print(f"\n{'━' * 66}")
-    print(f"  {stage.name}")
-    print(f"{'━' * 66}")
-
-    # -- Embedding model ---------------------------------------------------
+    # Embedding model
     emb_key = stage.embedding
     if emb_key not in embedder_cache:
         from retrieval.embedder import Embedder
@@ -359,10 +433,9 @@ def run_stage(
         )
         emb.load_model()
         embedder_cache[emb_key] = emb
-
     embedder = embedder_cache[emb_key]
 
-    # -- FAISS index (rebuild when embedding changes) ----------------------
+    # FAISS index (rebuild when embedding changes)
     idx_key = emb_key
     if idx_key not in retriever_cache:
         from retrieval.retriever import Retriever as _Retriever
@@ -379,13 +452,11 @@ def run_stage(
         _ret.build_index(texts, metadata)
         print(f"    Index built in {time.time() - t0:.1f}s")
         retriever_cache[idx_key] = _ret
-
     retriever = retriever_cache[idx_key]
 
-    # -- BM25 index --------------------------------------------------------
-    needs_bm25 = stage.retrieval in ("hybrid", "rrf")
+    # BM25 index
     bm25 = None
-    if needs_bm25:
+    if stage.retrieval in ("hybrid", "rrf"):
         if "bm25" not in bm25_cache:
             from retrieval.bm25_retriever import BM25Index
 
@@ -396,7 +467,7 @@ def run_stage(
             bm25_cache["bm25"] = b
         bm25 = bm25_cache["bm25"]
 
-    # -- Reranker ----------------------------------------------------------
+    # Reranker
     reranker = None
     if stage.use_rerank:
         if "reranker" not in reranker_cache:
@@ -408,7 +479,7 @@ def run_stage(
             reranker_cache["reranker"] = r
         reranker = reranker_cache["reranker"]
 
-    # -- Graph index -------------------------------------------------------
+    # Graph index — validate JSON before loading; rebuild if corrupt
     graph_index = None
     if stage.use_graph:
         if "graph_index" not in reranker_cache:
@@ -422,22 +493,113 @@ def run_stage(
                     / config.METADATA_FILE
                 )
             if graph_path.exists() and meta_path.exists():
-                print(f"  Loading graph index: {graph_path}")
-                reranker_cache["graph_index"] = GraphIndex(
-                    graph_path, meta_path,
-                )
+                try:
+                    with open(graph_path, encoding="utf-8") as _gf:
+                        json.load(_gf)
+                except (json.JSONDecodeError, OSError):
+                    print(f"  WARNING: graph.json corrupt at {graph_path}; rebuilding …")
+                    from pipeline.retrieval import auto_build_graph
+                    auto_build_graph(graph_path)
+                if graph_path.exists():
+                    print(f"  Loading graph index: {graph_path}")
+                    reranker_cache["graph_index"] = GraphIndex(graph_path, meta_path)
             else:
                 print(f"  WARNING: graph.json not found at {graph_path}")
         graph_index = reranker_cache.get("graph_index")
 
-    # -- LLM selection -----------------------------------------------------
     llm_model = (
         config.LLM_FINETUNED_MODEL
         if stage.llm == "finetuned"
         else config.LLM_MODEL
     )
 
-    # -- Retrieval ---------------------------------------------------------
+    return embedder, retriever, bm25, reranker, graph_index, llm_model
+
+
+def _run_generation_and_qa(
+    stage_key: str,
+    stage: "StageConfig",
+    qa_examples,
+    retrieved_all: list[list[dict]],
+    retriever,
+    llm_model: str,
+    short_answer_mode: bool,
+    inject_citations_fn,
+    max_failure_rate: float,
+) -> tuple[list[dict], int, int, int, bool, dict]:
+    """Run generation loop, failure filtering, and QA metrics.
+
+    Returns
+    -------
+    tuple
+        ``(predictions, n_total, n_failed, n_errors, generation_failed, qa_metrics)``
+    """
+    import config
+    from generation.rag_pipeline import RAGPipeline
+    from evaluation.qa_metrics import compute_all_qa_metrics_with_citation
+
+    max_tokens = (
+        config.LLM_FINETUNED_MAX_TOKENS
+        if stage.llm == "finetuned"
+        else config.LLM_MAX_TOKENS
+    )
+    pipeline = RAGPipeline(
+        retriever,
+        model=llm_model,
+        max_tokens=max_tokens,
+        short_answer_mode=short_answer_mode,
+    )
+    predictions = run_generation_loop(
+        pipeline, qa_examples, retrieved_all,
+        stage_key=stage_key, inject_citations_fn=inject_citations_fn,
+    )
+
+    n_total = len(predictions)
+    failed = [p for p in predictions if not p.get("predicted")]
+    n_errors = sum(1 for p in predictions if p.get("generation_error"))
+    predictions = [p for p in predictions if p.get("predicted")]
+    if failed:
+        print(f"    Filtered {len(failed)} failed generation(s) from QA metrics.")
+
+    gen_failed = failure_rate_exceeded(len(failed), n_total, max_failure_rate)
+    if gen_failed:
+        print(
+            f"    !!! WARNING: {len(failed)}/{n_total} generations failed "
+            f"(> {max_failure_rate:.0%}); stage {stage_key} marked FAILED !!!"
+        )
+
+    qa_metrics = compute_all_qa_metrics_with_citation(predictions)
+    print(
+        f"    F1={qa_metrics.get('f1', 0):.4f}  "
+        f"ROUGE-L={qa_metrics.get('rouge_l', 0):.4f}  "
+        f"Citation={qa_metrics.get('citation_accuracy', 0):.4f}"
+    )
+    return predictions, n_total, len(failed), n_errors, gen_failed, qa_metrics
+
+
+# ---------------------------------------------------------------------------
+# run_stage phase helpers
+# ---------------------------------------------------------------------------
+
+def _run_retrieval_phase(
+    stage: "StageConfig",
+    qa_examples,
+    retriever,
+    bm25,
+    reranker,
+    graph_index,
+    relevant_map: dict,
+) -> tuple[list[list[dict]], dict, dict, dict[str, list]]:
+    """Run retrieval and compute retrieval + source-hit metrics.
+
+    Returns
+    -------
+    tuple
+        ``(retrieved_all, retrieval_metrics, source_metrics, full_retrieved)``
+    """
+    from pipeline.retrieval import retrieve
+    from evaluation.retrieval_metrics import compute_all_metrics, compute_source_hit_metrics
+
     print(
         f"  Retrieval ({stage.retrieval}, rerank={stage.use_rerank}, "
         f"graph={stage.use_graph}) …"
@@ -449,9 +611,6 @@ def run_stage(
         bm25=bm25, reranker=reranker, graph_index=graph_index,
         use_rerank=stage.use_rerank, use_graph=stage.use_graph,
     )
-
-    # -- Retrieval metrics -------------------------------------------------
-    from evaluation.retrieval_metrics import compute_all_metrics, compute_source_hit_metrics
 
     metric_input, full_retrieved = prepare_metric_input(
         qa_examples, retrieved_all, relevant_map,
@@ -475,44 +634,22 @@ def run_stage(
         f"MRR={retrieval_metrics.get('mrr', 0):.4f}  "
         f"nDCG@10={retrieval_metrics.get('ndcg_at_10', 0):.4f}"
     )
+    return retrieved_all, retrieval_metrics, source_metrics, full_retrieved
 
-    # -- Generation --------------------------------------------------------
-    print(f"  Generation with {llm_model} …")
-    from generation.rag_pipeline import RAGPipeline
 
-    max_tokens = (
-        config.LLM_FINETUNED_MAX_TOKENS
-        if stage.llm == "finetuned"
-        else config.LLM_MAX_TOKENS
-    )
-    pipeline = RAGPipeline(
-        retriever,
-        model=llm_model,
-        max_tokens=max_tokens,
-        short_answer_mode=short_answer_mode,
-    )
+def _run_supplemental_metrics(
+    predictions: list[dict],
+    llm_model: str,
+) -> tuple[Optional[float], dict]:
+    """Compute perplexity and RAGAS scores.
 
-    _inject_fn = _inject_citations if stage.inject_citations else None
-    predictions = run_generation_loop(
-        pipeline, qa_examples, retrieved_all,
-        stage_key=stage_key, inject_citations_fn=_inject_fn,
-    )
+    Returns
+    -------
+    tuple[Optional[float], dict]
+        ``(perplexity_score, ragas_scores)``
+    """
+    import config as _config
 
-    failed = [p for p in predictions if not p.get("predicted")]
-    predictions = [p for p in predictions if p.get("predicted")]
-    if failed:
-        print(f"    Filtered {len(failed)} failed generation(s) from QA metrics.")
-
-    from evaluation.qa_metrics import compute_all_qa_metrics_with_citation
-
-    qa_metrics = compute_all_qa_metrics_with_citation(predictions)
-    print(
-        f"    F1={qa_metrics.get('f1', 0):.4f}  "
-        f"ROUGE-L={qa_metrics.get('rouge_l', 0):.4f}  "
-        f"Citation={qa_metrics.get('citation_accuracy', 0):.4f}"
-    )
-
-    # -- Perplexity --------------------------------------------------------
     print("  Perplexity …")
     perplexity_score = None
     try:
@@ -520,7 +657,7 @@ def run_stage(
 
         perplexity_score = compute_perplexity(
             predictions, model=llm_model,
-            hf_model_id=config.HF_PERPLEXITY_MODEL,
+            hf_model_id=_config.HF_PERPLEXITY_MODEL,
         )
     except Exception as exc:
         print(f"    Perplexity=N/A ({exc.__class__.__name__}: {exc})")
@@ -530,7 +667,6 @@ def run_stage(
         else:
             print("    Perplexity=N/A (logprobs not supported)")
 
-    # -- RAGAS -------------------------------------------------------------
     print("  RAGAS metrics …")
     from evaluation.ragas_metrics import compute_ragas_metrics
 
@@ -545,64 +681,173 @@ def run_stage(
     else:
         print("    RAGAS=N/A (install: pip install ragas langchain-ollama)")
 
-    # -- Hallucination -----------------------------------------------------
+    return perplexity_score, ragas_scores
+
+
+def _run_hallucination_phase(
+    predictions: list[dict],
+    full_retrieved: dict[str, list],
+    llm_model: str,
+) -> tuple[dict, float]:
+    """Evict perplexity/RAGAS models, run hallucination analysis, update NLI cache.
+
+    The NLI cross-encoder is stored in and retrieved from the module-level
+    ``_model_cache`` so it is reused across consecutive stages.
+
+    Returns
+    -------
+    tuple[dict, float]
+        ``(hallucination_result, faithful_rate)``
+    """
+    import config as _config
+
+    # Evict perplexity/RAGAS models before loading the NLI cross-encoder.
+    evict_model_cache()
+
     print("  Hallucination analysis …")
     hall, faithful_rate, nli_model = run_hallucination_eval(
         predictions, full_retrieved,
-        config.HALLUCINATION_SAMPLE_SIZE,
-        nli_model=getattr(run_stage, "_nli_model", None),
+        _config.HALLUCINATION_SAMPLE_SIZE,
+        nli_model=_model_cache.get("nli"),
         llm_model=llm_model,
     )
-    run_stage._nli_model = nli_model  # reuse across stages
+    _model_cache["nli"] = nli_model  # reuse across stages
     print(f"    Faithfulness={faithful_rate:.4f}")
+    return hall, faithful_rate
 
-    # -- LLM Judge ---------------------------------------------------------
-    print(f"  LLM Judge (sample={min(20, len(predictions))}) …")
-    llm_judge_score = None
-    llm_relevancy_score = None
-    llm_coherence_score = None
-    llm_faithfulness_score = None
-    llm_judge_parse_failures: Optional[dict] = None
+
+def _run_judge_phase(
+    predictions: list[dict],
+    qa_examples,
+    stage: "StageConfig",
+    stage_key: str,
+    max_rate: float,
+) -> dict:
+    """Run all four LLM judge metrics with error/failure handling.
+
+    Returns
+    -------
+    dict
+        Keys: ``score``, ``faithfulness``, ``relevancy``, ``coherence``,
+        ``parse_failures``, ``failure_count``, ``call_count``,
+        ``crashed``, ``failed``.
+    """
+    import config as _config
+    from evaluation.llm_judge import sample_judge_query_ids
+
+    _judge_sample = _config.LLM_JUDGE_SAMPLE_SIZE
+    # Sample ONCE here; all four judge functions receive the same IDs so every
+    # metric evaluates the identical subset — enabling valid cross-metric comparison.
+    _sampled_ids = sample_judge_query_ids(
+        [p["query_id"] for p in predictions],
+        n=_judge_sample,
+    )
+    print(f"  LLM Judge (sample={len(_sampled_ids)}) …")
+
+    score = faithfulness = relevancy = coherence = None
+    parse_failures: Optional[dict] = None
+    failure_count = 0
+    call_count = 0
+    crashed = False
 
     try:
-        _judge_sample = getattr(config, "LLM_JUDGE_SAMPLE_SIZE", 20)
-        judge = run_llm_judge_eval(
+        j = run_llm_judge_eval(
             predictions, qa_examples,
-            base_url=config.LLM_BASE_URL,
-            judge_model=config.LLM_JUDGE_MODEL,
+            base_url=_config.LLM_BASE_URL,
+            judge_model=_config.LLM_JUDGE_MODEL,
             sample_size=_judge_sample,
+            query_ids=_sampled_ids,
             results_dir=stage.results_dir,
         )
-        llm_judge_score = judge["score"]
-        llm_faithfulness_score = judge["faithfulness"]
-        llm_relevancy_score = judge["relevancy"]
-        llm_coherence_score = judge["coherence"]
-        llm_judge_parse_failures = judge["parse_failures"]
+        score = j["score"]
+        faithfulness = j["faithfulness"]
+        relevancy = j["relevancy"]
+        coherence = j["coherence"]
+        parse_failures = j["parse_failures"]
+        failure_count = j["failure_count"]
+        call_count = j["call_count"]
     except Exception as exc:
+        crashed = True
         print(f"    WARNING: LLM Judge failed: {exc}")
 
-    # -- Semantic Similarity -----------------------------------------------
+    failed = crashed or failure_rate_exceeded(failure_count, call_count, max_rate)
+    if failed:
+        print(
+            f"    !!! WARNING: LLM judge failures {failure_count}/{call_count}"
+            f"{' (judge crashed)' if crashed else ''} exceed {max_rate:.0%}; "
+            f"stage {stage_key} marked FAILED !!!"
+        )
+
+    return {
+        "score": score,
+        "faithfulness": faithfulness,
+        "relevancy": relevancy,
+        "coherence": coherence,
+        "parse_failures": parse_failures,
+        "failure_count": failure_count,
+        "call_count": call_count,
+        "crashed": crashed,
+        "failed": failed,
+    }
+
+
+def _run_semantic_sim_phase(predictions: list[dict]) -> Optional[float]:
+    """Compute mean semantic similarity between predicted and expected answers.
+
+    Returns ``None`` on failure (non-fatal; recorded as null in results).
+    """
     print("  Semantic similarity …")
-    sem_sim = 0.0
     try:
         from evaluation.semantic_similarity import compute_semantic_similarity
 
         sem_result = compute_semantic_similarity(predictions)
         sem_sim = sem_result["mean_similarity"]
         print(f"    SemanticSim={sem_sim:.4f}")
+        return sem_sim
     except Exception as exc:
-        print(f"    WARNING: Semantic similarity failed: {exc}")
+        print(f"    WARNING: Semantic similarity failed (recorded as null): {exc}")
+        return None
 
-    # -- Final Scenario Scores ---------------------------------------------
+
+def _assemble_final_result(
+    stage_key: str,
+    stage: "StageConfig",
+    eval_set_name: str,
+    qa_examples,
+    llm_model: str,
+    labeling_coverage: Optional[dict],
+    retrieval_metrics: dict,
+    source_metrics: dict,
+    qa_metrics: dict,
+    hall: dict,
+    faithful_rate: float,
+    judge: dict,
+    sem_sim: Optional[float],
+    perplexity_score: Optional[float],
+    ragas_scores: dict,
+    n_generated_total: int,
+    n_generation_failed: int,
+    n_generation_errors: int,
+    generation_failed: bool,
+    max_rate: float,
+) -> dict:
+    """Build the final results dict and print scenario scores.
+
+    Returns
+    -------
+    dict
+        Full results dict matching the run_baseline JSON schema.
+    """
+    import config as _config
     from evaluation.final_score import compute_all_scenario_scores
 
     llm_scores_dict: dict = {}
-    if llm_faithfulness_score is not None:
-        llm_scores_dict["faithfulness"] = llm_faithfulness_score
-    if llm_relevancy_score is not None:
-        llm_scores_dict["relevancy"] = llm_relevancy_score
-    if llm_coherence_score is not None:
-        llm_scores_dict["coherence"] = llm_coherence_score
+    if judge["faithfulness"] is not None:
+        llm_scores_dict["faithfulness"] = judge["faithfulness"]
+    if judge["relevancy"] is not None:
+        llm_scores_dict["relevancy"] = judge["relevancy"]
+    if judge["coherence"] is not None:
+        llm_scores_dict["coherence"] = judge["coherence"]
 
     scenario_scores = compute_all_scenario_scores(
         retrieval_metrics=retrieval_metrics,
@@ -617,35 +862,47 @@ def run_stage(
         f"Scenario3={scenario_scores['scenario3']:.4f}"
     )
 
-    # -- Assemble & save ---------------------------------------------------
-    final = {
+    return {
+        "status": "failed" if (generation_failed or judge["failed"]) else "ok",
+        "failure_counts": {
+            "generation_total": n_generated_total,
+            "generation_failed": n_generation_failed,
+            "generation_errors": n_generation_errors,
+            "judge_calls": judge["call_count"],
+            "judge_failed": judge["failure_count"],
+            "judge_crashed": judge["crashed"],
+            "semantic_similarity_failed": sem_sim is None,
+            "max_failure_rate": max_rate,
+        },
         "hyperparameters": {
             "stage": stage_key,
             "stage_name": stage.name,
             "eval_set": eval_set_name,
             "eval_n": len(qa_examples),
             "embedding_model": (
-                config.FINETUNED_EMBEDDING_MODEL
+                _config.FINETUNED_EMBEDDING_MODEL
                 if stage.embedding == "finetuned"
-                else config.EMBEDDING_MODEL
+                else _config.EMBEDDING_MODEL
             ),
             "retrieval_mode": (
                 stage.retrieval + ("_rerank" if stage.use_rerank else "")
             ),
             "llm_model": llm_model,
             "inject_citations": stage.inject_citations,
-            "chunk_size": config.CHUNK_SIZE,
-            "chunk_overlap": config.CHUNK_OVERLAP,
-            "top_k_retrieval": config.TOP_K_RETRIEVAL,
-            "top_k_for_generation": config.TOP_K_FOR_GENERATION,
+            "chunk_size": _config.CHUNK_SIZE,
+            "chunk_overlap": _config.CHUNK_OVERLAP,
+            "top_k_retrieval": _config.TOP_K_RETRIEVAL,
+            "top_k_for_generation": _config.TOP_K_FOR_GENERATION,
         },
         "headline_metrics": {
+            "headline_mode": headline_mode(
+                (labeling_coverage or {}).get("labeled", 0),
+                (labeling_coverage or {}).get("total", 0),
+            ),
             "source_hit_at_5": source_metrics.get("source_hit_at_5_all"),
             "source_hit_at_10": source_metrics.get("source_hit_at_10_all"),
             "source_mrr": source_metrics.get("source_mrr_all"),
-            "source_precision_at_5": source_metrics.get(
-                "source_precision_at_5_all",
-            ),
+            "source_precision_at_5": source_metrics.get("source_precision_at_5_all"),
             "n_source_queries": source_metrics.get("source_labeled_queries"),
             "chunk_recall_at_5_gold_only": retrieval_metrics.get("recall_at_5"),
             "chunk_mrr_gold_only": retrieval_metrics.get("mrr"),
@@ -658,11 +915,11 @@ def run_stage(
         "qa_metrics": qa_metrics,
         "hallucination_summary": hall.get("summary", {}),
         "faithfulness_rate": faithful_rate,
-        "llm_judge_score": llm_judge_score,
-        "llm_faithfulness_score": llm_faithfulness_score,
-        "llm_relevancy_score": llm_relevancy_score,
-        "llm_coherence_score": llm_coherence_score,
-        "llm_judge_parse_failures": llm_judge_parse_failures,
+        "llm_judge_score": judge["score"],
+        "llm_faithfulness_score": judge["faithfulness"],
+        "llm_relevancy_score": judge["relevancy"],
+        "llm_coherence_score": judge["coherence"],
+        "llm_judge_parse_failures": judge["parse_failures"],
         "semantic_similarity": sem_sim,
         "scenario1_score": scenario_scores["scenario1"],
         "scenario2_score": scenario_scores["scenario2"],
@@ -670,6 +927,98 @@ def run_stage(
         "perplexity": perplexity_score,
         "ragas_scores": ragas_scores or {},
     }
+
+
+# ---------------------------------------------------------------------------
+# run_stage -- full single-stage orchestration (used by 14_eval_all_stages)
+# ---------------------------------------------------------------------------
+
+def run_stage(
+    stage_key: str,
+    stage: "StageConfig",
+    qa_examples,
+    corpus_chunks,
+    *,
+    embedder_cache: dict,
+    retriever_cache: dict,
+    bm25_cache: dict,
+    reranker_cache: dict,
+    relevant_map: dict,
+    short_answer_mode: bool,
+    eval_set_name: str = "turkish_legal_rag",
+    labeling_coverage: Optional[dict] = None,
+) -> dict:
+    """Run a single ablation stage end-to-end.
+
+    Returns the final_results dict (same JSON schema as run_baseline).
+    """
+    import config
+    from utils import inject_citations as _inject_citations
+
+    print(f"\n{'━' * 66}")
+    print(f"  {stage.name}")
+    print(f"{'━' * 66}")
+
+    # -- Infrastructure (embedder, FAISS, BM25, reranker, graph, LLM) ------
+    _embedder, retriever, bm25, reranker, graph_index, llm_model = (
+        _build_stage_components(
+            stage, corpus_chunks,
+            embedder_cache, retriever_cache, bm25_cache, reranker_cache,
+        )
+    )
+
+    # -- Retrieval + retrieval metrics -------------------------------------
+    retrieved_all, retrieval_metrics, source_metrics, full_retrieved = (
+        _run_retrieval_phase(
+            stage, qa_examples, retriever, bm25, reranker, graph_index,
+            relevant_map,
+        )
+    )
+
+    # -- Generation + QA metrics -------------------------------------------
+    print(f"  Generation with {llm_model} …")
+    _inject_fn = _inject_citations if stage.inject_citations else None
+    _max_rate = config.MAX_FAILURE_RATE
+    (
+        predictions,
+        n_generated_total,
+        n_generation_failed,
+        n_generation_errors,
+        generation_failed,
+        qa_metrics,
+    ) = _run_generation_and_qa(
+        stage_key, stage, qa_examples, retrieved_all,
+        retriever, llm_model, short_answer_mode,
+        _inject_fn, _max_rate,
+    )
+
+    # -- Perplexity + RAGAS ------------------------------------------------
+    perplexity_score, ragas_scores = _run_supplemental_metrics(
+        predictions, llm_model,
+    )
+
+    # -- Hallucination -----------------------------------------------------
+    hall, faithful_rate = _run_hallucination_phase(
+        predictions, full_retrieved, llm_model,
+    )
+
+    # -- LLM Judge ---------------------------------------------------------
+    judge = _run_judge_phase(
+        predictions, qa_examples, stage, stage_key, _max_rate,
+    )
+
+    # -- Semantic Similarity -----------------------------------------------
+    sem_sim = _run_semantic_sim_phase(predictions)
+
+    # -- Assemble, score & save --------------------------------------------
+    final = _assemble_final_result(
+        stage_key, stage, eval_set_name, qa_examples, llm_model,
+        labeling_coverage, retrieval_metrics, source_metrics, qa_metrics,
+        hall, faithful_rate, judge, sem_sim,
+        perplexity_score, ragas_scores,
+        n_generated_total, n_generation_failed, n_generation_errors,
+        generation_failed, _max_rate,
+    )
 
     out_path = save_stage_results(final, predictions, stage.results_dir)
     print(f"  ✓ Results → {out_path}")
@@ -680,14 +1029,32 @@ def run_stage(
 # Ablation table
 # ---------------------------------------------------------------------------
 
+def headline_mode(n_labeled: int, n_total: int,
+                  min_fraction: Optional[float] = None) -> str:
+    """Pick the headline retrieval view from the gold-labeled fraction.
+
+    Returns ``"chunk"`` (recall/MRR/nDCG are the headline) when at least
+    ``min_fraction`` of the queries have gold chunk labels, else ``"source"``
+    (source-hit stays the headline).  Independent of the eval-set name.
+    """
+    from config import HEADLINE_CHUNK_MIN_LABELED_FRACTION
+    if min_fraction is None:
+        min_fraction = HEADLINE_CHUNK_MIN_LABELED_FRACTION
+    if not n_total:
+        return "source"
+    return "chunk" if n_labeled / n_total >= min_fraction else "source"
+
+
 def print_ablation_table(
     results: dict[str, dict],
     stage_order: Optional[list[str]] = None,
 ) -> None:
     """Print two markdown-style ablation tables to stdout.
 
-    Table 1 (PRIMARY) -- source-level retrieval + QA + judge.
-    Table 2 (SECONDARY) -- chunk-level recall/MRR/NDCG (gold-labeled subset).
+    The PRIMARY table leads with chunk-level recall/MRR/nDCG when at least
+    ``config.HEADLINE_CHUNK_MIN_LABELED_FRACTION`` of the queries have gold
+    chunk labels (see :func:`headline_mode`), otherwise with source-hit.
+    The SECONDARY table carries whichever retrieval view is not the headline.
     """
     if stage_order is None:
         from pipeline.stages import DEFAULT_STAGE_ORDER
@@ -699,11 +1066,51 @@ def print_ablation_table(
     def _f4(v) -> str:
         return f"{v:.4f}" if isinstance(v, (int, float)) else "N/A"
 
+    def _src_cells(r) -> list:
+        sm = r.get("source_hit_metrics", r.get("headline_metrics", {}))
+        n = sm.get("source_labeled_queries", sm.get("n_source_queries", "?"))
+        return [
+            _f4(sm.get("source_hit_at_5_all", sm.get("source_hit_at_5"))),
+            _f4(sm.get("source_hit_at_10_all", sm.get("source_hit_at_10"))),
+            _f4(sm.get("source_mrr_all", sm.get("source_mrr"))),
+            _f4(sm.get("source_precision_at_5_all", sm.get("source_precision_at_5"))),
+            str(n),
+        ]
+
+    def _chunk_cells(r) -> list:
+        ret = r.get("retrieval_metrics", {})
+        return [
+            _f4(ret.get("recall_at_5")), _f4(ret.get("recall_at_10")),
+            _f4(ret.get("mrr")), _f4(ret.get("ndcg_at_10")),
+            str(ret.get("num_queries", "?")),
+        ]
+
+    src_hdr = ["SrcHit@5", "SrcHit@10", "SrcMRR", "SrcPrec@5", "n_src"]
+    chunk_hdr = ["R@5", "R@10", "MRR", "nDCG@10", "n_gold"]
+
+    mode = "source"
+    for stage_key in stage_order:
+        cov = (results.get(stage_key) or {}).get("labeling_coverage")
+        if cov:
+            mode = headline_mode(cov.get("labeled", 0), cov.get("total", 0))
+            break
+    if mode == "chunk":
+        head_hdr, head_cells = chunk_hdr, _chunk_cells
+        side_hdr, side_cells = src_hdr, _src_cells
+        head_title = "chunk-level retrieval — gold-labeled queries"
+        side_title = "source-level — all queries with known law"
+    else:
+        head_hdr, head_cells = src_hdr, _src_cells
+        side_hdr, side_cells = chunk_hdr, _chunk_cells
+        head_title = "source-level retrieval — all queries with known law"
+        side_title = ("chunk-level — gold-labeled subset only; "
+                      "n_gold may be small for HMGS")
+
     # -- Table 1: PRIMARY --------------------------------------------------
     h1 = (
-        f"| {'Stage':<26} | {'SrcHit@5':>8} | {'SrcHit@10':>9} | "
-        f"{'SrcMRR':>7} | {'SrcPrec@5':>9} | {'n_src':>6} | "
-        f"{'F1':>6} | {'Contain':>7} | {'ROUGE-L':>7} | {'Citation':>8} | "
+        f"| {'Stage':<26} | "
+        + " | ".join(f"{h:>{w}}" for h, w in zip(head_hdr, [8, 9, 7, 9, 6]))
+        + f" | {'F1':>6} | {'Contain':>7} | {'ROUGE-L':>7} | {'Citation':>8} | "
         f"{'Faith.':>7} | {'LLM-J':>6} | {'SemSim':>7} |"
     )
     sep1 = "|" + "|".join(
@@ -711,8 +1118,7 @@ def print_ablation_table(
     ) + "|"
 
     print("\n\n" + "=" * 140)
-    print("  PRIMARY ABLATION TABLE  "
-          "(source-level retrieval — all queries with known law)")
+    print(f"  PRIMARY ABLATION TABLE  ({head_title})")
     print("=" * 140)
     print(h1)
     print(sep1)
@@ -721,19 +1127,13 @@ def print_ablation_table(
         if stage_key not in results:
             continue
         r = results[stage_key]
-        sm = r.get("source_hit_metrics", r.get("headline_metrics", {}))
         qa = r.get("qa_metrics", {})
         stage_name = r.get("hyperparameters", {}).get("stage_name", stage_key)
-        n_src = sm.get(
-            "source_labeled_queries", sm.get("n_source_queries", "?"),
+        cells = " | ".join(
+            f"{c:>{w}}" for c, w in zip(head_cells(r), [8, 9, 7, 9, 6])
         )
         print(
-            f"| {stage_name:<26} | "
-            f"{_f4(sm.get('source_hit_at_5_all', sm.get('source_hit_at_5'))):>8} | "
-            f"{_f4(sm.get('source_hit_at_10_all', sm.get('source_hit_at_10'))):>9} | "
-            f"{_f4(sm.get('source_mrr_all', sm.get('source_mrr'))):>7} | "
-            f"{_f4(sm.get('source_precision_at_5_all', sm.get('source_precision_at_5'))):>9} | "
-            f"{str(n_src):>6} | "
+            f"| {stage_name:<26} | {cells} | "
             f"{_pct(qa.get('f1')):>6} | "
             f"{_pct(qa.get('answer_containment')):>7} | "
             f"{_pct(qa.get('rouge_l')):>7} | "
@@ -746,18 +1146,16 @@ def print_ablation_table(
 
     # -- Table 2: SECONDARY ------------------------------------------------
     h2 = (
-        f"| {'Stage':<26} | {'R@5':>6} | {'R@10':>6} | {'MRR':>6} | "
-        f"{'nDCG@10':>7} | {'n_gold':>7} | "
-        f"{'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
+        f"| {'Stage':<26} | "
+        + " | ".join(f"{h:>{w}}" for h, w in zip(side_hdr, [9, 9, 7, 9, 7]))
+        + f" | {'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
     )
     sep2 = "|" + "|".join(
-        ["-" * w for w in [28, 8, 8, 8, 9, 9, 9, 9, 9]]
+        ["-" * w for w in [28, 11, 11, 9, 11, 9, 9, 9, 9]]
     ) + "|"
 
     print("=" * 100)
-    print("  SECONDARY TABLE  "
-          "(chunk-level — gold-labeled subset only; "
-          "n_gold may be small for HMGS)")
+    print(f"  SECONDARY TABLE  ({side_title})")
     print("=" * 100)
     print(h2)
     print(sep2)
@@ -766,16 +1164,12 @@ def print_ablation_table(
         if stage_key not in results:
             continue
         r = results[stage_key]
-        ret = r.get("retrieval_metrics", {})
-        n_gold = ret.get("num_queries", "?")
         stage_name = r.get("hyperparameters", {}).get("stage_name", stage_key)
+        cells = " | ".join(
+            f"{c:>{w}}" for c, w in zip(side_cells(r), [9, 9, 7, 9, 7])
+        )
         print(
-            f"| {stage_name:<26} | "
-            f"{_f4(ret.get('recall_at_5')):>6} | "
-            f"{_f4(ret.get('recall_at_10')):>6} | "
-            f"{_f4(ret.get('mrr')):>6} | "
-            f"{_f4(ret.get('ndcg_at_10')):>7} | "
-            f"{str(n_gold):>7} | "
+            f"| {stage_name:<26} | {cells} | "
             f"{_f4(r.get('scenario1_score')):>7} | "
             f"{_f4(r.get('scenario2_score')):>7} | "
             f"{_f4(r.get('scenario3_score')):>7} |"

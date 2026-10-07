@@ -420,3 +420,17 @@ class TestSilverLabelingStrategy:
         # Should be labeled as "article", not "silver_lexical"
         assert cov["by_strategy"]["article"] == 1
         assert cov["by_strategy"]["silver_lexical"] == 0
+
+
+class TestChunkMatchesNonNumericMaddeNo:
+    def _chunk(self, madde_no):
+        from data.data_processor import CorpusChunk
+        return CorpusChunk(chunk_id="c", doc_id="d", source="s", text="t", char_len=1,
+                           madde_no=madde_no)
+
+    def test_gecici_does_not_crash(self):
+        assert _chunk_matches_article(self._chunk("gecici-2"), 2) is False
+        assert _chunk_matches_article(self._chunk("ek-3"), 3) is False
+
+    def test_numeric_string_matches(self):
+        assert _chunk_matches_article(self._chunk("44"), 44) is True

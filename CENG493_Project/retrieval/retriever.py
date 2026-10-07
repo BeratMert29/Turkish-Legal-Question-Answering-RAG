@@ -42,9 +42,9 @@ class Retriever:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
     def load_index(self, index_path, metadata_path) -> None:
+        from utils import read_jsonl
         self.index = faiss.read_index(str(index_path))
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            self.metadata = [json.loads(line) for line in f if line.strip()]
+        self.metadata = list(read_jsonl(metadata_path))
         if self.index.ntotal != len(self.metadata):
             raise ValueError(
                 f"Index/metadata mismatch: {self.index.ntotal} vectors vs {len(self.metadata)} metadata entries"

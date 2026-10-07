@@ -49,6 +49,24 @@ HMGS_SOURCE_MAP = {
 }
 HMGS_EVAL_EXPECTED = 161  # 240 raw - 49 no corpus - 5 VUK (misattributed) - 25 MC-ref; enforced as soft assertion in build_gold_eval_set
 
+# turkish_legal_rag eval set (HF mtntasci/turkish-legal-rag, CC-BY-4.0); built by
+# scripts/16_prepare_turkish_legal_rag.py and committed under results/processed_data/.
+TLR_PROCESSED_DIR = BASE_DIR.parent / "results" / "processed_data"
+TLR_METADATA_PATH = BASE_DIR.parent / "results" / "index" / "metadata.jsonl"
+TLR_GOLD_FILE = "qa_turkish_legal_rag.jsonl"
+TLR_DATA_PATH = TLR_PROCESSED_DIR / TLR_GOLD_FILE
+# HF ``kaynak`` spellings that differ from corpus source names
+TLR_SOURCE_ALIASES = {
+    "Bilgi Edinme Hakkı Kanunu": "Bilgi Edinme Kanunu",
+}
+
+# Eval sets selectable via --eval-set; the default applies to scripts/14 and run_baseline.
+EVAL_SET_CHOICES = ["turkish_legal_rag", "hmgs", "kaggle"]
+DEFAULT_EVAL_SET = "turkish_legal_rag"
+# Chunk-level metrics become the headline when at least this fraction of queries
+# has gold chunk labels; otherwise source-hit stays the headline.
+HEADLINE_CHUNK_MIN_LABELED_FRACTION = 0.5
+
 # Embedding
 EMBEDDING_MODEL = "BAAI/bge-m3"
 FINETUNED_EMBEDDING_MODEL = str(BASE_DIR / "models" / "bge-m3-turkish-legal")
@@ -85,6 +103,8 @@ LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_API_KEY = "ollama"
 LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 512
+# Stage is marked failed when more than this fraction of generations / judge calls fail
+MAX_FAILURE_RATE = 0.2
 LLM_FINETUNED_MAX_TOKENS = 256  # shorter cap for fine-tuned model to reduce runaway generation
 LLM_JUDGE_MODEL = "llama3.3:70b"   # separate judge model to avoid self-evaluation bias
 

@@ -294,6 +294,45 @@ All settings are in `config.py`. Key values:
 
 ---
 
+## Default Evaluation Set: `turkish_legal_rag`
+
+`scripts/14_eval_all_stages.py` and `run_baseline.py` now evaluate on
+`turkish_legal_rag` by default: 195 questions with explicit law + article gold
+labels, so chunk-level Recall/MRR/nDCG are meaningful.
+
+- **Source:** [`mtntasci/turkish-legal-rag`](https://huggingface.co/datasets/mtntasci/turkish-legal-rag),
+  config `qa_benchmark`, split `test` (290 rows).
+- **License / attribution:** CC-BY-4.0. Dataset by `mtntasci`; questions derive
+  from the Kaggle legal QA data our corpus is built from.
+- **Filtering** (290 -> 195 kept):
+  - drop 90 rows whose `source_origin` is not `kaggle_batuhankalem` (templated, low quality)
+  - drop 0 rows whose law has no chunks in our corpus (all 8 laws are indexed)
+  - drop 5 rows whose question appears in a `qa_train*.jsonl` fine-tuning file (leakage; normalized text match)
+  - `madde_no` is normalised to the corpus convention (`"3-"` -> `"3"`); 1 kept row has no article
+  - 4 kept questions also appear in `qa_eval.jsonl`
+- **Gold labels:** `source` + `madde_no` select the corpus chunks of that law and
+  article (194/195 labeled this way, 195/195 with at least one gold chunk).
+- **Headline metrics:** chunk-level R@5/R@10/MRR/nDCG@10 lead the PRIMARY table
+  when at least 50% of queries have gold chunk labels
+  (`config.HEADLINE_CHUNK_MIN_LABELED_FRACTION`); otherwise source-hit stays the headline.
+
+Rebuild the set (outputs `results/processed_data/qa_turkish_legal_rag.jsonl` and
+`.report.json`; pass `--input rows.json` to use a local copy instead of downloading):
+
+```bash
+python CENG493_Project/scripts/16_prepare_turkish_legal_rag.py
+```
+
+Colab run (default set is `turkish_legal_rag`):
+
+```bash
+python scripts/14_eval_all_stages.py --stages base rrf_rerank graph emb_ft full
+```
+
+HMGS is still available with `--eval-set hmgs` (Kaggle with `--eval-set kaggle`).
+
+---
+
 ## Retrieval Evaluation Notes
 
 ### Why source-level metrics are primary

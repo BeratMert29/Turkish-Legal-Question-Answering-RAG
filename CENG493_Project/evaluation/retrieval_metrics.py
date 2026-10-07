@@ -12,15 +12,22 @@ def compute_source_hit_metrics(results: list[dict]) -> dict:
             "query_id"          : str
             "source_law"        : str — gold law name (empty string = unknown, skipped)
             "retrieved_sources" : list[str] — source field of each retrieved chunk,
-                                  in retrieval-rank order
+                                  in retrieval-rank order.  Callers may deduplicate
+                                  this list (e.g. keep only the first chunk per law)
+                                  when per-law precision rather than per-chunk
+                                  precision is desired; the function itself counts
+                                  raw occurrences.
 
     Returns:
         Dict with keys:
             source_hit_at_5_all      : fraction of source-known queries with a
                                        top-5 chunk from the gold law
             source_hit_at_10_all     : same for top-10
-            source_precision_at_5_all: mean fraction of top-5 chunks from gold law
-            source_precision_at_10_all: mean fraction of top-10 chunks
+            source_precision_at_5_all: mean fraction of k=5 slots from gold law
+                                       (denominator is always 5, even when fewer
+                                       than 5 chunks were retrieved — missing
+                                       slots count as misses)
+            source_precision_at_10_all: same with k=10 denominator
             source_labeled_queries   : number of queries with a known source law
             total_queries            : total queries passed in
     """
@@ -44,8 +51,8 @@ def compute_source_hit_metrics(results: list[dict]) -> dict:
             hit5 += 1
         if hits10:
             hit10 += 1
-        prec5_sum  += hits5  / max(len(top5),  1)
-        prec10_sum += hits10 / max(len(top10), 1)
+        prec5_sum  += hits5  / 5
+        prec10_sum += hits10 / 10
         # MRR: reciprocal rank of the first retrieved chunk from the gold law
         for rank, src in enumerate(srcs):
             if src == law:
@@ -94,6 +101,10 @@ def compute_all_metrics(results: list[dict]) -> dict:  # noqa: C901
         qrels_dict[qid] = {str(doc_id): 1 for doc_id in relevant}
         # Score by inverse rank so ranx sorts correctly
         run_dict[qid] = {str(doc_id): 1.0 / (rank + 1) for rank, doc_id in enumerate(retrieved)}
+        if not run_dict[qid]:
+            # ranx crashes on an empty run entry; a single non-relevant
+            # placeholder doc scores the query as 0 on every metric.
+            run_dict[qid] = {"__no_retrieval__": 1.0}
 
     if not qrels_dict:
         return {"recall_at_5": 0.0, "recall_at_10": 0.0, "mrr": 0.0, "ndcg_at_10": 0.0, "source_hit_at_5": 0.0, "source_hit_at_10": 0.0, "capped_recall_at_5": 0.0, "capped_recall_at_10": 0.0, "precision_at_5": 0.0, "precision_at_10": 0.0, "num_queries": 0, "total_queries": total_queries}

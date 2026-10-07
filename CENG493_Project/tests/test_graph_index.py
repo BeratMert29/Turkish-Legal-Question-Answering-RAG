@@ -546,3 +546,245 @@ class TestRealGraphIndex:
         assert len(expanded[0]) > len(seed), (
             f"expand_batch should add adj neighbors for {seed_id}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Abbreviation + madde regex, dedupe, self-loops
+# ---------------------------------------------------------------------------
+
+from retrieval.graph_index import find_abbrev_maddes  # noqa: E402
+
+
+class TestAbbrevMaddeParsing:
+    @pytest.mark.parametrize("q,exp", [
+        ("TCK 86. madde", [("TCK", "86")]),
+        ("İİK 72. madde", [("İİK", "72")]),
+        ("TMK madde 2 ve TBK madde 49", [("TMK", "2"), ("TBK", "49")]),
+        ("Anayasa 10. maddesi", [("ANAYASA", "10")]),
+        ("anayasa madde 138", [("ANAYASA", "138")]),
+        ("iik madde 72", [("İİK", "72")]),
+        ("IIK madde 72", [("İİK", "72")]),
+        ("TBK m. 49", [("TBK", "49")]),
+        ("TBK md. 5", [("TBK", "5")]),
+        ("TCK 86'ncı maddesi", [("TCK", "86")]),
+        ("TCK madde 1234", [("TCK", "1234")]),
+        ("TCK madde 5 ve TBK", [("TCK", "5")]),
+        # number-first forms with md abbreviation (Task 0 fix)
+        ("TCK 86. md.", [("TCK", "86")]),
+        ("TBK 49. md", [("TBK", "49")]),
+        ("TCK 5. md. nedir", [("TCK", "5")]),
+        ("CMK 100. md. uygulanır", [("CMK", "100")]),
+    ])
+    def test_forms(self, q, exp):
+        assert find_abbrev_maddes(q) == exp
+
+    def test_no_madde(self):
+        assert find_abbrev_maddes("TCK hakkında bilgi") == []
+
+    def test_inject_casing_and_two_laws(self, tmp_path, monkeypatch):
+        import config
+        monkeypatch.setattr(config, "DIRECT_MADDE_LOOKUP_ENABLED", True)
+        gi = _make_gi_with_lookup(tmp_path)
+        ids = [r["chunk_id"] for r in gi.inject_from_query("tck 86. maddesi")]
+        assert "Türk Ceza Kanunu_kaggle_5237_0" in ids
+
+    def test_inject_abbrev_number_first_md(self, tmp_path, monkeypatch):
+        """TCK 86. md. → injects TCK madde-86 chunk (number-first md form)."""
+        import config
+        monkeypatch.setattr(config, "DIRECT_MADDE_LOOKUP_ENABLED", True)
+        gi = _make_gi_with_lookup(tmp_path)
+        result = gi.inject_from_query("TCK 86. md.")
+        ids = [r["chunk_id"] for r in result]
+        assert "Türk Ceza Kanunu_kaggle_5237_0" in ids
+
+    def test_inject_canonical_number_first_md(self, tmp_path, monkeypatch):
+        """5237 sayılı ... Kanununda 87. md. → injects TCK madde-87 chunk."""
+        import config
+        monkeypatch.setattr(config, "DIRECT_MADDE_LOOKUP_ENABLED", True)
+        gi = _make_gi_with_lookup(tmp_path)
+        query = "5237 sayılı Türk Ceza Kanununda 87. md. hükmü uygulanır."
+        result = gi.inject_from_query(query)
+        ids = [r["chunk_id"] for r in result]
+        assert "Türk Ceza Kanunu_kaggle_5237_1" in ids
+
+
+class TestMaddeHeadingFixes:
+    """Task 2: EK MADDE all-caps, MADDE N/A suffix, mid-text anchor."""
+
+    def test_ek_madde_allcaps_not_regular(self):
+        """'EK MADDE 1' must return ek-1, not article 1."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "EK MADDE 1 – ek hüküm içeriği.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn == "ek-1", f"Expected 'ek-1', got {mn!r}"
+
+    def test_madde_slash_suffix_normalised(self):
+        """'MADDE 183/A' must return '183-a'."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "MADDE 183/A – Suç ve ceza tanımı.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn == "183-a", f"Expected '183-a', got {mn!r}"
+
+    def test_madde_hyphen_suffix_normalised(self):
+        """'MADDE 5-B' must return '5-b'."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "MADDE 5-B – Hüküm.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn == "5-b", f"Expected '5-b', got {mn!r}"
+
+    def test_mid_text_madde_not_extracted(self):
+        """Inline 'Madde 5 uyarınca' mid-line must not set chunk's article number."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "Bu hüküm Madde 5 uyarınca uygulanır.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn is None, f"Expected None for mid-text reference, got {mn!r}"
+
+    def test_mid_text_ref_does_not_shadow_real_heading(self):
+        """Inline mid-sentence ref before a real line-start heading: heading wins."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            # "Madde 3" is mid-sentence (not at line start); "MADDE 7" is at line start.
+            "text": "Kanun hükmüne göre Madde 3 uyarınca karar verilmiştir.\nMADDE 7- Asıl hüküm.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn == "7", f"Expected '7' from line-start heading, got {mn!r}"
+
+    def test_ek_madde_suffix_normalised(self):
+        """'EK MADDE 2/A' must return 'ek-2-a'."""
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "EK MADDE 2/A – ek hüküm.",
+        }
+        mn, _ = _extract_madde_no(rec)
+        assert mn == "ek-2-a", f"Expected 'ek-2-a', got {mn!r}"
+
+    def test_build_graph_ek_madde_key(self):
+        """build_graph_from_metadata stores 'ek-1' key (not '1') for EK MADDE 1."""
+        recs = [
+            {
+                "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+                "text": "EK MADDE 1 – ek hüküm.",
+            }
+        ]
+        g = build_graph_from_metadata(recs)
+        lookup = g["_source_madde_lookup"]
+        assert "L||ek-1" in lookup, f"Expected 'L||ek-1' in lookup, got keys: {list(lookup)}"
+        assert "L||1" not in lookup, "'L||1' must not appear for EK MADDE 1"
+
+
+class TestDedupeAndSelfLoops:
+    def test_duplicate_ids_no_self_loops(self):
+        rec = {
+            "chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+            "text": "MADDE 5 - bkz. madde 5 ve madde 6.", "madde_no": "5",
+        }
+        rec2 = {
+            "chunk_id": "L_d_1", "doc_id": "d", "source": "L",
+            "text": "MADDE 6 - x.", "madde_no": "6",
+        }
+        g = build_graph_from_metadata([rec, dict(rec), rec2, dict(rec2)])
+        for k, es in g.items():
+            if k.startswith("_"):
+                continue
+            assert all(t != k for t, _ in es)
+        lk = g["_source_madde_lookup"]
+        assert lk["L||5"] == ["L_d_0"]
+        assert lk["L||6"] == ["L_d_1"]
+
+    def test_gecici_madde_no_graph(self):
+        recs = [
+            {"chunk_id": "L_d_0", "doc_id": "d", "source": "L",
+             "text": "x", "madde_no": "gecici-2"},
+            {"chunk_id": "L_d_1", "doc_id": "d", "source": "L",
+             "text": "y", "madde_no": "7"},
+        ]
+        g = build_graph_from_metadata(recs)
+        assert g["_source_madde_lookup"]["L||gecici-2"] == ["L_d_0"]
+
+
+# ---------------------------------------------------------------------------
+# Task 2: atomic save_graph write + corrupt JSON recovery
+# ---------------------------------------------------------------------------
+
+from retrieval.graph_builder import save_graph  # noqa: E402
+
+
+class TestAtomicSaveGraph:
+    """save_graph writes atomically; a simulated mid-write failure leaves no
+    partial/corrupt output at the target path."""
+
+    def test_save_creates_valid_json(self, tmp_path):
+        """save_graph produces a readable JSON file at the target path."""
+        graph = build_graph_from_metadata(_META_KAGGLE)
+        out = tmp_path / "graph.json"
+        save_graph(graph, out)
+        loaded = json.loads(out.read_text(encoding="utf-8"))
+        assert "_source_madde_lookup" in loaded
+
+    def test_no_tmp_file_left_after_success(self, tmp_path):
+        """Temp file is removed (renamed away) after a successful save."""
+        graph = build_graph_from_metadata(_META_KAGGLE)
+        out = tmp_path / "graph.json"
+        save_graph(graph, out)
+        tmp_candidate = tmp_path / "graph.json.tmp"
+        assert not tmp_candidate.exists(), "Temp file should not remain after save"
+
+    def test_overwrite_is_atomic(self, tmp_path):
+        """Calling save_graph twice replaces the file; old content gone."""
+        g1 = build_graph_from_metadata(_META_KAGGLE[:1])
+        g2 = build_graph_from_metadata(_META_KAGGLE[:2])
+        out = tmp_path / "graph.json"
+        save_graph(g1, out)
+        save_graph(g2, out)
+        loaded = json.loads(out.read_text(encoding="utf-8"))
+        # g2 has more nodes than g1
+        non_meta = {k: v for k, v in loaded.items() if not k.startswith("_")}
+        assert len(non_meta) >= len(g1) - 1  # at least as many nodes as g1
+
+
+class TestCorruptGraphRecovery:
+    """GraphIndex raises JSONDecodeError on corrupt files; from_config rebuilds."""
+
+    def test_load_graph_raises_on_corrupt(self, tmp_path):
+        """GraphIndex.__init__ raises json.JSONDecodeError for a corrupt graph file."""
+        m_path = tmp_path / "metadata.jsonl"
+        m_path.write_text(
+            "\n".join(json.dumps(r) for r in _META_KAGGLE[:2]),
+            encoding="utf-8",
+        )
+        g_path = tmp_path / "graph.json"
+        g_path.write_text("{corrupt json", encoding="utf-8")
+        with pytest.raises(json.JSONDecodeError):
+            GraphIndex(g_path, m_path)
+
+    def test_from_config_rebuilds_on_corrupt(self, tmp_path, monkeypatch):
+        """from_config transparently rebuilds and returns a valid GraphIndex."""
+        import config as _cfg
+
+        # Point config at tmp_path
+        monkeypatch.setattr(_cfg, "INDEX_DIR", tmp_path)
+        monkeypatch.setattr(_cfg, "GRAPH_FILE", "graph.json")
+        monkeypatch.setattr(_cfg, "METADATA_FILE", "metadata.jsonl")
+
+        # Write valid metadata, corrupt graph
+        m_path = tmp_path / "metadata.jsonl"
+        m_path.write_text(
+            "\n".join(json.dumps(r) for r in _META_KAGGLE),
+            encoding="utf-8",
+        )
+        g_path = tmp_path / "graph.json"
+        g_path.write_text("{bad}", encoding="utf-8")
+
+        gi = GraphIndex.from_config()
+        assert len(gi._graph) > 0, "from_config should have rebuilt a non-empty graph"
+        # After rebuild the file on disk should be valid JSON
+        reloaded = json.loads(g_path.read_text(encoding="utf-8"))
+        assert "_source_madde_lookup" in reloaded

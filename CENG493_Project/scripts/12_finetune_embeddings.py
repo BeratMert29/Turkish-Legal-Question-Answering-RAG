@@ -51,8 +51,8 @@ TRAINING_CONFIG = {
 
 
 def load_jsonl(path: Path) -> list[dict]:
-    with open(path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+    from utils import read_jsonl
+    return list(read_jsonl(path))
 
 
 def main() -> None:

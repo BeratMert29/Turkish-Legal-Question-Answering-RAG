@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+16_prepare_turkish_legal_rag.py — Build the ``turkish_legal_rag`` eval set.
+
+Source: HuggingFace ``mtntasci/turkish-legal-rag`` (config ``qa_benchmark``,
+split ``test``, CC-BY-4.0).  Filters applied, in order:
+
+  1. source_origin       keep only ``kaggle_batuhankalem`` rows (the templated
+                         ``None``-origin rows are low quality)
+  2. unknown_law         drop rows whose law has no chunks in our corpus
+  3. train_leakage       drop questions present in any
+                         ``qa_train*.jsonl`` fine-tuning file
+
+``madde_no`` ("3-") is normalised to the corpus convention ("3", "183-a",
+"ek-3", "gecici-2").
+
+Usage:
+    python scripts/16_prepare_turkish_legal_rag.py
+    python scripts/16_prepare_turkish_legal_rag.py --input rows.json
+
+Output (under results/processed_data/):
+    qa_turkish_legal_rag.jsonl         same schema as qa_hmgs.jsonl
+                                       + madde_no, hf_row_id
+    qa_turkish_legal_rag.report.json   per-reason / per-law counts
+"""
+
+import argparse
+import collections
+import json
+import re
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+import config
+from data.data_processor import DataProcessor
+
+HF_DATASET = "mtntasci/turkish-legal-rag"
+HF_CONFIG = "qa_benchmark"
+HF_SPLIT = "test"
+KEEP_ORIGIN = "kaggle_batuhankalem"
+
+_ROWS_API = "https://datasets-server.huggingface.co/rows"
+_PAGE = 100
+
+
+def normalize_question(text: str) -> str:
+    """Lowercase, collapse non-word runs to one space, strip."""
+    return re.sub(r"\W+", " ", (text or "").lower()).strip()
+
+
+def normalize_madde_no(raw) -> "str | None":
+    """Map an HF ``madde_no`` to the corpus convention.
+
+    ``"3-"`` -> ``"3"``, ``"183/A"`` -> ``"183-a"``, ``"Ek Madde 3"`` ->
+    ``"ek-3"``, ``"Geçici 2-"`` -> ``"gecici-2"``.  ``None`` when unusable.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().lower().replace("ç", "c").replace("ı", "i")
+    s = re.sub(r"\bmadde\b", " ", s).strip(" -.")
+    m = re.fullmatch(r"(ek|gecici)?[\s-]*(\d+)(?:[\s/-]*([a-z]))?", s)
+    if not m:
+        return None
+    prefix, num, letter = m.groups()
+    out = num + (f"-{letter}" if letter else "")
+    return f"{prefix}-{out}" if prefix else out
+
+
+def corpus_sources(metadata_path: Path) -> set:
+    """Laws that have chunks in our corpus."""
+    sources = set()
+    if metadata_path.exists():
+        with open(metadata_path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    sources.add(json.loads(line).get("source"))
+        sources.discard(None)
+    return sources or set(config.HMGS_SOURCE_MAP.values())
+
+
+def resolve_source(kaynak, known: set) -> "str | None":
+    """Map HF ``kaynak`` to a corpus source name, or None if not in corpus."""
+    name = config.TLR_SOURCE_ALIASES.get(kaynak, kaynak)
+    if name in known:
+        return name
+    name = config.HMGS_SOURCE_MAP.get(kaynak)
+    return name if name in known else None
+
+
+def load_training_questions(processed_dir: Path) -> set:
+    out = set()
+    for path in sorted(processed_dir.glob("qa_train*.jsonl")):
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    out.add(normalize_question(json.loads(line).get("question", "")))
+    return out
+
+
+def build_examples(rows, known_sources, train_questions, eval_questions=frozenset()):
+    """Apply the filters; return (examples, report)."""
+    drops = collections.Counter()
+    kept_per_law = collections.Counter()
+    examples = []
+    eval_overlap = 0
+    for row in rows:
+        if row.get("source_origin") != KEEP_ORIGIN:
+            drops["source_origin"] += 1
+            continue
+        source = resolve_source(row.get("kaynak"), known_sources)
+        if source is None:
+            drops["unknown_law"] += 1
+            continue
+        question = row.get("soru") or ""
+        nq = normalize_question(question)
+        if nq in train_questions:
+            drops["train_leakage"] += 1
+            continue
+        if nq in eval_questions:
+            eval_overlap += 1
+        row_id = str(row.get("row_id", "")).split(".")[0]
+        madde_no = normalize_madde_no(row.get("madde_no"))
+        if madde_no is None:
+            drops["_kept_without_madde_no"] += 1
+        examples.append({
+            "query_id": f"tlr_{row_id}",
+            "question": question,
+            "answer": row.get("cevap") or "",
+            "context": "",
+            "source": source,
+            "data_type": "",
+            "madde_no": madde_no,
+            "hf_row_id": row_id,
+        })
+        kept_per_law[source] += 1
+    kept_no_madde = drops.pop("_kept_without_madde_no", 0)
+    report = {
+        "dataset": f"{HF_DATASET}/{HF_CONFIG}/{HF_SPLIT}",
+        "license": "CC-BY-4.0",
+        "total_rows": len(rows),
+        "kept": len(examples),
+        "dropped": {k: drops.get(k, 0) for k in
+                    ("source_origin", "unknown_law", "train_leakage")},
+        "kept_without_madde_no": kept_no_madde,
+        "kept_per_law": dict(kept_per_law.most_common()),
+        "overlap_with_qa_eval_kept": eval_overlap,
+    }
+    return examples, report
+
+
+def fetch_rows() -> list:
+    """Download all rows via ``datasets`` or the datasets-server REST API."""
+    try:
+        from datasets import load_dataset
+        return [dict(r) for r in load_dataset(HF_DATASET, HF_CONFIG, split=HF_SPLIT)]
+    except Exception as exc:  # noqa: BLE001 — fall back to REST
+        print(f"  datasets library unavailable ({exc}); using rows API")
+    rows, offset = [], 0
+    while True:
+        qs = urllib.parse.urlencode({
+            "dataset": HF_DATASET, "config": HF_CONFIG, "split": HF_SPLIT,
+            "offset": offset, "length": _PAGE,
+        })
+        with urllib.request.urlopen(f"{_ROWS_API}?{qs}", timeout=60) as resp:
+            payload = json.load(resp)
+        page = [r["row"] for r in payload.get("rows", [])]
+        rows.extend(page)
+        offset += len(page)
+        if not page or offset >= payload.get("num_rows_total", 0):
+            return rows
+
+
+def _load_questions(path: Path) -> set:
+    if not path.exists():
+        return set()
+    return {normalize_question(r.get("question", ""))
+            for r in DataProcessor.load_jsonl(path)}
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--input", type=Path, default=None,
+                    help="Local JSON (list of row dicts); default: download from HF")
+    ap.add_argument("--processed-dir", type=Path, default=config.TLR_PROCESSED_DIR)
+    ap.add_argument("--metadata", type=Path, default=config.TLR_METADATA_PATH)
+    args = ap.parse_args(argv)
+
+    if args.input:
+        with open(args.input, encoding="utf-8") as fh:
+            rows = json.load(fh)
+    else:
+        rows = fetch_rows()
+
+    examples, report = build_examples(
+        rows,
+        corpus_sources(args.metadata),
+        load_training_questions(args.processed_dir),
+        _load_questions(args.processed_dir / config.QA_GOLD_FILE),
+    )
+
+    out = args.processed_dir / config.TLR_GOLD_FILE
+    DataProcessor.save_jsonl(examples, out)
+    report_path = out.with_suffix(".report.json")
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(f"\nWrote {len(examples)} examples -> {out}\nReport -> {report_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -35,24 +35,20 @@ class ChunkExpander:
     """Merge chunk text with adjacent chunks (same chunk_id prefix) from metadata."""
 
     def __init__(self, metadata_path: str | Path):
+        from utils import read_jsonl
         metadata_path = Path(metadata_path)
         self._by_prefix: dict[str, list[tuple[int, dict]]] = {}
-        with open(metadata_path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                meta = json.loads(line)
-                chunk_id: str = meta.get("chunk_id", "")
-                last_sep = chunk_id.rfind("_")
-                if last_sep == -1:
-                    continue
-                prefix = chunk_id[:last_sep]
-                try:
-                    idx = int(chunk_id[last_sep + 1:])
-                except ValueError:
-                    continue
-                self._by_prefix.setdefault(prefix, []).append((idx, meta))
+        for meta in read_jsonl(metadata_path):
+            chunk_id: str = meta.get("chunk_id", "")
+            last_sep = chunk_id.rfind("_")
+            if last_sep == -1:
+                continue
+            prefix = chunk_id[:last_sep]
+            try:
+                idx = int(chunk_id[last_sep + 1:])
+            except ValueError:
+                continue
+            self._by_prefix.setdefault(prefix, []).append((idx, meta))
         for prefix in self._by_prefix:
             self._by_prefix[prefix].sort(key=lambda t: t[0])
 
