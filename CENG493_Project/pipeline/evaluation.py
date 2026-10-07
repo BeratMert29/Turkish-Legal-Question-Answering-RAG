@@ -363,7 +363,12 @@ def run_llm_judge_eval(
         "coherence": coher_result.get("parse_fail_count", 0),
     }
 
-    _all = (judge_result, faith_result, relev_result, coher_result)
+    _named = {"answer": judge_result, "faithfulness": faith_result,
+              "relevancy": relev_result, "coherence": coher_result}
+    result["call_failures"] = {k: r.get("call_fail_count", 0) for k, r in _named.items()}
+    result["score_failures_as_zero"] = {
+        k: r.get("score_failures_as_zero") for k, r in _named.items()}
+    _all = tuple(_named.values())
     result["failure_count"] = sum(r.get("parse_fail_count", 0) for r in _all)
     result["call_count"] = sum(r.get("sample_size", 0) for r in _all)
 
@@ -1000,6 +1005,7 @@ def _run_judge_phase(
     failure_count = 0
     call_count = 0
     crashed = False
+    extra: dict = {}
 
     try:
         j = run_llm_judge_eval(
@@ -1016,6 +1022,8 @@ def _run_judge_phase(
         coherence = j["coherence"]
         parse_failures = j["parse_failures"]
         per_sample = j.get("per_sample", {})
+        extra = {"call_failures": j.get("call_failures"),
+                 "score_failures_as_zero": j.get("score_failures_as_zero")}
         failure_count = j["failure_count"]
         call_count = j["call_count"]
     except Exception as exc:
@@ -1041,6 +1049,7 @@ def _run_judge_phase(
         "call_count": call_count,
         "crashed": crashed,
         "failed": failed,
+        **extra,
     }
 
 
@@ -1227,6 +1236,9 @@ def _assemble_final_result(
         "llm_relevancy_score": judge["relevancy"],
         "llm_coherence_score": judge["coherence"],
         "llm_judge_parse_failures": judge["parse_failures"],
+        "llm_judge_call_failures": judge.get("call_failures"),
+        # sensitivity: judge means with every missing score counted as 0
+        "llm_judge_score_failures_as_zero": judge.get("score_failures_as_zero"),
         "semantic_similarity": sem_sim,
         "scenario1_score": scenario_scores["scenario1"],
         "scenario2_score": scenario_scores["scenario2"],
