@@ -28,8 +28,8 @@ MERGED_DATASET = config.PROCESSED_DIR / "qa_train_merged.jsonl"
 FALLBACK_DATASET = config.PROCESSED_DIR / "qa_train.jsonl"
 
 TRAINING_CONFIG = {
-    "base_model": HF_MODEL_ID,
-    "backend": "safe_lora_fp16",
+    "base_model": QLORA_MODEL_ID,
+    "backend": "qlora_4bit",
     "lora": {
         "r": 16,
         "lora_alpha": 32,
@@ -144,8 +144,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--backend",
         choices=["safe", "qlora"],
-        default="safe",
-        help="safe: Qwen2.5-3B fp16 LoRA; qlora: Qwen2.5-7B 4-bit QLoRA.",
+        default="qlora",
+        help="qlora (default): Qwen2.5-7B 4-bit QLoRA, matches the ablation base; "
+             "safe: Qwen2.5-3B fp16 LoRA (low-VRAM smoke runs only).",
     )
     return p
 

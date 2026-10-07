@@ -332,11 +332,11 @@ CENG493_Project/
 ### LLM Fine-tuning (QLoRA)
 
 ```bash
-# Fine-tune Qwen2.5-3B (safe fp16 LoRA, fits on 16GB GPU)
-PYTHONUTF8=1 python scripts/08_finetune_llm.py --backend safe
+# Fine-tune Qwen2.5-7B (4-bit QLoRA; default, the base the ablation uses)
+PYTHONUTF8=1 python scripts/08_finetune_llm.py
 
-# Fine-tune Qwen2.5-7B (4-bit QLoRA; the base the ablation uses)
-PYTHONUTF8=1 python scripts/08_finetune_llm.py --backend qlora
+# Low-VRAM smoke run only: Qwen2.5-3B fp16 LoRA (does not match the ablation base)
+PYTHONUTF8=1 python scripts/08_finetune_llm.py --backend safe
 
 # Export LoRA adapter to Ollama
 PYTHONUTF8=1 python scripts/13_export_lora_to_ollama.py
