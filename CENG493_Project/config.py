@@ -45,6 +45,11 @@ HMGS_SOURCE_MAP = {
     "2577 sayılı İdari Yargılama Usulü Kanunu": "İdari Yargılama Usulü Kanunu",
     "2004 sayılı İcra ve İflas Kanunu":      "İcra ve İflas Kanunu",
     "657 sayılı Devlet Memurları Kanunu":    "Devlet Memurları Kanunu",
+    # Present in the corpus index (results/index/metadata.jsonl).  VUK rows are
+    # still dropped by build_gold_eval_set until the data owner revalidates them.
+    "213 sayılı Vergi Usul Kanunu":          "Vergi Usul Kanunu",
+    "4982 sayılı Bilgi Edinme Hakkı Kanunu": "Bilgi Edinme Kanunu",
+    "Türk Bayrağı Tüzüğü":                   "Türk Bayrağı Tüzüğü",
 }
 HMGS_EVAL_EXPECTED = 161  # 240 raw - 49 no corpus - 5 VUK (misattributed) - 25 MC-ref; enforced as soft assertion in build_gold_eval_set
 
