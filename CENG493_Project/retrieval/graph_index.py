@@ -107,8 +107,14 @@ class GraphIndex:
         self._load_metadata(Path(metadata_path))
 
     def _load_graph(self, path: Path) -> None:
+        """Load graph from *path*, propagating JSONDecodeError on corrupt files.
+
+        Callers (e.g. :meth:`from_config`) catch ``json.JSONDecodeError`` and
+        trigger an automatic rebuild so that a corrupt graph.json never causes
+        a hard crash.
+        """
         with path.open(encoding="utf-8") as fh:
-            raw: dict = json.load(fh)
+            raw: dict = json.load(fh)  # raises json.JSONDecodeError if corrupt
         for key, edges in raw.items():
             if key == "_source_madde_lookup":
                 # Store lookup table; values may be lists or dicts depending on
@@ -273,8 +279,26 @@ class GraphIndex:
 
     @classmethod
     def from_config(cls) -> "GraphIndex":
+        """Load GraphIndex from paths defined in config.
+
+        If ``graph.json`` exists but is corrupt (``json.JSONDecodeError``), it
+        is rebuilt automatically from the metadata file and the fresh index is
+        returned.
+        """
         import config
-        return cls(
-            config.INDEX_DIR / config.GRAPH_FILE,
-            config.INDEX_DIR / config.METADATA_FILE,
-        )
+        graph_path = config.INDEX_DIR / config.GRAPH_FILE
+        meta_path = config.INDEX_DIR / config.METADATA_FILE
+        try:
+            return cls(graph_path, meta_path)
+        except json.JSONDecodeError:
+            log.warning(
+                "graph.json at %s is corrupt — rebuilding from %s",
+                graph_path,
+                meta_path,
+            )
+            from utils import read_jsonl
+            from retrieval.graph_builder import build_graph_from_metadata, save_graph
+            metadata = list(read_jsonl(meta_path))
+            graph = build_graph_from_metadata(metadata)
+            save_graph(graph, graph_path)
+            return cls(graph_path, meta_path)

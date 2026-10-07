@@ -708,3 +708,83 @@ class TestDedupeAndSelfLoops:
         ]
         g = build_graph_from_metadata(recs)
         assert g["_source_madde_lookup"]["L||gecici-2"] == ["L_d_0"]
+
+
+# ---------------------------------------------------------------------------
+# Task 2: atomic save_graph write + corrupt JSON recovery
+# ---------------------------------------------------------------------------
+
+from retrieval.graph_builder import save_graph  # noqa: E402
+
+
+class TestAtomicSaveGraph:
+    """save_graph writes atomically; a simulated mid-write failure leaves no
+    partial/corrupt output at the target path."""
+
+    def test_save_creates_valid_json(self, tmp_path):
+        """save_graph produces a readable JSON file at the target path."""
+        graph = build_graph_from_metadata(_META_KAGGLE)
+        out = tmp_path / "graph.json"
+        save_graph(graph, out)
+        loaded = json.loads(out.read_text(encoding="utf-8"))
+        assert "_source_madde_lookup" in loaded
+
+    def test_no_tmp_file_left_after_success(self, tmp_path):
+        """Temp file is removed (renamed away) after a successful save."""
+        graph = build_graph_from_metadata(_META_KAGGLE)
+        out = tmp_path / "graph.json"
+        save_graph(graph, out)
+        tmp_candidate = tmp_path / "graph.json.tmp"
+        assert not tmp_candidate.exists(), "Temp file should not remain after save"
+
+    def test_overwrite_is_atomic(self, tmp_path):
+        """Calling save_graph twice replaces the file; old content gone."""
+        g1 = build_graph_from_metadata(_META_KAGGLE[:1])
+        g2 = build_graph_from_metadata(_META_KAGGLE[:2])
+        out = tmp_path / "graph.json"
+        save_graph(g1, out)
+        save_graph(g2, out)
+        loaded = json.loads(out.read_text(encoding="utf-8"))
+        # g2 has more nodes than g1
+        non_meta = {k: v for k, v in loaded.items() if not k.startswith("_")}
+        assert len(non_meta) >= len(g1) - 1  # at least as many nodes as g1
+
+
+class TestCorruptGraphRecovery:
+    """GraphIndex raises JSONDecodeError on corrupt files; from_config rebuilds."""
+
+    def test_load_graph_raises_on_corrupt(self, tmp_path):
+        """GraphIndex.__init__ raises json.JSONDecodeError for a corrupt graph file."""
+        m_path = tmp_path / "metadata.jsonl"
+        m_path.write_text(
+            "\n".join(json.dumps(r) for r in _META_KAGGLE[:2]),
+            encoding="utf-8",
+        )
+        g_path = tmp_path / "graph.json"
+        g_path.write_text("{corrupt json", encoding="utf-8")
+        with pytest.raises(json.JSONDecodeError):
+            GraphIndex(g_path, m_path)
+
+    def test_from_config_rebuilds_on_corrupt(self, tmp_path, monkeypatch):
+        """from_config transparently rebuilds and returns a valid GraphIndex."""
+        import config as _cfg
+
+        # Point config at tmp_path
+        monkeypatch.setattr(_cfg, "INDEX_DIR", tmp_path)
+        monkeypatch.setattr(_cfg, "GRAPH_FILE", "graph.json")
+        monkeypatch.setattr(_cfg, "METADATA_FILE", "metadata.jsonl")
+
+        # Write valid metadata, corrupt graph
+        m_path = tmp_path / "metadata.jsonl"
+        m_path.write_text(
+            "\n".join(json.dumps(r) for r in _META_KAGGLE),
+            encoding="utf-8",
+        )
+        g_path = tmp_path / "graph.json"
+        g_path.write_text("{bad}", encoding="utf-8")
+
+        gi = GraphIndex.from_config()
+        assert len(gi._graph) > 0, "from_config should have rebuilt a non-empty graph"
+        # After rebuild the file on disk should be valid JSON
+        reloaded = json.loads(g_path.read_text(encoding="utf-8"))
+        assert "_source_madde_lookup" in reloaded

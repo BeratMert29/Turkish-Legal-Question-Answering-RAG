@@ -331,11 +331,26 @@ def lookup_by_source_madde(
 
 
 def save_graph(graph: dict, path: Path) -> None:
-    """Write graph JSON (includes _source_madde_lookup)."""
+    """Write graph JSON atomically via tmp-file + os.replace.
+
+    The file is written to ``<path>.tmp`` in the same directory and then
+    renamed to *path* so that a crash or interruption mid-write never leaves
+    a partial/corrupt graph file on disk.
+    """
+    import os
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(graph, f, ensure_ascii=False, indent=1)
+    tmp_path = path.parent / (path.name + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(graph, f, ensure_ascii=False, indent=1)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     log.info("Graph saved → %s (%d bytes)", path, path.stat().st_size)
 
 

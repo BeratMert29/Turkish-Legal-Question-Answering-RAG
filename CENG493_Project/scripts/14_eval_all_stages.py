@@ -152,6 +152,14 @@ def main() -> None:
             graph_path = config.INDEX_DIR / config.GRAPH_FILE
             if not graph_path.exists():
                 auto_build_graph(graph_path)
+            # Rebuild if the existing file is corrupt JSON.
+            if graph_path.exists():
+                try:
+                    with graph_path.open(encoding="utf-8") as _gf:
+                        json.load(_gf)
+                except json.JSONDecodeError:
+                    print(f"  graph.json is corrupt — rebuilding …")
+                    auto_build_graph(graph_path)
             if not graph_path.exists():
                 print(
                     f"INFO: Stage '{key}' skipped -- "
