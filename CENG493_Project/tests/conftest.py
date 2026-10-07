@@ -10,6 +10,7 @@ when the full environment is available.
 
 from __future__ import annotations
 
+import importlib.machinery
 import pathlib
 import sys
 from unittest.mock import MagicMock
@@ -40,14 +41,31 @@ _HEAVY: list[str] = [
 ]
 
 
+def _module_stub(name: str) -> MagicMock:
+    """MagicMock module with a real ``__spec__``: importlib.util.find_spec
+    (used by e.g. transformers / datasets to probe for torch) raises
+    ``ValueError: <name>.__spec__ is not set`` on a bare MagicMock."""
+    mock = MagicMock(name=name)
+    mock.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+    mock.__path__ = []
+    return mock
+
+
 def _stub_if_missing(name: str) -> None:
-    """Insert a MagicMock into sys.modules for *name* only if unimportable."""
+    """Insert a MagicMock into sys.modules for *name* only if unimportable.
+
+    Any exception counts as unimportable: a partly installed package (e.g.
+    ``datasets`` present while ``torch`` is stubbed) can fail with more than
+    ImportError at import time.
+    """
     if name in sys.modules:
         return
     try:
         __import__(name)
-    except ImportError:
-        mock = MagicMock(name=name)
+    except Exception:
+        for mod in [m for m in sys.modules if m == name or m.startswith(name + ".")]:
+            sys.modules.pop(mod, None)
+        mock = _module_stub(name)
         sys.modules[name] = mock
 
         # Populate common sub-module paths that source code accesses via
@@ -77,7 +95,7 @@ def _stub_if_missing(name: str) -> None:
                 "torch.utils.data",
             ):
                 if sub not in sys.modules:
-                    sys.modules[sub] = MagicMock(name=sub)
+                    sys.modules[sub] = _module_stub(sub)
         elif name == "transformers":
             for sub in (
                 "transformers.AutoTokenizer",
@@ -85,11 +103,11 @@ def _stub_if_missing(name: str) -> None:
                 "transformers.TrainingArguments",
             ):
                 if sub not in sys.modules:
-                    sys.modules[sub] = MagicMock(name=sub)
+                    sys.modules[sub] = _module_stub(sub)
         elif name == "nltk":
             for sub in ("nltk.corpus", "nltk.corpus.stopwords"):
                 if sub not in sys.modules:
-                    sys.modules[sub] = MagicMock(name=sub)
+                    sys.modules[sub] = _module_stub(sub)
 
 
 for _mod in _HEAVY:

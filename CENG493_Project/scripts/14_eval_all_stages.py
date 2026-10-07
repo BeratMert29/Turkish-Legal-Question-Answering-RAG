@@ -164,6 +164,14 @@ def merge_summary(summary_path: Path, new_results: dict) -> dict:
     return merged
 
 
+def _bm25_info():
+    try:
+        from retrieval.bm25_retriever import tokenizer_info
+        return tokenizer_info()
+    except Exception as exc:  # rank_bm25 / nltk missing
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 def load_per_query(stage_dir: Path):
     path = stage_dir / "per_query.jsonl"
     if not path.exists():
@@ -346,7 +354,9 @@ def main() -> None:
         eval_file=eval_file,
         corpus_chunks=corpus_chunks,
         extra={"limit": args.limit, "eval_n": len(qa_examples),
-               "labeled_n": labeling_coverage["labeled"]},
+               "labeled_n": labeling_coverage["labeled"],
+               "bm25_tokenizer": _bm25_info(),
+               "tlr_label_fixes": config.TLR_USE_LABEL_FIXES},
     )
 
     # -- Shared caches -----------------------------------------------------

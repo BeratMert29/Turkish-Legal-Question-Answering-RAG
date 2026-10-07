@@ -1,16 +1,31 @@
-"""BM25 retrieval for hybrid dense+sparse search."""
+"""BM25 retrieval for hybrid dense+sparse search.
+
+Tokens: Turkish-normalised words, Turkish stopwords removed, Snowball
+Turkish stems.  Stemming and stopwords depend on optional packages
+(snowballstemmer, the NLTK stopword corpus); when one is missing BM25 still
+runs but differently, so this is logged as a warning and recorded in every
+run's provenance via :func:`tokenizer_info`.
+"""
+import logging
 import re
 import numpy as np
 from rank_bm25 import BM25Okapi
 from utils import normalize_turkish
 import config
 
+log = logging.getLogger(__name__)
+
 try:
     from snowballstemmer import stemmer as _snowball_stemmer
     _TR_STEMMER = _snowball_stemmer("turkish")
+    _STEMMER_ACTIVE = True
+
     def _stem(token: str) -> str:
         return _TR_STEMMER.stemWord(token)
 except ImportError:
+    _STEMMER_ACTIVE = False
+    log.warning("snowballstemmer not installed: BM25 runs without Turkish stemming")
+
     def _stem(token: str) -> str:
         return token
 
@@ -23,13 +38,26 @@ except LookupError:
         _STOPWORDS = set(nltk.corpus.stopwords.words('turkish'))
     except Exception:
         _STOPWORDS = set()
+        log.warning("NLTK Turkish stopwords unavailable: BM25 runs without stopword removal")
+
+
+def tokenizer_info() -> dict:
+    """How BM25 tokenises in this environment (recorded in run provenance)."""
+    try:
+        n_stop = len(_STOPWORDS)
+    except TypeError:  # stubbed nltk in tests
+        n_stop = None
+    return {"stemmer": "snowball-turkish" if _STEMMER_ACTIVE else None,
+            "n_stopwords": n_stop, "min_token_length": config.BM25_MIN_TOKEN_LENGTH}
 
 
 def tokenize(text: str) -> list[str]:
     normalized = normalize_turkish(text)
     # Strip punctuation so tokens like "madde," match "madde"
     normalized = re.sub(r'[^\w\s]', ' ', normalized)
-    return [_stem(w) for w in normalized.split() if len(w) >= config.BM25_MIN_TOKEN_LENGTH and w not in _STOPWORDS]
+    # Article numbers ("madde 5") are kept whatever their length.
+    return [_stem(w) for w in normalized.split()
+            if (len(w) >= config.BM25_MIN_TOKEN_LENGTH or w.isdigit()) and w not in _STOPWORDS]
 
 
 class BM25Index:

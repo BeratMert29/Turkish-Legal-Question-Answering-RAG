@@ -336,7 +336,7 @@ class TestDryRun:
         out = save_stage_results(final, preds, tmp_path / "out")
 
         assert out.exists()
-        with open(out) as f:
+        with open(out, encoding="utf-8") as f:
             loaded = __import__("json").load(f)
         assert loaded["test"] is True
 
@@ -501,10 +501,10 @@ class TestEvalHelpers:
         out = save_stage_results({"v": 1}, [], tmp_path / "r")
         assert out.exists()
         import json
-        assert json.loads(out.read_text())["v"] == 1
+        assert json.loads(out.read_text(encoding="utf-8"))["v"] == 1
         # Second call overwrites atomically — must not raise or leave .tmp files.
         save_stage_results({"v": 2}, [], tmp_path / "r")
-        assert json.loads(out.read_text())["v"] == 2
+        assert json.loads(out.read_text(encoding="utf-8"))["v"] == 2
         assert not (tmp_path / "r" / "baseline_metrics.tmp").exists()
 
     def test_run_llm_judge_eval_shared_sample(self):
