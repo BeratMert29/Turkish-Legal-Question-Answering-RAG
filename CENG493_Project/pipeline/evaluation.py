@@ -53,18 +53,38 @@ def evict_model_cache() -> None:
 # Metric-input preparation
 # ---------------------------------------------------------------------------
 
+def chunk_article_map(corpus_chunks) -> dict[str, str]:
+    """``{chunk_id: "<source>||<madde_no>"}`` for chunks with an article."""
+    from evaluation.retrieval_metrics import article_key
+
+    out = {}
+    for c in corpus_chunks:
+        key = article_key(c.source, getattr(c, "madde_no", None))
+        if key:
+            out[c.chunk_id] = key
+    return out
+
+
 def prepare_metric_input(
     qa_examples,
     retrieved_all: list[list[dict]],
     relevant_map: dict,
+    chunk_articles: Optional[dict[str, str]] = None,
 ) -> tuple[list[dict], dict[str, list]]:
     """Build the metric_input list and full_retrieved map from retrieval results.
+
+    With *chunk_articles* (see :func:`chunk_article_map`) every entry also
+    carries ``relevant_articles`` / ``retrieved_articles`` for article-level
+    metrics; a QA example with an explicit ``madde_no`` uses it as the gold
+    article directly.
 
     Returns
     -------
     tuple[list[dict], dict[str, list]]
         ``(metric_input, full_retrieved)``
     """
+    from evaluation.retrieval_metrics import article_key
+
     metric_input: list[dict] = []
     full_retrieved: dict[str, list] = {}
 
@@ -78,13 +98,21 @@ def prepare_metric_input(
             if c["chunk_id"] not in seen:
                 seen.add(c["chunk_id"])
                 deduped.append(c["chunk_id"])
-        metric_input.append({
+        entry = {
             "query_id": qa.query_id,
             "relevant": relevant_map.get(qa.query_id, []),
             "retrieved": deduped,
             "source_law": qa.source,
             "retrieved_sources": [c.get("source", "") for c in ranked],
-        })
+        }
+        if chunk_articles is not None:
+            gold = article_key(qa.source, getattr(qa, "madde_no", None))
+            rel_art = [gold] if gold else [
+                chunk_articles[c] for c in entry["relevant"] if c in chunk_articles]
+            entry["relevant_articles"] = list(dict.fromkeys(rel_art))
+            entry["retrieved_articles"] = list(dict.fromkeys(
+                chunk_articles.get(c, f"chunk::{c}") for c in deduped))
+        metric_input.append(entry)
         full_retrieved[qa.query_id] = chunks
 
     return metric_input, full_retrieved
@@ -402,8 +430,9 @@ def run_llm_judge_eval(
 # ---------------------------------------------------------------------------
 
 def _retrieval_per_query(metric_input: list[dict]) -> dict[str, dict]:
-    """Per-query recall@5/10, reciprocal rank (gold-labeled queries only) and
-    source-hit@5 (queries with a known gold law)."""
+    """Per-query recall@5/10, reciprocal rank (gold-labeled queries only),
+    article-level hit@5 / reciprocal rank and source-hit@5 (queries with a
+    known gold law)."""
     from utils import normalize_turkish
 
     out: dict[str, dict] = {}
@@ -411,12 +440,19 @@ def _retrieval_per_query(metric_input: list[dict]) -> dict[str, dict]:
         rel = set(m.get("relevant") or [])
         ranked = m.get("retrieved", [])
         rec: dict = {"recall_at_5": None, "recall_at_10": None,
-                     "reciprocal_rank": None, "source_hit_at_5": None}
+                     "reciprocal_rank": None, "source_hit_at_5": None,
+                     "article_hit_at_5": None, "article_reciprocal_rank": None}
         if rel:
             rec["recall_at_5"] = len(rel & set(ranked[:5])) / len(rel)
             rec["recall_at_10"] = len(rel & set(ranked[:10])) / len(rel)
             first = next((i for i, c in enumerate(ranked, 1) if c in rel), None)
             rec["reciprocal_rank"] = 1.0 / first if first else 0.0
+        rel_art = set(m.get("relevant_articles") or [])
+        if rel_art:
+            arts = m.get("retrieved_articles") or []
+            rec["article_hit_at_5"] = float(bool(rel_art & set(arts[:5])))
+            first = next((i for i, a in enumerate(arts, 1) if a in rel_art), None)
+            rec["article_reciprocal_rank"] = 1.0 / first if first else 0.0
         gold = normalize_turkish(str(m.get("source_law") or "").strip())
         if gold:
             srcs = [normalize_turkish(str(x).strip())
@@ -472,6 +508,7 @@ def build_per_query(
 
 _CI_METRICS = (
     "recall_at_5", "recall_at_10", "reciprocal_rank", "source_hit_at_5",
+    "article_hit_at_5", "article_reciprocal_rank",
     "f1", "rouge_l", "answer_containment", "em", "semantic_similarity",
     "nli_context_grounding", "nli_context_supported", "nli_gold_claim_recall",
     "judge_answer", "judge_faithfulness",
@@ -503,7 +540,7 @@ ABLATION_PAIRS: tuple[tuple[str, str], ...] = (
 )
 
 COMPARISON_METRICS: tuple[str, ...] = (
-    "recall_at_5", "reciprocal_rank", "f1", "answer_containment", "rouge_l",
+    "recall_at_5", "reciprocal_rank", "article_reciprocal_rank", "f1", "answer_containment", "rouge_l",
     "semantic_similarity", "nli_context_supported", "nli_gold_claim_recall",
     "judge_answer",
 )
@@ -563,10 +600,11 @@ def print_comparison_table(comparisons: dict[str, dict[str, dict]]) -> None:
     print("=" * 100 + "\n")
 
 
-def _gold_info(qa_examples, retrieved_all, relevant_map):
+def _gold_info(qa_examples, retrieved_all, relevant_map, chunk_articles=None):
     """``(metric_input, gold_info)``; gold_info maps str(query_id) to the
     relevant/retrieved ids used to stratify hallucination by hit@k."""
-    metric_input, _ = prepare_metric_input(qa_examples, retrieved_all, relevant_map)
+    metric_input, _ = prepare_metric_input(
+        qa_examples, retrieved_all, relevant_map, chunk_articles)
     gold_info = {
         str(m["query_id"]): {"relevant": m["relevant"], "retrieved": m["retrieved"]}
         for m in metric_input
@@ -825,8 +863,12 @@ def _run_retrieval_phase(
     reranker,
     graph_index,
     relevant_map: dict,
+    chunk_articles: Optional[dict[str, str]] = None,
 ) -> tuple[list[list[dict]], dict, dict, dict[str, list]]:
     """Run retrieval and compute retrieval + source-hit metrics.
+
+    With *chunk_articles* ``retrieval_metrics["article_level"]`` holds the
+    article-level (chunker-independent) metrics.
 
     Returns
     -------
@@ -834,7 +876,9 @@ def _run_retrieval_phase(
         ``(retrieved_all, retrieval_metrics, source_metrics, full_retrieved)``
     """
     from pipeline.retrieval import retrieve
-    from evaluation.retrieval_metrics import compute_all_metrics, compute_source_hit_metrics
+    from evaluation.retrieval_metrics import (
+        compute_all_metrics, compute_article_metrics, compute_source_hit_metrics,
+    )
 
     print(
         f"  Retrieval ({stage.retrieval}, rerank={stage.use_rerank}, "
@@ -849,9 +893,17 @@ def _run_retrieval_phase(
     )
 
     metric_input, full_retrieved = prepare_metric_input(
-        qa_examples, retrieved_all, relevant_map,
+        qa_examples, retrieved_all, relevant_map, chunk_articles,
     )
     retrieval_metrics = compute_all_metrics(metric_input)
+    if chunk_articles is not None:
+        art = compute_article_metrics(metric_input)
+        retrieval_metrics["article_level"] = art
+        print(
+            f"    [article-level n={art['num_queries']}]  "
+            f"Hit@5={_fmt_opt(art['hit_at_5'])}  Hit@10={_fmt_opt(art['hit_at_10'])}  "
+            f"MRR={_fmt_opt(art['mrr'])}  nDCG@10={_fmt_opt(art['ndcg_at_10'])}"
+        )
     source_metrics = compute_source_hit_metrics(metric_input)
 
     _n_src = source_metrics.get("source_labeled_queries", 0)
@@ -1218,6 +1270,8 @@ def _assemble_final_result(
             "chunk_mrr_gold_only": retrieval_metrics.get("mrr"),
             "chunk_ndcg_at_10_gold_only": retrieval_metrics.get("ndcg_at_10"),
             "n_gold_labeled": retrieval_metrics.get("num_queries"),
+            "article_hit_at_5": (retrieval_metrics.get("article_level") or {}).get("hit_at_5"),
+            "article_mrr": (retrieval_metrics.get("article_level") or {}).get("mrr"),
         },
         "retrieval_metrics": retrieval_metrics,
         "source_hit_metrics": source_metrics,
@@ -1294,8 +1348,10 @@ def run_stage(
             embedder_cache, retriever_cache, bm25_cache, reranker_cache,
         )
     )
+    chunk_articles = chunk_article_map(corpus_chunks)
     retrieved_all, retrieval_metrics, source_metrics, _ = _run_retrieval_phase(
         stage, qa_examples, retriever, bm25, reranker, graph_index, relevant_map,
+        chunk_articles,
     )
 
     print(f"  Generation with {llm_model} …")
@@ -1308,7 +1364,8 @@ def run_stage(
         stage_key, stage, qa_examples, retrieved_all,
         retriever, llm_model, short_answer_mode, _inject_fn, _max_rate,
     )
-    metric_input, gold_info = _gold_info(qa_examples, retrieved_all, relevant_map)
+    metric_input, gold_info = _gold_info(
+        qa_examples, retrieved_all, relevant_map, chunk_articles)
 
     if generation_failed:
         print("  Skipping LLM-based metrics: generation failure rate exceeded.")
@@ -1492,10 +1549,10 @@ def print_ablation_table(
     h2 = (
         f"| {'Stage':<26} | "
         + " | ".join(f"{h:>{w}}" for h, w in zip(side_hdr, [9, 9, 7, 9, 7]))
-        + f" | {'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
+        + f" | {'ArtHit@5':>8} | {'ArtMRR':>7} | {'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
     )
     sep2 = "|" + "|".join(
-        ["-" * w for w in [28, 11, 11, 9, 11, 9, 9, 9, 9]]
+        ["-" * w for w in [28, 11, 11, 9, 11, 9, 10, 9, 9, 9, 9]]
     ) + "|"
 
     print("=" * 100)
@@ -1512,8 +1569,10 @@ def print_ablation_table(
         cells = " | ".join(
             f"{c:>{w}}" for c, w in zip(side_cells(r), [9, 9, 7, 9, 7])
         )
+        art = (r.get("retrieval_metrics") or {}).get("article_level") or {}
         print(
             f"| {stage_name:<26} | {cells} | "
+            f"{_f4(art.get('hit_at_5')):>8} | {_f4(art.get('mrr')):>7} | "
             f"{_f4(r.get('scenario1_score')):>7} | "
             f"{_f4(r.get('scenario2_score')):>7} | "
             f"{_f4(r.get('scenario3_score')):>7} |"

@@ -172,3 +172,25 @@ def compute_all_metrics(results: list[dict]) -> dict:
         "num_queries":      n,
         "total_queries":    total_queries,
     }
+
+
+def article_key(source: str, madde_no) -> "str | None":
+    """Chunker-independent id of a law article: ``"<source>||<madde_no>"``."""
+    return f"{source}||{str(madde_no).lower()}" if source and madde_no else None
+
+
+def compute_article_metrics(metric_input: list[dict]) -> dict:
+    """Article-level retrieval metrics: :func:`compute_all_metrics` over the
+    (law, article) ids of the ranked chunks instead of chunk ids.
+
+    Entries need ``relevant_articles`` and ``retrieved_articles`` (see
+    ``pipeline.evaluation.prepare_metric_input``); a chunk without an article
+    keeps its own id so it still occupies its rank.  Two chunks of the same
+    article count once, so the numbers do not move when the chunk size does.
+    """
+    return compute_all_metrics([
+        {"query_id": m["query_id"],
+         "relevant": m.get("relevant_articles") or [],
+         "retrieved": m.get("retrieved_articles") or []}
+        for m in metric_input
+    ])

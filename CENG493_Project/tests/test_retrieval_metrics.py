@@ -275,3 +275,27 @@ class TestDuplicateChunkIds:
         res = compute_all_metrics(_single("q", ["R", "x"], ["R", "R"]))
         assert res["recall_at_5"] == pytest.approx(1.0)
         assert res["capped_recall_at_5"] == pytest.approx(1.0)
+
+
+class TestArticleLevel:
+    def test_two_chunks_of_one_article_count_once(self):
+        from evaluation.retrieval_metrics import compute_article_metrics
+        mi = [{"query_id": "q",
+               "relevant_articles": ["TCK||86"],
+               # ranks: TCK 85 (two chunks) then TCK 86 -> article rank 2
+               "retrieved_articles": ["TCK||85", "TCK||86", "chunk::x"]}]
+        res = compute_article_metrics(mi)
+        assert res["mrr"] == pytest.approx(0.5) and res["hit_at_5"] == 1.0
+
+    def test_prepare_metric_input_maps_chunks_to_articles(self):
+        from types import SimpleNamespace
+        from pipeline.evaluation import prepare_metric_input
+        qa = [SimpleNamespace(query_id="q", source="TCK", madde_no="86"),
+              SimpleNamespace(query_id="r", source="TCK", madde_no=None)]
+        chunks = [[{"chunk_id": "a1"}, {"chunk_id": "a2"}, {"chunk_id": "b1"}, {"chunk_id": "z"}],
+                  [{"chunk_id": "b1"}]]
+        arts = {"a1": "TCK||85", "a2": "TCK||85", "b1": "TCK||86"}
+        mi, _ = prepare_metric_input(qa, chunks, {"q": ["b1"], "r": ["b1"]}, arts)
+        assert mi[0]["relevant_articles"] == ["TCK||86"]
+        assert mi[0]["retrieved_articles"] == ["TCK||85", "TCK||86", "chunk::z"]
+        assert mi[1]["relevant_articles"] == ["TCK||86"]  # from gold chunks
