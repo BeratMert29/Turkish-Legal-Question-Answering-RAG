@@ -70,13 +70,8 @@ TRAINING_CONFIG = {
 
 
 def load_jsonl(path: Path) -> list[dict]:
-    records = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return records
+    from utils import read_jsonl
+    return list(read_jsonl(path))
 
 
 def format_as_chat(example: dict, tokenizer) -> str:

@@ -62,16 +62,12 @@ def _map_ipproo_row(row: dict, idx: int) -> dict:
 
 
 def load_existing(path: Path) -> tuple[list[dict], set[str]]:
+    from utils import read_jsonl
     records = []
     seen_questions: set[str] = set()
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            records.append(rec)
-            seen_questions.add(_normalize(rec["question"]))
+    for rec in read_jsonl(path):
+        records.append(rec)
+        seen_questions.add(_normalize(rec["question"]))
     return records, seen_questions
 
 

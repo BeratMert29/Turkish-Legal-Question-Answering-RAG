@@ -37,19 +37,14 @@ log = logging.getLogger(__name__)
 
 def load_metadata_from_index() -> list[dict]:
     """Load metadata records from config.INDEX_DIR / config.METADATA_FILE."""
+    from utils import read_jsonl
     meta_path = config.INDEX_DIR / config.METADATA_FILE
     if not meta_path.exists():
         raise FileNotFoundError(
             f"Metadata file not found: {meta_path}\n"
             "Run scripts/02_build_index.py first to create the FAISS index."
         )
-    records = []
-    with open(meta_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return records
+    return list(read_jsonl(meta_path))
 
 
 def load_metadata_from_corpus(corpus_path: Path) -> list[dict]:

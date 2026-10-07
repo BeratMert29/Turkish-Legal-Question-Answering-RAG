@@ -17,13 +17,8 @@ from retrieval.bm25_retriever import BM25Index
 
 
 def load_jsonl(path: Path) -> list[dict]:
-    records = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return records
+    from utils import read_jsonl
+    return list(read_jsonl(path))
 
 
 def assemble_context(chunks: list, top_k: int, context_window_chars: int) -> str:
