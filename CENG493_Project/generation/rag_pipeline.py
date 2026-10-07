@@ -40,15 +40,15 @@ class ChunkExpander:
         self._by_prefix: dict[str, list[tuple[int, dict]]] = {}
         for meta in read_jsonl(metadata_path):
             chunk_id: str = meta.get("chunk_id", "")
-                last_sep = chunk_id.rfind("_")
-                if last_sep == -1:
-                    continue
-                prefix = chunk_id[:last_sep]
-                try:
-                    idx = int(chunk_id[last_sep + 1:])
-                except ValueError:
-                    continue
-                self._by_prefix.setdefault(prefix, []).append((idx, meta))
+            last_sep = chunk_id.rfind("_")
+            if last_sep == -1:
+                continue
+            prefix = chunk_id[:last_sep]
+            try:
+                idx = int(chunk_id[last_sep + 1:])
+            except ValueError:
+                continue
+            self._by_prefix.setdefault(prefix, []).append((idx, meta))
         for prefix in self._by_prefix:
             self._by_prefix[prefix].sort(key=lambda t: t[0])
 
