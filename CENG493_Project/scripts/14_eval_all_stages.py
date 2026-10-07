@@ -170,10 +170,36 @@ def main() -> None:
                 continue
         if stage.llm == "finetuned":
             import subprocess
-            result = subprocess.run(
-                ["ollama", "list"], capture_output=True, text=True,
+            try:
+                _ollama_result = subprocess.run(
+                    ["ollama", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except FileNotFoundError:
+                print(
+                    f"INFO: Stage '{key}' skipped -- "
+                    f"'ollama' executable not found in PATH."
+                )
+                continue
+            except subprocess.TimeoutExpired:
+                print(
+                    f"INFO: Stage '{key}' skipped -- "
+                    f"'ollama list' timed out."
+                )
+                continue
+            # Exact name match: compare first column, allowing ':latest' suffix.
+            _target = config.LLM_FINETUNED_MODEL
+            _found = any(
+                (parts := line.split()) and (
+                    parts[0] == _target
+                    or parts[0] == _target + ":latest"
+                )
+                for line in _ollama_result.stdout.splitlines()
+                if line.strip()
             )
-            if config.LLM_FINETUNED_MODEL not in result.stdout:
+            if not _found:
                 print(
                     f"INFO: Stage '{key}' skipped -- "
                     f"Ollama model '{config.LLM_FINETUNED_MODEL}' not found.\n"
