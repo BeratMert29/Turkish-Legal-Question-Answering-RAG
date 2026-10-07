@@ -171,6 +171,51 @@ class TestSaveRawResponses:
             save_raw_responses("test", [], target)
             assert target.exists()
 
+    def test_appends_on_second_call(self):
+        """Calling save_raw_responses twice accumulates records (mode 'a')."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s1 = [{"query_id": "q1", "score": 0.8, "raw_response": "0.8", "parse_failed": False}]
+            s2 = [{"query_id": "q2", "score": 0.6, "raw_response": "0.6", "parse_failed": False}]
+            out = save_raw_responses("answer", s1, tmp)
+            save_raw_responses("answer", s2, tmp)
+            lines = [l for l in out.read_text(encoding="utf-8").splitlines() if l.strip()]
+            assert len(lines) == 2, "Second call should append, not overwrite"
+            ids = [json.loads(l)["query_id"] for l in lines]
+            assert ids == ["q1", "q2"]
+
+    def test_run_id_present_in_each_record(self):
+        """Every record written by save_raw_responses has a 'run_id' key."""
+        with tempfile.TemporaryDirectory() as tmp:
+            per_sample = [
+                {"query_id": "q1", "score": 0.9, "raw_response": "0.9", "parse_failed": False},
+                {"query_id": "q2", "score": 0.7, "raw_response": "0.7", "parse_failed": False},
+            ]
+            out = save_raw_responses("faithfulness", per_sample, tmp)
+            loaded = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines() if l]
+            assert all("run_id" in r for r in loaded), "run_id must be in every record"
+
+    def test_same_run_id_within_call(self):
+        """All records from a single call share the same run_id."""
+        with tempfile.TemporaryDirectory() as tmp:
+            per_sample = [
+                {"query_id": f"q{i}", "score": 0.5, "raw_response": "0.5", "parse_failed": False}
+                for i in range(3)
+            ]
+            out = save_raw_responses("coherence", per_sample, tmp)
+            loaded = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines() if l]
+            run_ids = {r["run_id"] for r in loaded}
+            assert len(run_ids) == 1, "All records in one call must share the same run_id"
+
+    def test_different_run_ids_across_calls(self):
+        """Two successive calls produce different run_ids."""
+        with tempfile.TemporaryDirectory() as tmp:
+            s = [{"query_id": "q1", "score": 0.8, "raw_response": "0.8", "parse_failed": False}]
+            out = save_raw_responses("answer", s, tmp)
+            save_raw_responses("answer", s, tmp)
+            lines = [l for l in out.read_text(encoding="utf-8").splitlines() if l]
+            loaded = [json.loads(l) for l in lines]
+            assert loaded[0]["run_id"] != loaded[1]["run_id"]
+
 
 # ---------------------------------------------------------------------------
 # llm_judge_* — mocked Ollama

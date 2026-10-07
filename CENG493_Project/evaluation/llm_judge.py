@@ -159,21 +159,28 @@ def save_raw_responses(
 ) -> Path:
     """Append raw judge responses for *metric_name* to a JSONL file in *results_dir*.
 
+    Records are **appended** (mode ``"a"``) rather than overwritten so that
+    responses from multiple evaluation runs accumulate in a single file.  A
+    ``run_id`` key (UUID4) is injected into every record to distinguish runs
+    when the file contains entries from more than one invocation.
+
     Args:
-        metric_name: Short identifier, e.g. "answer", "faithfulness".
-        per_sample:  List of dicts as returned by each llm_judge_* function.
-        results_dir: Directory where the JSONL is written.
+        metric_name: Short identifier, e.g. ``"answer"``, ``"faithfulness"``.
+        per_sample:  List of dicts as returned by each ``llm_judge_*`` function.
+        results_dir: Directory where the JSONL is written (created if absent).
 
     Returns:
         Path to the written file.
     """
+    import uuid as _uuid
+    run_id = str(_uuid.uuid4())
     out_dir = Path(results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"judge_raw_{metric_name}.jsonl"
-    with open(out_path, "w", encoding="utf-8") as fh:
+    with open(out_path, "a", encoding="utf-8") as fh:
         for rec in per_sample:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    logger.debug("LLM judge raw responses saved to %s", out_path)
+            fh.write(json.dumps({**rec, "run_id": run_id}, ensure_ascii=False) + "\n")
+    logger.debug("LLM judge raw responses appended to %s", out_path)
     return out_path
 
 
