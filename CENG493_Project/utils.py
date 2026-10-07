@@ -197,7 +197,7 @@ def git_revision(cwd: "str | pathlib.Path | None" = None) -> dict:
 
 
 def package_versions(names=("torch", "transformers", "sentence-transformers", "faiss-cpu",
-                            "faiss-gpu", "rank-bm25", "ranx", "numpy", "openai",
+                            "faiss-gpu", "rank-bm25", "ranx", "numpy", "requests",
                             "langchain-text-splitters", "snowballstemmer", "peft")) -> dict:
     """Installed versions of the packages that affect results (absent ones omitted)."""
     from importlib import metadata

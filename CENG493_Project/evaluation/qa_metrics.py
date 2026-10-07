@@ -373,6 +373,11 @@ def compute_all_qa_metrics_with_citation(predictions: list[dict]) -> dict:
         if p.get("predicted_native") is not None:
             nat.append(citation_accuracy(p["predicted_native"], chunks, exp_src))
             nat_pres.append(citation_presence(p["predicted_native"]))
+    # Generation diagnostics (recorded by the pipeline when available):
+    # answers that hit max_tokens and answers whose invented "Soru:" turn was cut.
+    for key, out in (("truncated", "truncated_rate"), ("runaway_cut", "runaway_cut_rate")):
+        flags = [bool(p[key]) for p in predictions if key in p]
+        result[out] = sum(flags) / len(flags) if flags else None
     result["citation_accuracy_injected"] = sum(inj) / n
     result["citation_presence_rate_injected"] = sum(inj_pres) / n
     result["citation_accuracy_native"] = sum(nat) / len(nat) if nat else None

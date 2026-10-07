@@ -1,3 +1,6 @@
+import re
+from pathlib import PurePath
+
 import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
@@ -10,6 +13,15 @@ class EmbedderProtocol(Protocol):
     def load_model(self) -> None: ...
     def encode(self, texts: list[str], is_query: bool = False,
                show_progress: bool = True) -> "np.ndarray": ...
+
+def uses_e5_prefixes(model_name: str) -> bool:
+    """True for E5-family models ("intfloat/multilingual-e5-large"), which need
+    "query: " / "passage: " prefixes.  Only the last path component is checked,
+    as a dash/underscore-delimited token, so a local path that merely
+    contains "e5" somewhere (e.g. ".../run-3fe51a/bge-m3") does not match."""
+    name = PurePath(str(model_name).replace("\\", "/")).name.lower()
+    return re.search(r"(?:^|[-_])e5(?:[-_]|$)", name) is not None
+
 
 class Embedder:
     def __init__(self, model_name: str = config.EMBEDDING_MODEL,
@@ -43,7 +55,7 @@ class Embedder:
         """
         if self.model is None:
             raise RuntimeError("Call load_model() before encode()")
-        if "e5" in self.model_name.lower():
+        if uses_e5_prefixes(self.model_name):
             prefix = "query: " if is_query else "passage: "
             prefixed = [prefix + t for t in texts]
         else:

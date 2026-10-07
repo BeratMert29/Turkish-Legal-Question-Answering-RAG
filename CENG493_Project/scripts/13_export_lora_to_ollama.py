@@ -183,17 +183,21 @@ def convert_to_gguf(dry_run: bool) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def write_modelfile() -> None:
     _step(3, "Ollama Modelfile oluştur")
+    # The evaluation sends num_ctx / stop / num_predict with every request
+    # (identical for the base model); the Modelfile only sets the same values
+    # as defaults for interactive use.  FROM is relative to the Modelfile so
+    # the file carries no machine-specific path.
+    stops = "".join(
+        f"PARAMETER stop {json.dumps(s, ensure_ascii=False)}\n" for s in config.LLM_STOP
+    )
     content = (
-        f"FROM {GGUF_PATH}\n"
+        f"FROM ./{GGUF_PATH.name}\n"
         f"PARAMETER temperature {config.LLM_TEMPERATURE}\n"
         f"PARAMETER num_predict {config.LLM_MAX_TOKENS}\n"
-        f"PARAMETER num_ctx 8192\n"
+        f"PARAMETER num_ctx {config.LLM_NUM_CTX}\n"
         f"PARAMETER num_gpu 999\n"
-        'PARAMETER stop "Soru:"\n'
-        'PARAMETER stop "\\nSoru"\n'
-        'PARAMETER stop "<|im_end|>"\n'
-        'PARAMETER stop "<|endoftext|>"\n'
-        'SYSTEM "Sen Türk hukuku alanında uzman bir hukuki asistansın. '
+        + stops
+        + 'SYSTEM "Sen Türk hukuku alanında uzman bir hukuki asistansın. '
         'Soruları yalnızca verilen bağlama dayanarak Türkçe yanıtla."\n'
     )
     MODELFILE_PATH.write_text(content, encoding="utf-8")

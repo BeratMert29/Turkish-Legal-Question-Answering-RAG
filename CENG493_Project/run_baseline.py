@@ -171,7 +171,7 @@ def main() -> None:
     from pipeline.retrieval import retrieve
     from utils import set_seeds, check_ollama
 
-    set_seeds(42)
+    set_seeds(config.SEED)
 
     # -- Load corpus and QA data -------------------------------------------
     short_answer_mode: bool = False
@@ -210,6 +210,16 @@ def main() -> None:
         )
     else:
         retriever = load_index(embedder)
+        # Gold labels, BM25 and the graph are built from corpus_chunks; an
+        # index built from another corpus (e.g. scripts/01's holdout corpus)
+        # silently makes gold chunks unretrievable.
+        index_ids = [m.get("chunk_id") for m in retriever.metadata]
+        if index_ids != [c.chunk_id for c in corpus_chunks]:
+            sys.exit(
+                f"ERROR: the saved index ({len(index_ids)} chunks, {config.INDEX_DIR}) "
+                f"does not match this run's corpus ({len(corpus_chunks)} chunks).\n"
+                f"  Re-run with --build-index."
+            )
 
     graph_index = None
     if args.graph:
@@ -330,16 +340,11 @@ def main() -> None:
     retrieval_time = round(time.time() - t0, 2)
 
     from evaluation.retrieval_metrics import compute_all_metrics
+    from pipeline.evaluation import prepare_metric_input
 
-    results_list = []
-    for qa, retrieved_chunks in zip(qa_examples, all_retrieved):
-        results_list.append({
-            "query_id": qa.query_id,
-            "retrieved": [c["chunk_id"] for c in retrieved_chunks],
-            "relevant": relevant_map.get(qa.query_id, []),
-            "retrieved_chunks": [dict(c) for c in retrieved_chunks],
-        })
-
+    # Same metric input as scripts/14: pre-expansion ranking (graph neighbours
+    # excluded), deduplicated chunk ids.
+    results_list, _ = prepare_metric_input(qa_examples, all_retrieved, relevant_map)
     retrieval_metrics = compute_all_metrics(results_list)
     retrieval_metrics["retrieval_time_s"] = retrieval_time
     log.info("Retrieval metrics: %s", retrieval_metrics)

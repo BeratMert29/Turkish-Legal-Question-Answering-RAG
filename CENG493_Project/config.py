@@ -141,10 +141,15 @@ LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_API_KEY = "ollama"
 LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 512
-# Context window for BOTH LLMs.  Baked into the fine-tuned Modelfile; for the
-# base model start Ollama with OLLAMA_CONTEXT_LENGTH=8192 (the OpenAI-compatible
-# endpoint cannot set num_ctx per request).
+# Context window for BOTH LLMs, sent as options.num_ctx on every native
+# /api/chat request (and baked into the fine-tuned Modelfile), so it no longer
+# depends on the server's OLLAMA_CONTEXT_LENGTH.
 LLM_NUM_CTX = 8192
+LLM_TIMEOUT_S = 300   # per generation request
+# Stop sequences sent with every request to BOTH LLMs (request options override
+# Modelfile parameters, so the base and fine-tuned model stop identically).
+LLM_STOP = ["<|im_end|>", "<|endoftext|>", "\nSoru:", "\nBağlam:"]
+LLM_MAX_RETRIES = 3   # on connection errors / timeouts
 # Stage is marked failed when more than this fraction of generations / judge calls fail
 MAX_FAILURE_RATE = 0.2
 # trust_remote_code executes code shipped with a model repo.  Qwen2.5 and

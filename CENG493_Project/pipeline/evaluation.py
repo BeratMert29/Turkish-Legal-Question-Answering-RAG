@@ -117,6 +117,7 @@ def run_generation_loop(
         try:
             ctx, ctx_chunks = pipeline.assemble_context(chunks)
             native_answer = pipeline.generate(qa.question, ctx)
+            meta = getattr(pipeline, "last_meta", None) or {}
             answer = native_answer
             if inject_citations_fn is not None:
                 answer = inject_citations_fn(native_answer, ctx_chunks)
@@ -131,6 +132,10 @@ def run_generation_loop(
                 "retrieved_sources": [c["source"] for c in ctx_chunks],
                 "expected_source": qa.source,
                 "retrieved_chunks": [dict(c) for c in ctx_chunks],
+                # hit max_tokens / an invented "Soru:" turn was cut off
+                "truncated": meta.get("done_reason") == "length",
+                "runaway_cut": bool(meta.get("runaway_cut")),
+                "output_tokens": meta.get("output_tokens"),
             })
         except Exception as exc:
             print(f"\n    ERROR on {qa.query_id}: {exc}")
@@ -810,7 +815,9 @@ def _run_generation_and_qa(
         f"ROUGE-L={qa_metrics.get('rouge_l', 0):.4f}  "
         f"Cite(native)={_fmt_opt(qa_metrics.get('citation_accuracy_native'))}  "
         f"Cite(injected)={_fmt_opt(qa_metrics.get('citation_accuracy_injected'))}  "
-        f"AnsLen={qa_metrics.get('mean_answer_len_words', 0):.1f}w"
+        f"AnsLen={qa_metrics.get('mean_answer_len_words', 0):.1f}w  "
+        f"Truncated={_fmt_opt(qa_metrics.get('truncated_rate'))}  "
+        f"RunawayCut={_fmt_opt(qa_metrics.get('runaway_cut_rate'))}"
     )
     return (
         predictions, n_total, len(failed), n_errors, gen_failed, qa_metrics,
