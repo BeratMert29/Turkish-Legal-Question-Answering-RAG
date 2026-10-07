@@ -19,6 +19,7 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import numpy as np
+from utils import read_jsonl
 import config
 from retrieval.embedder import Embedder
 
@@ -33,11 +34,6 @@ RANDOM_SEED = 42
 QA_PATH = config.PROCESSED_DIR / "qa_train.jsonl"
 CORPUS_PATH = config.PROCESSED_DIR / "corpus_chunks.jsonl"
 OUTPUT_PATH = config.PROCESSED_DIR / "embedding_triplets.jsonl"
-
-
-def load_jsonl(path: Path) -> list[dict]:
-    from utils import read_jsonl
-    return list(read_jsonl(path))
 
 
 def _jaccard_tokens(a: str, b: str) -> float:
@@ -68,11 +64,11 @@ def main() -> None:
 
     # ── Load data ────────────────────────────────────────────────────────────
     print(f"Loading QA pairs from {QA_PATH} ...")
-    qa_pairs = load_jsonl(QA_PATH)
+    qa_pairs = list(read_jsonl(QA_PATH))
     print(f"  {len(qa_pairs)} QA pairs loaded.")
 
     print(f"Loading corpus chunks from {CORPUS_PATH} ...")
-    corpus = load_jsonl(CORPUS_PATH)
+    corpus = list(read_jsonl(CORPUS_PATH))
     chunk_texts = [c["text"] for c in corpus]
     chunk_ids = [c["chunk_id"] for c in corpus]
     print(f"  {len(corpus)} corpus chunks loaded.")

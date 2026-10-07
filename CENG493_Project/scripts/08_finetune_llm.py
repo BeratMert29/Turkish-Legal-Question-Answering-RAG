@@ -15,11 +15,12 @@ _project_root = str(Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from utils import read_jsonl
 import config
 from generation.rag_pipeline import TURKISH_PROMPT
 
 HF_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-QLORA_MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
+QLORA_MODEL_ID = config.LORA_BASE_HF_MODEL  # 7B; matches config.LLM_BASE_FOR_ABLATION
 ADAPTER_DIR = config.BASE_DIR / "models" / "qwen25_lora"
 
 RAG_DATASET    = config.PROCESSED_DIR / "qa_train_rag.jsonl"
@@ -67,11 +68,6 @@ TRAINING_CONFIG = {
     },
     "adapter_output_dir": str(ADAPTER_DIR),
 }
-
-
-def load_jsonl(path: Path) -> list[dict]:
-    from utils import read_jsonl
-    return list(read_jsonl(path))
 
 
 def format_as_chat(example: dict, tokenizer) -> str:
@@ -186,7 +182,7 @@ def main() -> None:
         print(f"ERROR: dataset not found at {dataset_path}")
         sys.exit(1)
     print(f"Loading dataset from {dataset_path} ...")
-    raw_records = load_jsonl(dataset_path)
+    raw_records = list(read_jsonl(dataset_path))
     if args.sample_size is not None:
         raw_records = raw_records[:args.sample_size]
     print(f"  {len(raw_records)} examples loaded.")
@@ -199,7 +195,7 @@ def main() -> None:
     TRAINING_CONFIG["backend"] = "qlora_4bit" if args.backend == "qlora" else "safe_lora_fp16"
 
     print(f"\nLoading tokenizer from {model_id} ...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=config.TRUST_REMOTE_CODE)
     # Qwen2.5 has no pad token by default; reuse eos so padding doesn't break training
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -221,7 +217,7 @@ def main() -> None:
         load_kwargs = {
             "torch_dtype": torch.float16,
             "device_map": "auto",
-            "trust_remote_code": True,
+            "trust_remote_code": config.TRUST_REMOTE_CODE,
         }
         if args.backend == "qlora":
             load_kwargs["quantization_config"] = bnb_cfg
@@ -249,14 +245,14 @@ def main() -> None:
             quantization_config=bnb_config,
             torch_dtype=torch.float16,
             device_map="auto",
-            trust_remote_code=True,
+            trust_remote_code=config.TRUST_REMOTE_CODE,
         )
     else:
         print(f"\nLoading base model {model_id} in safe fp16 LoRA mode ...")
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch.float16,
-            trust_remote_code=True,
+            trust_remote_code=config.TRUST_REMOTE_CODE,
         )
         if torch.cuda.is_available():
             model = model.to("cuda")

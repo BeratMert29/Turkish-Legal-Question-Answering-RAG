@@ -227,13 +227,23 @@ class GraphIndex:
             injected = self.inject_from_query(query, exclude=seen)
             seen.update(c["chunk_id"] for c in injected)
 
-        added: list[dict] = list(injected)
+        # Directly-referenced article chunks have no parent; they are flagged
+        # and trail the list.
+        for c in injected:
+            c["graph_neighbor"] = True
+            c["graph_parent"] = None
+            c["graph_root"] = None
         remaining_budget = budget
+        # parent chunk_id -> neighbours (BFS order) to splice in right after it
+        children: dict[str, list[dict]] = {}
+        root_of: dict[str, str] = {}
 
         sorted_chunks = sorted(chunks, key=lambda c: c["score"], reverse=True)
         queue: deque[tuple[str, float, int]] = deque(
             (c["chunk_id"], c["score"], 0) for c in sorted_chunks
         )
+        for c in chunks:
+            root_of[c["chunk_id"]] = c["chunk_id"]
 
         while queue and remaining_budget > 0:
             current_id, parent_score, depth = queue.popleft()
@@ -247,19 +257,30 @@ class GraphIndex:
                     seen.add(nb_id)
                     continue
                 nb_score = parent_score * decay.get(kind, 0.7)
-                added.append({
+                root = root_of[current_id]
+                children.setdefault(root, []).append({
                     "chunk_id": nb_id,
                     "text": meta["text"],
                     "doc_id": meta["doc_id"],
                     "source": meta["source"],
                     "score": nb_score,
+                    "graph_neighbor": True,
+                    "graph_parent": current_id,
+                    "graph_root": root,
                 })
+                root_of[nb_id] = root
                 seen.add(nb_id)
                 remaining_budget -= 1
                 if depth + 1 < hops:
                     queue.append((nb_id, nb_score, depth + 1))
 
-        return chunks + added
+        # Each neighbour sits directly after its (root) parent so that cutting
+        # the list to the generation top-k keeps parent and neighbour together.
+        merged: list[dict] = []
+        for c in chunks:
+            merged.append(c)
+            merged.extend(children.get(c["chunk_id"], []))
+        return merged + injected
 
     def expand_batch(
         self,

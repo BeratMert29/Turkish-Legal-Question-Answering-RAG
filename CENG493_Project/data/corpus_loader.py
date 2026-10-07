@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import config
 from data.data_processor import DataProcessor, CorpusChunk
+from utils import read_jsonl
 
 if TYPE_CHECKING:
     pass
@@ -106,7 +107,7 @@ def load_corpus_jsonl(path: pathlib.Path) -> list[dict]:
     regardless of whether the file came from the evaluator or was produced by
     this project's own tooling.
     """
-    records = DataProcessor.load_jsonl(path)
+    records = list(read_jsonl(path))
     return [_normalize_corpus_record(r) for r in records]
 
 
@@ -117,7 +118,7 @@ def _maybe_normalize_corpus_file(path: pathlib.Path) -> None:
     If the first record already has ``chunk_id`` the file is left untouched so
     we never rewrite a file unnecessarily.
     """
-    records = DataProcessor.load_jsonl(path)
+    records = list(read_jsonl(path))
     if not records:
         return
     # Peek at the first record to decide whether normalization is needed.

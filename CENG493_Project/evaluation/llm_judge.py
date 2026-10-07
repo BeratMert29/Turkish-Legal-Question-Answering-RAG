@@ -7,8 +7,9 @@ Provides four scoring functions using Turkish prompts:
   - llm_judge_relevancy   : relevance of answer to question
   - llm_judge_coherence   : linguistic coherence of answer
 
-All functions accept a sample_size param (default from config.LLM_JUDGE_SAMPLE_SIZE)
-and run on a random subsample to stay within time budgets.
+All functions accept a sample_size param (default config.LLM_JUDGE_SAMPLE_SIZE;
+None = judge every prediction). Rubrics are Turkish with explicit 0 / 0.5 / 1
+anchors; Ollama is called with an explicit num_ctx.
 
 Each function returns a dict with keys:
   "score"           : float mean (None-excluded), or None if all parses failed
@@ -16,7 +17,8 @@ Each function returns a dict with keys:
   "parse_fail_count": int number of samples where score could not be parsed
   "sample_size"     : int number of samples actually judged
 
-Raw judge responses are saved per-stage to a JSONL file via save_raw_responses().
+Raw judge responses are saved per run to judge_raw_<metric>_<run_id>.jsonl via
+save_raw_responses() (one file per run, never appended across runs).
 
 Bug fix: _parse_score now returns None on failure instead of 0.5, so failed
 parses are excluded from the mean rather than biasing it toward 0.5.
@@ -52,11 +54,13 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Default sample size — can be overridden by config.LLM_JUDGE_SAMPLE_SIZE
-_DEFAULT_SAMPLE_SIZE: int = 20
+# Default sample size: None = judge all predictions (config.LLM_JUDGE_SAMPLE_SIZE).
+_DEFAULT_SAMPLE_SIZE: Optional[int] = None
+_DEFAULT_NUM_CTX: int = 8192
 try:
     import config as _cfg
-    _DEFAULT_SAMPLE_SIZE = getattr(_cfg, "LLM_JUDGE_SAMPLE_SIZE", 20)
+    _DEFAULT_SAMPLE_SIZE = getattr(_cfg, "LLM_JUDGE_SAMPLE_SIZE", None)
+    _DEFAULT_NUM_CTX = getattr(_cfg, "LLM_JUDGE_NUM_CTX", 8192)
 except Exception:
     pass
 
@@ -112,6 +116,7 @@ def _ollama_generate(
     base_url: str,
     model: str,
     max_retries: int = 3,
+    num_ctx: Optional[int] = None,
 ) -> Optional[str]:
     """Call Ollama /api/generate and return the response text.
 
@@ -127,12 +132,16 @@ def _ollama_generate(
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.0, "num_predict": 16},
+        "options": {
+            "temperature": 0.0,
+            "num_predict": 16,
+            "num_ctx": int(num_ctx or _DEFAULT_NUM_CTX),
+        },
     }
 
     for attempt in range(max_retries):
         try:
-            resp = requests.post(url, json=payload, timeout=30)
+            resp = requests.post(url, json=payload, timeout=120)
             resp.raise_for_status()
             data = resp.json()
             text = data.get("response", "").strip()
@@ -150,9 +159,9 @@ def _ollama_generate(
     return None
 
 
-def _subsample(items: list, sample_size: int, seed: int = 42) -> list:
-    """Return a deterministic random subsample of *items*."""
-    if len(items) <= sample_size:
+def _subsample(items: list, sample_size: Optional[int], seed: int = 42) -> list:
+    """Deterministic random subsample; sample_size None (or >= len) keeps all."""
+    if sample_size is None or len(items) <= sample_size:
         return items
     rng = random.Random(seed)
     return rng.sample(items, sample_size)
@@ -160,57 +169,43 @@ def _subsample(items: list, sample_size: int, seed: int = 42) -> list:
 
 def sample_judge_query_ids(
     query_ids: "list[str]",
-    n: int,
+    n: Optional[int],
     seed: int = 42,
 ) -> "list[str]":
-    """Sample *n* query IDs for consistent cross-metric LLM judging.
+    """Sample *n* query IDs for consistent cross-metric judging (and NLI).
 
-    Call this once before running the four ``llm_judge_*`` functions and pass
-    the returned list to all of them via their ``query_ids`` parameter.  Each
-    function will then filter its predictions to exactly those IDs, ensuring
-    every metric is evaluated on an identical subset and per-query score
-    comparisons are valid.
-
-    Args:
-        query_ids: All available query IDs (e.g. from the predictions list).
-        n:         Maximum number of IDs to sample.
-        seed:      RNG seed for reproducibility (default 42).
-
-    Returns:
-        Deterministic subsample of up to *n* query IDs.
+    ``n=None`` returns every ID. Call once and pass the result to all four
+    ``llm_judge_*`` functions (and to the NLI scorer) via ``query_ids`` so
+    every metric is evaluated on an identical subset.
     """
     return _subsample(query_ids, n, seed=seed)
+
+
+def new_run_id() -> str:
+    """Timestamped unique id for naming per-run raw judge files."""
+    import uuid as _uuid
+    return time.strftime("%Y%m%dT%H%M%S") + "-" + _uuid.uuid4().hex[:8]
 
 
 def save_raw_responses(
     metric_name: str,
     per_sample: list[dict],
     results_dir: "str | Path",
+    run_id: Optional[str] = None,
 ) -> Path:
-    """Append raw judge responses for *metric_name* to a JSONL file in *results_dir*.
+    """Write raw judge responses to ``judge_raw_<metric>_<run_id>.jsonl``.
 
-    Records are **appended** (mode ``"a"``) rather than overwritten so that
-    responses from multiple evaluation runs accumulate in a single file.  A
-    ``run_id`` key (UUID4) is injected into every record to distinguish runs
-    when the file contains entries from more than one invocation.
-
-    Args:
-        metric_name: Short identifier, e.g. ``"answer"``, ``"faithfulness"``.
-        per_sample:  List of dicts as returned by each ``llm_judge_*`` function.
-        results_dir: Directory where the JSONL is written (created if absent).
-
-    Returns:
-        Path to the written file.
+    One file per run (the file is written fresh, not appended), so reruns
+    never mix with earlier runs. A ``run_id`` key is added to every record.
     """
-    import uuid as _uuid
-    run_id = str(_uuid.uuid4())
+    run_id = run_id or new_run_id()
     out_dir = Path(results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"judge_raw_{metric_name}.jsonl"
-    with open(out_path, "a", encoding="utf-8") as fh:
+    out_path = out_dir / f"judge_raw_{metric_name}_{run_id}.jsonl"
+    with open(out_path, "w", encoding="utf-8") as fh:
         for rec in per_sample:
             fh.write(json.dumps({**rec, "run_id": run_id}, ensure_ascii=False) + "\n")
-    logger.debug("LLM judge raw responses appended to %s", out_path)
+    logger.debug("LLM judge raw responses written to %s", out_path)
     return out_path
 
 
@@ -227,249 +222,139 @@ def _aggregate(per_sample: list[dict]) -> dict:
     }
 
 
+_ANSWER_ONLY = "Sadece sayıyı yaz (0, 0.5 veya 1); başka hiçbir şey yazma."
+
+
+def _prompt_answer(item: dict) -> str:
+    question = item.get("question", item.get("query_id", ""))
+    return (
+        "Bir Türk hukuku sorusuna verilen cevabı, referans cevaba göre değerlendir.\n\n"
+        f"Soru: {question}\n"
+        f"Beklenen Cevap: {item.get('expected', '')}\n"
+        f"Verilen Cevap: {item.get('predicted', '')}\n\n"
+        "Puanlama:\n"
+        "1   = Verilen cevap referans cevapla aynı hukuki sonuca varıyor ve temel bilgileri içeriyor.\n"
+        "0.5 = Kısmen doğru: doğru bilgi var ama eksik, belirsiz veya bir kısmı yanlış.\n"
+        "0   = Yanlış, referans cevapla çelişen veya soruyla ilgisiz.\n"
+        + _ANSWER_ONLY
+    )
+
+
+def _prompt_faithfulness(item: dict) -> str:
+    chunks = item.get("retrieved_chunks", [])
+    context = "\n\n".join(c.get("text", "") for c in chunks[:5])
+    return (
+        "Cevabın yalnızca verilen bağlamdaki bilgilere dayanıp dayanmadığını değerlendir.\n\n"
+        f"Bağlam:\n{context}\n\n"
+        f"Cevap: {item.get('predicted', '')}\n\n"
+        "Puanlama:\n"
+        "1   = Cevaptaki tüm iddialar bağlamda yer alıyor veya bağlamdan doğrudan çıkarılabiliyor.\n"
+        "0.5 = Bazı iddialar bağlamda var, bazıları bağlamda bulunmuyor.\n"
+        "0   = İddiaların çoğu bağlamda yok veya bağlamla çelişiyor.\n"
+        + _ANSWER_ONLY
+    )
+
+
+def _prompt_relevancy(item: dict) -> str:
+    question = item.get("question", item.get("query_id", ""))
+    return (
+        "Cevabın soruyla ne kadar ilgili olduğunu değerlendir.\n\n"
+        f"Soru: {question}\n"
+        f"Cevap: {item.get('predicted', '')}\n\n"
+        "Puanlama:\n"
+        "1   = Cevap doğrudan sorulan soruyu yanıtlıyor.\n"
+        "0.5 = Cevap konuyla ilgili ama sorulan noktayı tam yanıtlamıyor.\n"
+        "0   = Cevap soruyla alakasız.\n"
+        + _ANSWER_ONLY
+    )
+
+
+def _prompt_coherence(item: dict) -> str:
+    return (
+        "Cevabın Türkçe dil bilgisi ve anlaşılırlık açısından tutarlılığını değerlendir.\n\n"
+        f"Cevap: {item.get('predicted', '')}\n\n"
+        "Puanlama:\n"
+        "1   = Akıcı, dil bilgisi doğru, kendi içinde tutarlı ve anlaşılır.\n"
+        "0.5 = Anlaşılır ama hatalı veya kopuk ifadeler içeriyor.\n"
+        "0   = Anlamsız, tekrarlı veya kendi içinde çelişkili.\n"
+        + _ANSWER_ONLY
+    )
+
+
+def _run_metric(
+    name: str,
+    seed: int,
+    prompt_fn,
+    predictions: list[dict],
+    ollama_base_url: str,
+    model: str,
+    sample_size: Optional[int],
+    results_dir,
+    query_ids,
+    num_ctx: Optional[int],
+    run_id: Optional[str],
+) -> dict:
+    if query_ids is not None:
+        qid_set = set(query_ids)
+        sample = [p for p in predictions if p.get("query_id") in qid_set]
+    else:
+        # Distinct seed per metric so independent subsamples differ unless a
+        # shared ``query_ids`` list is passed.
+        sample = _subsample(predictions, sample_size, seed=seed)
+    per_sample = []
+    for item in sample:
+        raw = _ollama_generate(prompt_fn(item), ollama_base_url, model, num_ctx=num_ctx)
+        score = None if raw is None else _parse_score(raw)
+        per_sample.append({
+            "query_id": item.get("query_id", ""),
+            "score": score,
+            "raw_response": raw,
+            "parse_failed": score is None,
+        })
+    result = _aggregate(per_sample)
+    if results_dir is not None:
+        save_raw_responses(name, per_sample, results_dir, run_id=run_id)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+# Each function: (predictions, ollama_base_url, model, sample_size=config default
+# (None = all), results_dir=None, query_ids=None, num_ctx=None, run_id=None)
+# -> {"score": float|None, "per_sample": [...], "parse_fail_count": int,
+#     "sample_size": int}
 
-def llm_judge_answer(
-    predictions: list[dict],
-    ollama_base_url: str,
-    model: str,
-    sample_size: int = _DEFAULT_SAMPLE_SIZE,
-    results_dir: "str | Path | None" = None,
-    query_ids: "list[str] | None" = None,
-) -> dict:
-    """Judge answer quality.
-
-    Each prediction must have keys: "question", "expected", "predicted".
-
-    Args:
-        predictions:    List of prediction dicts.
-        ollama_base_url: Base URL for the Ollama API.
-        model:          Ollama model name.
-        sample_size:    Maximum number of samples to judge (default from config).
-        results_dir:    If provided, raw responses are saved to this directory.
-        query_ids:      When provided, judge only these query IDs (bypasses
-                        per-function sampling).  Use ``sample_judge_query_ids``
-                        to obtain a consistent set shared across all four metrics.
-
-    Returns:
-        {"score": float|None, "per_sample": [...], "parse_fail_count": int,
-         "sample_size": int}
-    """
-    if query_ids is not None:
-        qid_set = set(query_ids)
-        sample = [p for p in predictions if p.get("query_id") in qid_set]
-    else:
-        # seed=42 for answer quality; distinct seed avoids accidentally identical
-        # subsamples across metrics (see module docstring).
-        sample = _subsample(predictions, sample_size, seed=42)
-    per_sample = []
-
-    for item in sample:
-        question  = item.get("question",  item.get("query_id", ""))
-        expected  = item.get("expected",  "")
-        predicted = item.get("predicted", "")
-
-        prompt = (
-            f"Soru: {question}\n"
-            f"Beklenen Cevap: {expected}\n"
-            f"Verilen Cevap: {predicted}\n\n"
-            "Verilen cevabın kalitesini 0 ile 1 arasında bir sayı ile değerlendir.\n"
-            "1 = mükemmel cevap, 0 = tamamen yanlış.\n"
-            "Sadece sayıyı yaz, başka hiçbir şey yazma."
-        )
-
-        raw = _ollama_generate(prompt, ollama_base_url, model)
-        score = None if raw is None else _parse_score(raw)
-        per_sample.append({
-            "query_id": item.get("query_id", ""),
-            "score": score,
-            "raw_response": raw,
-            "parse_failed": score is None,
-        })
-
-    result = _aggregate(per_sample)
-    if results_dir is not None:
-        save_raw_responses("answer", per_sample, results_dir)
-    return result
+def llm_judge_answer(predictions, ollama_base_url, model,
+                     sample_size=_DEFAULT_SAMPLE_SIZE, results_dir=None,
+                     query_ids=None, num_ctx=None, run_id=None) -> dict:
+    """Answer quality vs expected answer (needs question, expected, predicted)."""
+    return _run_metric("answer", 42, _prompt_answer, predictions, ollama_base_url,
+                       model, sample_size, results_dir, query_ids, num_ctx, run_id)
 
 
-def llm_judge_faithfulness(
-    predictions: list[dict],
-    ollama_base_url: str,
-    model: str,
-    sample_size: int = _DEFAULT_SAMPLE_SIZE,
-    results_dir: "str | Path | None" = None,
-    query_ids: "list[str] | None" = None,
-) -> dict:
-    """Judge faithfulness of answer to context.
-
-    Each prediction must have: "predicted" (answer), "retrieved_chunks"
-    (list of dicts with "text").
-
-    Args:
-        predictions:    List of prediction dicts.
-        ollama_base_url: Base URL for the Ollama API.
-        model:          Ollama model name.
-        sample_size:    Maximum number of samples to judge.
-        results_dir:    If provided, raw responses are saved to this directory.
-        query_ids:      When provided, judge only these query IDs (bypasses
-                        per-function sampling).
-
-    Returns:
-        {"score": float|None, "per_sample": [...], "parse_fail_count": int,
-         "sample_size": int}
-    """
-    if query_ids is not None:
-        qid_set = set(query_ids)
-        sample = [p for p in predictions if p.get("query_id") in qid_set]
-    else:
-        sample = _subsample(predictions, sample_size, seed=43)
-    per_sample = []
-
-    for item in sample:
-        answer  = item.get("predicted", "")
-        chunks  = item.get("retrieved_chunks", [])
-        context = "\n\n".join(c.get("text", "") for c in chunks[:5])
-
-        prompt = (
-            f"Bağlam:\n{context}\n\n"
-            f"Cevap: {answer}\n\n"
-            "Cevap yalnızca bağlamdaki bilgilere dayanıyor mu? "
-            "0 ile 1 arasında bir sayı ile değerlendir.\n"
-            "1 = tamamen sadık, 0 = tamamen uydurulmuş.\n"
-            "Sadece sayıyı yaz, başka hiçbir şey yazma."
-        )
-
-        raw   = _ollama_generate(prompt, ollama_base_url, model)
-        score = None if raw is None else _parse_score(raw)
-        per_sample.append({
-            "query_id": item.get("query_id", ""),
-            "score": score,
-            "raw_response": raw,
-            "parse_failed": score is None,
-        })
-
-    result = _aggregate(per_sample)
-    if results_dir is not None:
-        save_raw_responses("faithfulness", per_sample, results_dir)
-    return result
+def llm_judge_faithfulness(predictions, ollama_base_url, model,
+                           sample_size=_DEFAULT_SAMPLE_SIZE, results_dir=None,
+                           query_ids=None, num_ctx=None, run_id=None) -> dict:
+    """Faithfulness to retrieved context (needs predicted, retrieved_chunks)."""
+    return _run_metric("faithfulness", 43, _prompt_faithfulness, predictions,
+                       ollama_base_url, model, sample_size, results_dir, query_ids,
+                       num_ctx, run_id)
 
 
-def llm_judge_relevancy(
-    predictions: list[dict],
-    ollama_base_url: str,
-    model: str,
-    sample_size: int = _DEFAULT_SAMPLE_SIZE,
-    results_dir: "str | Path | None" = None,
-    query_ids: "list[str] | None" = None,
-) -> dict:
-    """Judge whether answer is relevant to question.
-
-    Each prediction must have: "question" (or query_id), "predicted".
-
-    Args:
-        predictions:    List of prediction dicts.
-        ollama_base_url: Base URL for the Ollama API.
-        model:          Ollama model name.
-        sample_size:    Maximum number of samples to judge.
-        results_dir:    If provided, raw responses are saved to this directory.
-        query_ids:      When provided, judge only these query IDs (bypasses
-                        per-function sampling).
-
-    Returns:
-        {"score": float|None, "per_sample": [...], "parse_fail_count": int,
-         "sample_size": int}
-    """
-    if query_ids is not None:
-        qid_set = set(query_ids)
-        sample = [p for p in predictions if p.get("query_id") in qid_set]
-    else:
-        sample = _subsample(predictions, sample_size, seed=44)
-    per_sample = []
-
-    for item in sample:
-        question = item.get("question", item.get("query_id", ""))
-        answer   = item.get("predicted", "")
-
-        prompt = (
-            f"Soru: {question}\n"
-            f"Cevap: {answer}\n\n"
-            "Cevap soruyla ne kadar ilgili? 0 ile 1 arasında bir sayı ile değerlendir.\n"
-            "1 = tamamen ilgili, 0 = tamamen alakasız.\n"
-            "Sadece sayıyı yaz, başka hiçbir şey yazma."
-        )
-
-        raw   = _ollama_generate(prompt, ollama_base_url, model)
-        score = None if raw is None else _parse_score(raw)
-        per_sample.append({
-            "query_id": item.get("query_id", ""),
-            "score": score,
-            "raw_response": raw,
-            "parse_failed": score is None,
-        })
-
-    result = _aggregate(per_sample)
-    if results_dir is not None:
-        save_raw_responses("relevancy", per_sample, results_dir)
-    return result
+def llm_judge_relevancy(predictions, ollama_base_url, model,
+                        sample_size=_DEFAULT_SAMPLE_SIZE, results_dir=None,
+                        query_ids=None, num_ctx=None, run_id=None) -> dict:
+    """Relevance of answer to question (needs question, predicted)."""
+    return _run_metric("relevancy", 44, _prompt_relevancy, predictions,
+                       ollama_base_url, model, sample_size, results_dir, query_ids,
+                       num_ctx, run_id)
 
 
-def llm_judge_coherence(
-    predictions: list[dict],
-    ollama_base_url: str,
-    model: str,
-    sample_size: int = _DEFAULT_SAMPLE_SIZE,
-    results_dir: "str | Path | None" = None,
-    query_ids: "list[str] | None" = None,
-) -> dict:
-    """Judge linguistic coherence of answer.
-
-    Each prediction must have: "predicted".
-
-    Args:
-        predictions:    List of prediction dicts.
-        ollama_base_url: Base URL for the Ollama API.
-        model:          Ollama model name.
-        sample_size:    Maximum number of samples to judge.
-        results_dir:    If provided, raw responses are saved to this directory.
-        query_ids:      When provided, judge only these query IDs (bypasses
-                        per-function sampling).
-
-    Returns:
-        {"score": float|None, "per_sample": [...], "parse_fail_count": int,
-         "sample_size": int}
-    """
-    if query_ids is not None:
-        qid_set = set(query_ids)
-        sample = [p for p in predictions if p.get("query_id") in qid_set]
-    else:
-        # seed=45 — distinct from answer (42), faithfulness (43), relevancy (44).
-        sample = _subsample(predictions, sample_size, seed=45)
-    per_sample = []
-
-    for item in sample:
-        answer = item.get("predicted", "")
-
-        prompt = (
-            f"Cevap: {answer}\n\n"
-            "Bu cevap dil bilgisi açısından doğru ve anlaşılır mı? "
-            "0 ile 1 arasında bir sayı ile değerlendir.\n"
-            "1 = tamamen tutarlı ve anlaşılır, 0 = anlamsız veya tutarsız.\n"
-            "Sadece sayıyı yaz, başka hiçbir şey yazma."
-        )
-
-        raw   = _ollama_generate(prompt, ollama_base_url, model)
-        score = None if raw is None else _parse_score(raw)
-        per_sample.append({
-            "query_id": item.get("query_id", ""),
-            "score": score,
-            "raw_response": raw,
-            "parse_failed": score is None,
-        })
-
-    result = _aggregate(per_sample)
-    if results_dir is not None:
-        save_raw_responses("coherence", per_sample, results_dir)
-    return result
+def llm_judge_coherence(predictions, ollama_base_url, model,
+                        sample_size=_DEFAULT_SAMPLE_SIZE, results_dir=None,
+                        query_ids=None, num_ctx=None, run_id=None) -> dict:
+    """Linguistic coherence of answer (needs predicted)."""
+    return _run_metric("coherence", 45, _prompt_coherence, predictions,
+                       ollama_base_url, model, sample_size, results_dir, query_ids,
+                       num_ctx, run_id)

@@ -12,7 +12,15 @@ split ``test``, CC-BY-4.0).  Filters applied, in order:
                          ``qa_train*.jsonl`` fine-tuning file
 
 ``madde_no`` ("3-") is normalised to the corpus convention ("3", "183-a",
-"ek-3", "gecici-2").
+"ek-3", "gecici-2").  The HF field never carries the section, so a plain
+number is promoted to ``gecici-N`` / ``ek-N`` when the question or answer
+names "Geçici Madde N" / "Ek Madde N" with that number.
+
+Label conflicts: rows whose question/answer names article numbers none of
+which equals the label (e.g. answer cites "TCK 151" but label is 150) are
+flagged ``label_conflict: true``.  They are NOT silently fixed and NOT in the
+default set: they go to ``qa_turkish_legal_rag.label_conflicts.jsonl`` and the
+report records the count.
 
 Usage:
     python scripts/16_prepare_turkish_legal_rag.py
@@ -39,6 +47,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import config
 from data.data_processor import DataProcessor
+from utils import read_jsonl
 
 HF_DATASET = "mtntasci/turkish-legal-rag"
 HF_CONFIG = "qa_benchmark"
@@ -72,14 +81,49 @@ def normalize_madde_no(raw) -> "str | None":
     return f"{prefix}-{out}" if prefix else out
 
 
+_SECTION_RE = re.compile(r"(?i)\b(ek\s+geçici|ek|geçici)\s+madde\s+(\d+)")
+_ARTICLE_MENTION_RES = (
+    re.compile(r"(?i)(\d{1,4})\s*(?:\.|inci|ıncı|nci|ncı|üncü|uncu)?\s*madde"),
+    re.compile(r"(?i)madde\s+(\d{1,4})"),
+)
+
+
+def refine_madde_no(madde_no, question: str, answer: str) -> "str | None":
+    """Promote a plain article number to ``gecici-N`` / ``ek-N``.
+
+    The HF ``madde_no`` drops the section ("Geçici Madde 5" -> "5").  When the
+    question/answer says "Geçici Madde N" with the same N, use the section form.
+    """
+    if madde_no is None or not re.fullmatch(r"\d+(?:-[a-z])?", madde_no):
+        return madde_no
+    base = re.match(r"\d+", madde_no).group()
+    for m in _SECTION_RE.finditer(f"{question} {answer}"):
+        if m.group(2) != base:
+            continue
+        kind = m.group(1).lower().replace("İ", "i")
+        if "geçici" in kind:
+            return f"{'ekgecici' if kind.startswith('ek') else 'gecici'}-{madde_no}"
+        return f"ek-{madde_no}"
+    return madde_no
+
+
+def find_label_conflict(madde_no, question: str, answer: str) -> bool:
+    """True when the text names article numbers but none equals the label."""
+    if not madde_no:
+        return False
+    text = f"{question} {answer}"
+    named = {n for rx in _ARTICLE_MENTION_RES for n in rx.findall(text)}
+    if not named:
+        return False
+    label = re.search(r"\d+", madde_no).group()
+    return label not in named
+
+
 def corpus_sources(metadata_path: Path) -> set:
     """Laws that have chunks in our corpus."""
     sources = set()
     if metadata_path.exists():
-        with open(metadata_path, encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip():
-                    sources.add(json.loads(line).get("source"))
+        sources = {r.get("source") for r in read_jsonl(metadata_path)}
         sources.discard(None)
     return sources or set(config.HMGS_SOURCE_MAP.values())
 
@@ -96,18 +140,21 @@ def resolve_source(kaynak, known: set) -> "str | None":
 def load_training_questions(processed_dir: Path) -> set:
     out = set()
     for path in sorted(processed_dir.glob("qa_train*.jsonl")):
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip():
-                    out.add(normalize_question(json.loads(line).get("question", "")))
+        out.update(normalize_question(r.get("question", "")) for r in read_jsonl(path))
     return out
 
 
 def build_examples(rows, known_sources, train_questions, eval_questions=frozenset()):
-    """Apply the filters; return (examples, report)."""
+    """Apply the filters; return ``(examples, report)``.
+
+    Rows flagged ``label_conflict`` are kept out of ``examples``; they are
+    returned under ``report["label_conflict_rows"]`` (``main`` writes them to
+    their own file and removes that key from the printed report).
+    """
     drops = collections.Counter()
     kept_per_law = collections.Counter()
     examples = []
+    conflicts = []
     eval_overlap = 0
     for row in rows:
         if row.get("source_origin") != KEEP_ORIGIN:
@@ -125,26 +172,34 @@ def build_examples(rows, known_sources, train_questions, eval_questions=frozense
         if nq in eval_questions:
             eval_overlap += 1
         row_id = str(row.get("row_id", "")).split(".")[0]
-        madde_no = normalize_madde_no(row.get("madde_no"))
+        answer = row.get("cevap") or ""
+        madde_no = refine_madde_no(normalize_madde_no(row.get("madde_no")), question, answer)
         if madde_no is None:
             drops["_kept_without_madde_no"] += 1
-        examples.append({
+        conflict = find_label_conflict(madde_no, question, answer)
+        target = conflicts if conflict else examples
+        target.append({
             "query_id": f"tlr_{row_id}",
             "question": question,
-            "answer": row.get("cevap") or "",
+            "answer": answer,
             "context": "",
             "source": source,
             "data_type": "",
             "madde_no": madde_no,
             "hf_row_id": row_id,
+            "label_conflict": conflict,
         })
-        kept_per_law[source] += 1
+        if not conflict:
+            kept_per_law[source] += 1
     kept_no_madde = drops.pop("_kept_without_madde_no", 0)
     report = {
         "dataset": f"{HF_DATASET}/{HF_CONFIG}/{HF_SPLIT}",
         "license": "CC-BY-4.0",
         "total_rows": len(rows),
         "kept": len(examples),
+        "label_conflict": len(conflicts),
+        "label_conflict_query_ids": [c["query_id"] for c in conflicts],
+        "label_conflict_rows": conflicts,
         "dropped": {k: drops.get(k, 0) for k in
                     ("source_origin", "unknown_law", "train_leakage")},
         "kept_without_madde_no": kept_no_madde,
@@ -179,8 +234,7 @@ def fetch_rows() -> list:
 def _load_questions(path: Path) -> set:
     if not path.exists():
         return set()
-    return {normalize_question(r.get("question", ""))
-            for r in DataProcessor.load_jsonl(path)}
+    return {normalize_question(r.get("question", "")) for r in read_jsonl(path)}
 
 
 def main(argv=None) -> int:
@@ -205,7 +259,9 @@ def main(argv=None) -> int:
     )
 
     out = args.processed_dir / config.TLR_GOLD_FILE
+    conflicts = report.pop("label_conflict_rows")
     DataProcessor.save_jsonl(examples, out)
+    DataProcessor.save_jsonl(conflicts, out.with_suffix(".label_conflicts.jsonl"))
     report_path = out.with_suffix(".report.json")
     report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",

@@ -2,7 +2,27 @@
   "dataset": "mtntasci/turkish-legal-rag/qa_benchmark/test",
   "license": "CC-BY-4.0",
   "total_rows": 290,
-  "kept": 195,
+  "kept": 178,
+  "label_conflict": 17,
+  "label_conflict_query_ids": [
+    "tlr_2600",
+    "tlr_3585",
+    "tlr_3630",
+    "tlr_7302",
+    "tlr_7589",
+    "tlr_7774",
+    "tlr_8405",
+    "tlr_8431",
+    "tlr_9254",
+    "tlr_10439",
+    "tlr_10944",
+    "tlr_11119",
+    "tlr_12273",
+    "tlr_12841",
+    "tlr_864",
+    "tlr_13255",
+    "tlr_13663"
+  ],
   "dropped": {
     "source_origin": 90,
     "unknown_law": 0,
@@ -11,13 +31,13 @@
   "kept_without_madde_no": 1,
   "kept_per_law": {
     "Türk Medeni Kanunu": 50,
-    "Türk Ceza Kanunu": 40,
-    "Türk Borçlar Kanunu": 36,
-    "Ceza Muhakemesi Kanunu": 24,
-    "Türkiye Cumhuriyeti Anayasası": 17,
-    "Türkiye Cumhuriyeti İş Kanunu": 13,
-    "Türk Bayrağı Tüzüğü": 8,
-    "Bilgi Edinme Kanunu": 7
+    "Türk Ceza Kanunu": 35,
+    "Türk Borçlar Kanunu": 32,
+    "Ceza Muhakemesi Kanunu": 21,
+    "Türkiye Cumhuriyeti Anayasası": 16,
+    "Türkiye Cumhuriyeti İş Kanunu": 11,
+    "Bilgi Edinme Kanunu": 7,
+    "Türk Bayrağı Tüzüğü": 6
   },
   "overlap_with_qa_eval_kept": 4
 }

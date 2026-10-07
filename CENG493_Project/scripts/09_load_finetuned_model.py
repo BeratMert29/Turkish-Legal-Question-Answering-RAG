@@ -11,7 +11,7 @@ if _project_root not in sys.path:
 import config
 from generation.rag_pipeline import TURKISH_PROMPT, SHORT_ANSWER_PROMPT
 
-HF_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+HF_MODEL_ID = config.LORA_BASE_HF_MODEL
 DEFAULT_ADAPTER_DIR = config.BASE_DIR / "models" / "qwen25_lora"
 
 
@@ -33,9 +33,9 @@ base_model = AutoModelForCausalLM.from_pretrained(
     "{HF_MODEL_ID}",
     torch_dtype=torch.bfloat16,
     device_map="auto",
-    trust_remote_code=True,
+    trust_remote_code={config.TRUST_REMOTE_CODE},
 )
-tokenizer = AutoTokenizer.from_pretrained("{HF_MODEL_ID}", trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained("{HF_MODEL_ID}", trust_remote_code={config.TRUST_REMOTE_CODE})
 
 model = PeftModel.from_pretrained(base_model, "{adapter_dir}")
 model = model.merge_and_unload()
@@ -121,7 +121,7 @@ class FinetunedRAGPipeline:
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            HF_MODEL_ID, trust_remote_code=True
+            HF_MODEL_ID, trust_remote_code=config.TRUST_REMOTE_CODE
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -130,7 +130,7 @@ class FinetunedRAGPipeline:
             HF_MODEL_ID,
             quantization_config=bnb_config,
             device_map="auto",
-            trust_remote_code=True,
+            trust_remote_code=config.TRUST_REMOTE_CODE,
         )
 
         self.model = PeftModel.from_pretrained(base_model, str(self.adapter_dir))

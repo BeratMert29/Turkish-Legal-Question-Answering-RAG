@@ -1,5 +1,6 @@
 from dataclasses import dataclass, asdict
 from typing import Iterator
+import collections
 import hashlib
 import json
 import pathlib
@@ -8,6 +9,7 @@ import re
 import numpy as np
 import pandas as pd
 import config
+from utils import read_jsonl as _read_jsonl
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -89,24 +91,25 @@ def _chunk_matches_article(chunk: "CorpusChunk", madde_no: int) -> bool:
     return False
 
 
-def _chunk_matches_madde_str(chunk: "CorpusChunk", madde_no: str) -> bool:
+def _chunk_matches_madde_str(
+    chunk: "CorpusChunk", madde_no: str, inherited: "str | None" = None,
+) -> bool:
     """Return True if *chunk* belongs to the article named by the normalised
-    string *madde_no* (``"12"``, ``"183-a"``, ``"ek-3"``, ``"gecici-2"``)."""
+    string *madde_no* (``"12"``, ``"183-a"``, ``"ek-3"``, ``"gecici-2"``).
+
+    *inherited* is the article carried forward from the preceding chunks of the
+    same document; it is used only when the chunk has no ``madde_no`` field."""
     want = str(madde_no).strip().lower()
     stored = getattr(chunk, "madde_no", None)
+    if stored is None:
+        stored = inherited  # continuation chunk of a legacy corpus without madde_no
     if stored is not None and str(stored).strip().lower() == want:
         return True
     # The stored/leading article can differ from the one asked for when the
     # chunk opens with a section title or holds several articles, so also scan
     # every line-anchored article heading in the chunk text.
     for m in _MADDE_HEADING_RE.finditer(chunk.text):
-        if m.group(1):
-            found = f"ek-{_normalize_madde_suffix(m.group(1))}"
-        elif m.group(2) or m.group(3):
-            found = f"gecici-{_normalize_madde_suffix(m.group(2) or m.group(3))}"
-        else:
-            found = _normalize_madde_suffix(m.group(4))
-        if found == want:
+        if _heading_key(m) == want:
             return True
     return False
 
@@ -153,24 +156,40 @@ def _silver_lexical_score(query_tokens: "list[str]", chunk_text: str) -> float:
 # Anchored to line-start ((?m)^\s*) so mid-text references like
 # "Madde 5 uyarınca" are never mistaken for article headings.
 # Suffix "[/-][A-Za-z]" captures "183/A" or "183-A"; normalised to
-# "183-a" by _madde_no_from_text() via _normalize_madde_suffix().
-# group 1: ek-N   — "Ek Madde 3", "EK MADDE 3" (case-insensitive MADDE)
-# group 2: gecici-N — "Geçici Madde 7"
-# group 3: gecici-N all-caps — "GEÇİCİ MADDE 4"
-# group 4: regular N — "MADDE 86", "MADDE 183/A"
+# "183-a" via _normalize_madde_suffix().
+# ekg : ekgecici-N — "Ek Geçici Madde 2"
+# ek  : ek-N       — "Ek Madde 3", "EK MADDE 3"
+# gec : gecici-N   — "Geçici Madde 7", "GEÇİCİ MADDE 4"
+# reg : N          — "MADDE 86", "MADDE 183/A"
+_NUM = r"\d+(?:[/-][A-Za-zÇĞİÖŞÜçğıöşü])?"
 _MADDE_HEADING_RE = re.compile(
     r"(?m)^\s*(?:"
-    r"(?:Ek|EK)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(\d+(?:[/-][A-Za-z])?)"   # g1: ek-N
-    r"|[Gg]eçici\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(\d+(?:[/-][A-Za-z])?)"  # g2: gecici-N
-    r"|(?:GEÇİCİ\s+MADDE)\s+(\d+(?:[/-][A-Za-z])?)"                    # g3: gecici-N caps
-    r"|(?:MADDE|Madde)\s+(\d+(?:[/-][A-Za-z])?)"                       # g4: N
+    r"(?:Ek|EK)\s+(?:[Gg]eçici|GEÇİCİ)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<ekg>" + _NUM + r")"
+    r"|(?:Ek|EK)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<ek>" + _NUM + r")"
+    r"|(?:[Gg]eçici|GEÇİCİ)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<gec>" + _NUM + r")"
+    r"|(?:MADDE|Madde)\s+(?P<reg>" + _NUM + r")"
     r")"
 )
 
 
 def _normalize_madde_suffix(raw: str) -> str:
     """Normalise a MADDE number: ``'183/A'`` → ``'183-a'``, ``'5'`` → ``'5'``."""
-    return re.sub(r"[/-]([A-Za-z])", lambda m: f"-{m.group(1).lower()}", raw)
+    return re.sub(
+        r"[/-]([A-Za-zÇĞİÖŞÜçğıöşü])",
+        lambda m: "-" + m.group(1).replace("İ", "i").lower(),
+        raw,
+    )
+
+
+def _heading_key(m: "re.Match") -> str:
+    """Normalised article key for a ``_MADDE_HEADING_RE`` match."""
+    if m.group("ekg"):
+        return f"ekgecici-{_normalize_madde_suffix(m.group('ekg'))}"
+    if m.group("ek"):
+        return f"ek-{_normalize_madde_suffix(m.group('ek'))}"
+    if m.group("gec"):
+        return f"gecici-{_normalize_madde_suffix(m.group('gec'))}"
+    return _normalize_madde_suffix(m.group("reg"))
 
 
 def _madde_no_from_text(text: str) -> "str | None":
@@ -178,22 +197,58 @@ def _madde_no_from_text(text: str) -> "str | None":
 
     Only matches headings anchored to a line boundary so that inline
     references such as "Madde 5 uyarınca" do not set the chunk's article.
+    The whole text is scanned (a heading can sit after a long preamble).
 
     Returns:
         ``"N"`` for a regular article (e.g. ``"86"`` or ``"183-a"``),
         ``"ek-N"`` for supplementary articles (Ek Madde),
         ``"gecici-N"`` for transitory articles (Geçici Madde),
+        ``"ekgecici-N"`` for Ek Geçici Madde,
         or ``None`` when no heading is found.
     """
-    m = _MADDE_HEADING_RE.search(text[:600])
-    if m is None:
-        return None
-    if m.group(1):
-        return f"ek-{_normalize_madde_suffix(m.group(1))}"
-    if m.group(2) or m.group(3):
-        n = m.group(2) or m.group(3)
-        return f"gecici-{_normalize_madde_suffix(n)}"
-    return _normalize_madde_suffix(m.group(4))
+    m = _MADDE_HEADING_RE.search(text)
+    return None if m is None else _heading_key(m)
+
+
+def _assign_madde_nos(texts: "list[str]", carry: "str | None" = None) -> "list[str | None]":
+    """Article number for each consecutive chunk of one document.
+
+    A chunk that opens with an article heading takes that article; a chunk
+    that starts mid-article (a continuation) inherits the last article seen
+    in the previous chunk, so every chunk of an article carries its number.
+    """
+    out: "list[str | None]" = []
+    for text in texts:
+        keys = [(m.start(), _heading_key(m)) for m in _MADDE_HEADING_RE.finditer(text)]
+        if keys:
+            lead = text[:keys[0][0]].strip()
+            out.append(carry if (lead and carry) else keys[0][1])
+            carry = keys[-1][1]
+        else:
+            out.append(carry)
+    return out
+
+
+def _inherited_madde_nos(corpus_chunks) -> "dict[str, str]":
+    """Carry the article number forward over continuation chunks.
+
+    For corpora built before ``madde_no`` was stored (or by external tools)
+    a chunk in the middle of an article has no heading, so only the first
+    chunk of the article would be labelled gold.  Walk each document in order
+    and give heading-less chunks the last article seen in the same document.
+    """
+    out: dict[str, str] = {}
+    carry: dict[tuple, "str | None"] = {}
+    for c in corpus_chunks:
+        key = (c.source, c.doc_id)
+        keys = [_heading_key(m) for m in _MADDE_HEADING_RE.finditer(c.text)]
+        if getattr(c, "madde_no", None):
+            carry[key] = c.madde_no if not keys else keys[-1]
+        elif keys:
+            carry[key] = keys[-1]
+        elif carry.get(key):
+            out[c.chunk_id] = carry[key]
+    return out
 
 
 @dataclass
@@ -331,6 +386,7 @@ class DataProcessor:
     def _char_chunk(text: str, doc_id: str, source: str) -> list["CorpusChunk"]:
         """Character-based chunking via RecursiveCharacterTextSplitter (original method)."""
         raw_chunks = _TEXT_SPLITTER.split_text(text)
+        madde_nos = _assign_madde_nos(raw_chunks)
         chunks: list[CorpusChunk] = []
         for i, chunk in enumerate(raw_chunks):
             if len(chunk) < config.MIN_CHUNK_CHARS:
@@ -341,6 +397,7 @@ class DataProcessor:
                 text=chunk,
                 source=source,
                 char_len=len(chunk),
+                madde_no=madde_nos[i],
             ))
         return chunks
 
@@ -373,7 +430,10 @@ class DataProcessor:
                     length_function=len,
                     separators=["\n\n", "\n", ". ", " ", ""],
                 )
-                for sub_chunk in sub_splitter.split_text(part):
+                subs = sub_splitter.split_text(part)
+                # Continuation chunks inherit the article of the heading chunk.
+                sub_nos = _assign_madde_nos(subs, carry=madde_no)
+                for sub_chunk, sub_no in zip(subs, sub_nos):
                     if len(sub_chunk) < config.MIN_CHUNK_CHARS:
                         continue
                     chunks.append(CorpusChunk(
@@ -382,7 +442,7 @@ class DataProcessor:
                         text=sub_chunk,
                         source=source,
                         char_len=len(sub_chunk),
-                        madde_no=madde_no,
+                        madde_no=sub_no,
                     ))
                     chunk_index += 1
         return chunks
@@ -409,22 +469,49 @@ class DataProcessor:
     # Corpus builder (generator)
     # ------------------------------------------------------------------
 
-    def build_corpus_chunks(self) -> Iterator[CorpusChunk]:
+    def build_corpus_chunks(self, holdout: bool = False) -> Iterator[CorpusChunk]:
         """Generator — yields CorpusChunk objects for every corpus row.
 
         Deduplicates by text hash so each unique legal passage appears once.
         build_relevant_chunk_map uses context-hash matching to correctly
         resolve the canonical chunk even when the query's row was deduplicated.
-        Also loads supplementary law texts from extra_laws.jsonl if present.
+        Also loads supplementary law texts from extra_laws.jsonl if present
+        (cleaned by :func:`data.extra_laws_cleaner.clean_extra_law_records`).
 
-        Eval rows are held out (data leakage fix): only the complement of the
-        QA eval sample is indexed into FAISS.
+        Every yielded ``chunk_id`` is unique: scraped records that share a
+        ``doc_id`` get a ``__dupN`` suffix so FAISS ids / metadata do not collide.
+
+        Args:
+            holdout: When True, the kaggle rows held out for the legacy
+                ``kaggle`` eval set (see ``_get_kaggle_corpus_eval_split``)
+                are NOT indexed.  Leave False (default) for the
+                ``turkish_legal_rag`` / ``hmgs`` eval sets: they are labelled
+                against the full kaggle law texts, and holding out would drop
+                all eval laws from the corpus.
         """
         seen_hashes: set[str] = set()
+        seen_ids: set[str] = set()
         kept = 0
         skipped = 0
+        renamed = 0
 
-        corpus_df, _ = self._get_kaggle_corpus_eval_split()
+        def _emit(chunk: CorpusChunk) -> CorpusChunk:
+            nonlocal renamed
+            cid = chunk.chunk_id
+            k = 1
+            while cid in seen_ids:
+                k += 1
+                cid = f"{chunk.chunk_id}__dup{k}"
+            if cid != chunk.chunk_id:
+                renamed += 1
+                chunk.chunk_id = cid
+            seen_ids.add(cid)
+            return chunk
+
+        if holdout:
+            corpus_df, _ = self._get_kaggle_corpus_eval_split()
+        else:
+            corpus_df = self.get_corpus_rows()
 
         for row in corpus_df.itertuples(index=False):
             context = row.context if pd.notna(row.context) else ""
@@ -437,29 +524,37 @@ class DataProcessor:
                     continue
                 seen_hashes.add(text_hash)
                 kept += 1
-                yield chunk
+                yield _emit(chunk)
 
         # Load supplementary law texts (HMK, TTK, İYUK, İİK, VUK, DMK, …)
         extra_path = pathlib.Path(config.BASE_DIR) / "data" / "extra_laws.jsonl"
         if extra_path.exists():
             from utils import read_jsonl
+            from data.extra_laws_cleaner import clean_extra_law_records
+            records, clean_stats = clean_extra_law_records(list(read_jsonl(extra_path)))
             extra_kept = 0
-            for entry in read_jsonl(extra_path):
-                    text   = entry.get("text", "")
-                    source = entry.get("source", "")
-                    doc_id = entry.get("doc_id", "")
-                    for chunk in DataProcessor.chunk_text(text, doc_id, source):
-                        text_hash = hashlib.md5(chunk.text.encode()).hexdigest()
-                        if text_hash in seen_hashes:
-                            skipped += 1
-                            continue
-                        seen_hashes.add(text_hash)
-                        kept += 1
-                        extra_kept += 1
-                        yield chunk
-            print(f"[build_corpus_chunks] extra_laws: +{extra_kept} chunks from supplementary laws")
+            seen_docs: collections.Counter = collections.Counter()
+            for entry in records:
+                text   = entry.get("text", "")
+                source = entry.get("source", "")
+                doc_id = entry.get("doc_id", "")
+                seen_docs[(source, doc_id)] += 1
+                if seen_docs[(source, doc_id)] > 1:
+                    doc_id = f"{doc_id}__dup{seen_docs[(source, doc_id)]}"
+                for chunk in DataProcessor.chunk_text(text, doc_id, source):
+                    text_hash = hashlib.md5(chunk.text.encode()).hexdigest()
+                    if text_hash in seen_hashes:
+                        skipped += 1
+                        continue
+                    seen_hashes.add(text_hash)
+                    kept += 1
+                    extra_kept += 1
+                    yield _emit(chunk)
+            print(f"[build_corpus_chunks] extra_laws: +{extra_kept} chunks from supplementary laws "
+                  f"(cleaning: {clean_stats})")
 
-        print(f"[build_corpus_chunks] kept={kept}, skipped={skipped} duplicate chunks")
+        print(f"[build_corpus_chunks] kept={kept}, skipped={skipped} duplicate chunks, "
+              f"renamed={renamed} colliding chunk_ids, holdout={holdout}")
 
     # ------------------------------------------------------------------
     # QA set builders
@@ -547,9 +642,8 @@ class DataProcessor:
             _re.IGNORECASE,
         )
 
-        # VUK rows are misattributed (3/5 questions are actually about HMK /
-        # Avukatlık Kanunu) — drop the entire source to avoid noise.
-        _DROPPED_SOURCES = {"213 sayılı Vergi Usul Kanunu"}
+        # Sources excluded despite corpus coverage (see config.HMGS_DROPPED_SOURCES).
+        _DROPPED_SOURCES = config.HMGS_DROPPED_SOURCES
 
         source_map = config.HMGS_SOURCE_MAP
         examples: list[QAExample] = []
@@ -624,7 +718,8 @@ class DataProcessor:
                 madde_no=r.get("madde_no"),
                 hf_row_id=r.get("hf_row_id"),
             )
-            for r in DataProcessor.load_jsonl(p)
+            for r in _read_jsonl(p)
+            if not r.get("label_conflict")
         ]
 
     @staticmethod
@@ -680,6 +775,8 @@ class DataProcessor:
         # Issue 11 fix: build valid_ids once outside the per-query loop (O(N) not O(N*Q))
         valid_ids = set(c.chunk_id for c in corpus_chunks)
 
+        inherited = _inherited_madde_nos(corpus_chunks)
+
         relevant_map: dict[str, list[str]] = {}
         # label_strategy tracks how each query was labeled (for coverage reporting)
         label_strategy_map: dict[str, str] = {}
@@ -723,7 +820,7 @@ class DataProcessor:
             if explicit_madde and qa_source:
                 relevant = [
                     c.chunk_id for c in by_source.get(qa_source, [])
-                    if _chunk_matches_madde_str(c, explicit_madde)
+                    if _chunk_matches_madde_str(c, explicit_madde, inherited.get(c.chunk_id))
                 ]
                 if relevant:
                     labeled_s05 += 1

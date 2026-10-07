@@ -23,6 +23,8 @@ class Reranker:
         except torch.cuda.OutOfMemoryError:
             self.device = "cpu"
             self.model = CrossEncoder(self.model_name, device="cpu")
+        if self.device == "cuda":
+            self.model.model.half()  # fp16 on CUDA
 
     def rerank(self, query: str, chunks: list[dict],
                top_k: int = None) -> list[dict]:

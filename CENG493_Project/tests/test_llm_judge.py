@@ -172,17 +172,17 @@ class TestSaveRawResponses:
             save_raw_responses("test", [], target)
             assert target.exists()
 
-    def test_appends_on_second_call(self):
-        """Calling save_raw_responses twice accumulates records (mode 'a')."""
+    def test_per_run_file_not_appended(self):
+        """Distinct run ids -> distinct files; same run id -> overwritten."""
         with tempfile.TemporaryDirectory() as tmp:
             s1 = [{"query_id": "q1", "score": 0.8, "raw_response": "0.8", "parse_failed": False}]
             s2 = [{"query_id": "q2", "score": 0.6, "raw_response": "0.6", "parse_failed": False}]
-            out = save_raw_responses("answer", s1, tmp)
-            save_raw_responses("answer", s2, tmp)
-            lines = [l for l in out.read_text(encoding="utf-8").splitlines() if l.strip()]
-            assert len(lines) == 2, "Second call should append, not overwrite"
-            ids = [json.loads(l)["query_id"] for l in lines]
-            assert ids == ["q1", "q2"]
+            o1 = save_raw_responses("answer", s1, tmp, run_id="r1")
+            o2 = save_raw_responses("answer", s2, tmp, run_id="r2")
+            assert o1 != o2 and o1.name == "judge_raw_answer_r1.jsonl"
+            save_raw_responses("answer", s2, tmp, run_id="r1")
+            lines = [l for l in o1.read_text(encoding="utf-8").splitlines() if l.strip()]
+            assert [json.loads(l)["query_id"] for l in lines] == ["q2"]
 
     def test_run_id_present_in_each_record(self):
         """Every record written by save_raw_responses has a 'run_id' key."""
@@ -211,11 +211,12 @@ class TestSaveRawResponses:
         """Two successive calls produce different run_ids."""
         with tempfile.TemporaryDirectory() as tmp:
             s = [{"query_id": "q1", "score": 0.8, "raw_response": "0.8", "parse_failed": False}]
-            out = save_raw_responses("answer", s, tmp)
-            save_raw_responses("answer", s, tmp)
-            lines = [l for l in out.read_text(encoding="utf-8").splitlines() if l]
-            loaded = [json.loads(l) for l in lines]
-            assert loaded[0]["run_id"] != loaded[1]["run_id"]
+            o1 = save_raw_responses("answer", s, tmp)
+            o2 = save_raw_responses("answer", s, tmp)
+            assert o1 != o2
+            r1 = json.loads(o1.read_text(encoding="utf-8").splitlines()[0])
+            r2 = json.loads(o2.read_text(encoding="utf-8").splitlines()[0])
+            assert r1["run_id"] != r2["run_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +273,7 @@ class TestLlmJudgeAnswer:
                     _make_predictions(3), "http://localhost:11434", "test-model",
                     sample_size=3, results_dir=tmp,
                 )
-            assert (Path(tmp) / "judge_raw_answer.jsonl").exists()
+            assert len(list(Path(tmp).glob("judge_raw_answer_*.jsonl"))) == 1
 
     def test_no_save_when_results_dir_none(self):
         """No JSONL should be written if results_dir is None."""
@@ -402,3 +403,49 @@ class TestSampleJudgeQueryIds:
             "All four metrics must evaluate the same query IDs when query_ids is passed"
         )
         assert _qids(r_ans) == set(shared_ids)
+
+
+class TestJudgeDefaults:
+    def test_sample_none_judges_all(self):
+        preds = _make_predictions(30)
+        with patch("evaluation.llm_judge._ollama_generate", return_value="1"):
+            r = llm_judge_answer(preds, "http://x", "m", sample_size=None)
+        assert r["sample_size"] == 30
+
+    def test_sample_judge_query_ids_none_returns_all(self):
+        ids = [f"q{i}" for i in range(7)]
+        assert sample_judge_query_ids(ids, None) == ids
+
+    def test_num_ctx_in_ollama_payload(self):
+        from evaluation import llm_judge as lj
+        captured = {}
+
+        class _R:
+            def raise_for_status(self): pass
+            def json(self): return {"response": "0.5"}
+
+        def fake_post(url, json=None, timeout=None):
+            captured.update(json)
+            return _R()
+
+        with patch.object(lj.requests, "post", fake_post):
+            lj._ollama_generate("p", "http://x/v1", "m", num_ctx=4096)
+            assert captured["options"]["num_ctx"] == 4096
+            lj._ollama_generate("p", "http://x/v1", "m")
+            assert captured["options"]["num_ctx"] == lj._DEFAULT_NUM_CTX
+
+    def test_prompts_have_turkish_anchors(self):
+        from evaluation import llm_judge as lj
+        item = {"question": "S", "expected": "E", "predicted": "P",
+                "retrieved_chunks": [{"text": "B"}]}
+        for fn in (lj._prompt_answer, lj._prompt_faithfulness,
+                   lj._prompt_relevancy, lj._prompt_coherence):
+            p = fn(item)
+            assert "0.5 =" in p and "1   =" in p and "0   =" in p
+
+    def test_run_id_shared_across_files(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("evaluation.llm_judge._ollama_generate", return_value="1"):
+            llm_judge_answer(_make_predictions(2), "http://x", "m",
+                             results_dir=tmp, run_id="RID")
+            assert (Path(tmp) / "judge_raw_answer_RID.jsonl").exists()

@@ -538,7 +538,7 @@ class TestEvalHelpers:
         from unittest.mock import patch, MagicMock, call
         import config
 
-        sampled = [f"q{i}" for i in range(config.LLM_JUDGE_SAMPLE_SIZE)]
+        sampled = [f"q{i}" for i in range(20)]
         fake_stage = MagicMock()
         fake_stage.results_dir = None
 
@@ -634,9 +634,112 @@ class TestEvalHelpers:
                 judge_model="mock",
             )
 
-        expected_n = min(config.LLM_JUDGE_SAMPLE_SIZE, 50)
+        expected_n = (
+            50 if config.LLM_JUDGE_SAMPLE_SIZE is None
+            else min(config.LLM_JUDGE_SAMPLE_SIZE, 50)
+        )
         for n in captured:
             assert n == expected_n, (
                 f"judge called with {n} samples; expected {expected_n} "
                 f"(config.LLM_JUDGE_SAMPLE_SIZE={config.LLM_JUDGE_SAMPLE_SIZE})"
             )
+
+
+class TestGraphGenerationContext:
+    """Graph neighbours must reach the generation context; metrics ignore them."""
+
+    @staticmethod
+    def _chunks():
+        reg = [{"chunk_id": f"r{i}", "text": "t", "source": "S", "score": 1.0 - i / 10}
+               for i in range(6)]
+        nb = [
+            {"chunk_id": "n0", "text": "t", "source": "S", "score": .5,
+             "graph_neighbor": True, "graph_parent": "r0", "graph_root": "r0"},
+            {"chunk_id": "n1", "text": "t", "source": "S", "score": .4,
+             "graph_neighbor": True, "graph_parent": "r1", "graph_root": "r1"},
+        ]
+        # neighbours spliced right after their parents
+        return [reg[0], nb[0], reg[1], nb[1], *reg[2:]]
+
+    def _pipe(self, budget):
+        from generation.rag_pipeline import RAGPipeline
+        p = object.__new__(RAGPipeline)
+        p.top_k_for_generation = 5
+        p.graph_neighbor_budget = budget
+        return p
+
+    def test_reserved_slots_include_neighbours(self):
+        sel = self._pipe(2)._select_for_generation(self._chunks())
+        ids = [c["chunk_id"] for c in sel]
+        assert len(ids) == 5
+        assert ids == ["r0", "n0", "r1", "n1", "r2"]
+
+    def test_budget_zero_just_cuts_to_top_k(self):
+        sel = self._pipe(0)._select_for_generation(self._chunks())
+        assert [c["chunk_id"] for c in sel] == ["r0", "n0", "r1", "n1", "r2"]
+
+    def test_metric_input_ignores_neighbours(self):
+        from pipeline.evaluation import prepare_metric_input
+        qa = [_FakeQA("q1", "Q", "A", "S")]
+        mi, full = prepare_metric_input(qa, [self._chunks()], {})
+        assert mi[0]["retrieved"] == [f"r{i}" for i in range(6)]
+        assert len(full["q1"]) == 8
+
+    def test_expand_puts_neighbour_after_parent(self):
+        from retrieval.graph_index import GraphIndex
+        gi = object.__new__(GraphIndex)
+        gi._graph = {"r0": [("n0", "adj")]}
+        gi._chunk_meta = {"n0": {"text": "x", "doc_id": "d", "source": "S"}}
+        gi._source_madde_lookup = {}
+        chunks = [{"chunk_id": "r0", "score": 1.0}, {"chunk_id": "r1", "score": .9}]
+        out = gi.expand(chunks, budget=1, kinds=("adj",))
+        assert [c["chunk_id"] for c in out] == ["r0", "n0", "r1"]
+        assert out[1]["graph_neighbor"] and out[1]["graph_parent"] == "r0"
+
+
+def test_failed_generations_stay_in_qa_denominator():
+    from unittest.mock import patch, MagicMock
+    from pipeline import evaluation as ev
+    preds = [
+        {"query_id": "a", "predicted": "ok", "expected": "ok", "retrieved_chunks": []},
+        {"query_id": "b", "predicted": "", "expected": "x", "retrieved_chunks": [],
+         "generation_error": True},
+    ]
+    seen = {}
+
+    def _fake_qa(p):
+        seen["n"] = len(p)
+        return {"f1": 0.5}
+
+    stage = MagicMock(llm="base", use_graph=False)
+    with patch.object(ev, "run_generation_loop", return_value=preds), \
+         patch("generation.rag_pipeline.RAGPipeline", MagicMock()), \
+         patch("evaluation.qa_metrics.compute_all_qa_metrics_with_citation",
+               side_effect=_fake_qa):
+        out = ev._run_generation_and_qa(
+            "base", stage, [], [], None, "m", False, None, 0.9)
+    ok_preds, n_total, n_failed, _, _, qa, all_preds = out
+    assert seen["n"] == 2 and n_total == 2 and n_failed == 1
+    assert len(ok_preds) == 1 and len(all_preds) == 2
+    assert qa["n_generation_failed_scored_zero"] == 1
+
+
+def test_per_query_records_and_ci():
+    from pipeline.evaluation import build_per_query, compute_confidence_intervals
+    preds = [
+        {"query_id": "a", "predicted": "ok cevap", "expected": "ok cevap"},
+        {"query_id": "b", "predicted": "", "expected": "x", "generation_error": True},
+    ]
+    mi = [
+        {"query_id": "a", "relevant": ["c1"], "retrieved": ["c1", "c2"],
+         "source_law": "TCK", "retrieved_sources": ["TCK"]},
+        {"query_id": "b", "relevant": [], "retrieved": ["c9"],
+         "source_law": "", "retrieved_sources": ["X"]},
+    ]
+    rows = build_per_query(preds, mi, {"per_sample": []},
+                           [{"query_id": "a", "similarity": 0.9}], {"per_sample": {}})
+    assert rows[0]["recall_at_5"] == 1.0 and rows[0]["semantic_similarity"] == 0.9
+    assert rows[1]["generation_failed"] and rows[1]["f1"] == 0.0
+    assert rows[1]["recall_at_5"] is None
+    ci = compute_confidence_intervals(rows)
+    assert ci["f1"]["n"] == 2 and "recall_at_5" in ci

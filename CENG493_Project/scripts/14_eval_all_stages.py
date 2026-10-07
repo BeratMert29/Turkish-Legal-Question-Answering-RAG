@@ -17,11 +17,11 @@ Usage:
     python scripts/14_eval_all_stages.py --stages base --eval-set hmgs
     python scripts/14_eval_all_stages.py --list-stages
     python scripts/14_eval_all_stages.py \
-        --corpus /content/datasets/corpus.jsonl \
-        --eval-data /content/datasets/gold_benchmark.json          # external evaluator format
+        --corpus datasets/corpus.jsonl \
+        --eval-data datasets/gold_benchmark.json          # external evaluator format
     python scripts/14_eval_all_stages.py \
-        --corpus /content/datasets/corpus.jsonl \
-        --eval-data /content/datasets/rag_eval.json                # external rag eval
+        --corpus datasets/corpus.jsonl \
+        --eval-data datasets/rag_eval.json                # external rag eval
 
 Available stages:
     base         BGE-M3 base    + dense          + qwen2.5:7b
@@ -249,7 +249,11 @@ def main() -> None:
     else:
         processor = DataProcessor(config.RAW_DATA_PATH)
         processor.load_and_validate()
-        corpus_chunks = list(processor.build_corpus_chunks())
+        corpus_chunks = list(
+            # Hold the eval rows out of the index only for the Kaggle-split
+            # eval set; the other eval sets are not drawn from the corpus.
+            processor.build_corpus_chunks(holdout=args.eval_set == "kaggle")
+        )
 
     if args.eval_data:
         print(f"  QA source     : {args.eval_data} (external evaluator format)")
@@ -290,6 +294,22 @@ def main() -> None:
         f"(unlabeled={labeling_coverage['unlabeled']}) "
         f"by_strategy={labeling_coverage['by_strategy']}"
     )
+
+    # An eval set that ships explicit gold labels must actually be labeled;
+    # otherwise every chunk-level metric silently collapses to 0.
+    if not args.eval_data and args.eval_set == "turkish_legal_rag":
+        _total = labeling_coverage["total"]
+        _frac = labeling_coverage["labeled"] / _total if _total else 0.0
+        if _frac < config.HEADLINE_CHUNK_MIN_LABELED_FRACTION:
+            sys.exit(
+                f"ERROR: only {labeling_coverage['labeled']}/{_total} "
+                f"({_frac:.0%}) of the turkish_legal_rag queries have gold "
+                f"chunk labels (< "
+                f"{config.HEADLINE_CHUNK_MIN_LABELED_FRACTION:.0%}).\n"
+                f"  The corpus index does not match the eval set's gold "
+                f"labels -- rebuild the index/corpus (scripts/01, 02) and "
+                f"re-run scripts/16_prepare_turkish_legal_rag.py."
+            )
 
     # -- Shared caches -----------------------------------------------------
     embedder_cache: dict = {}

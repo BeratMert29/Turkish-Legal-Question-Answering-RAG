@@ -4,7 +4,7 @@ import json
 import pathlib
 
 import config
-from data.data_processor import DataProcessor
+from utils import read_jsonl
 
 
 def _load_qa_file(path: pathlib.Path) -> list[dict]:
@@ -82,7 +82,7 @@ def _load_qa_file(path: pathlib.Path) -> list[dict]:
         except json.JSONDecodeError:
             pass
     # Fall back to JSONL (one JSON object per line)
-    return DataProcessor.load_jsonl(path)
+    return list(read_jsonl(path))
 
 
 def _normalize_qa_record(row: dict, index: int) -> dict:
@@ -199,10 +199,10 @@ def resolve_qa_set(
 
     if dataset == "hmgs":
         eval_path = pathlib.Path(config.PROCESSED_DIR) / config.HMGS_GOLD_FILE
-        rows = DataProcessor.load_jsonl(eval_path)
+        rows = list(read_jsonl(eval_path))
         return rows, True, "_hmgs"
 
     # kaggle (default)
     eval_path = pathlib.Path(config.PROCESSED_DIR) / config.QA_GOLD_FILE
-    rows = DataProcessor.load_jsonl(eval_path)
+    rows = list(read_jsonl(eval_path))
     return rows, False, ""

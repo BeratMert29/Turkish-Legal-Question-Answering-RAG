@@ -1,0 +1,55 @@
+import numpy as np
+import pytest
+
+from evaluation.stats import bootstrap_ci, paired_bootstrap
+
+
+def test_ci_contains_mean_and_seeded():
+    vals = list(np.random.default_rng(0).uniform(0, 1, 100))
+    r1, r2 = bootstrap_ci(vals), bootstrap_ci(vals)
+    assert r1 == r2
+    assert r1["ci_low"] <= r1["mean"] <= r1["ci_high"]
+    assert r1["n_resamples"] >= 1000 and r1["n"] == 100
+
+
+def test_ci_min_resamples_enforced_and_none_dropped():
+    r = bootstrap_ci([0.5, None, 0.7, float("nan")], n_resamples=10)
+    assert r["n"] == 2 and r["n_resamples"] == 1000
+
+
+def test_ci_empty():
+    assert bootstrap_ci([])["mean"] is None
+
+
+def test_ci_constant_values_zero_width():
+    r = bootstrap_ci([0.3] * 20)
+    assert r["ci_low"] == pytest.approx(0.3) and r["ci_high"] == pytest.approx(0.3)
+
+
+def test_paired_detects_shift():
+    rng = np.random.default_rng(1)
+    a = rng.uniform(0, 1, 80)
+    b = a + 0.2
+    r = paired_bootstrap(list(a), list(b))
+    assert r["mean_diff"] == pytest.approx(0.2)
+    assert r["significant"] and r["ci_low"] > 0 and r["p_value"] < 0.05
+
+
+def test_paired_no_difference_not_significant():
+    rng = np.random.default_rng(2)
+    a = rng.uniform(0, 1, 60)
+    b = a + rng.normal(0, 0.1, 60)
+    r = paired_bootstrap(a, b)
+    assert not r["significant"]
+
+
+def test_paired_dict_alignment_and_drop_none():
+    a = {"q1": 0.1, "q2": 0.2, "q3": None, "q4": 0.4}
+    b = {"q2": 0.3, "q1": 0.2, "q3": 0.5, "q5": 1.0}
+    r = paired_bootstrap(a, b)
+    assert r["n"] == 2 and r["mean_diff"] == pytest.approx(0.1)
+
+
+def test_paired_length_mismatch_raises():
+    with pytest.raises(ValueError):
+        paired_bootstrap([1, 2], [1])

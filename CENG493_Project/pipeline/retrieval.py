@@ -6,7 +6,6 @@ function bodies so this module loads on a CPU-only / light-deps machine.
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
@@ -32,8 +31,8 @@ def auto_build_graph(graph_path: Path) -> None:
             import os as _os
             from retrieval.graph_builder import build_graph_from_metadata, save_graph
 
-            with meta_path.open(encoding="utf-8") as _f:
-                meta = [json.loads(line) for line in _f if line.strip()]
+            from utils import read_jsonl
+            meta = list(read_jsonl(meta_path))
             _graph = build_graph_from_metadata(meta)
             _tmp_path = graph_path.with_suffix(".tmp")
             save_graph(_graph, _tmp_path)

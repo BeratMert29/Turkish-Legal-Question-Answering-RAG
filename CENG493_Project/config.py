@@ -9,7 +9,6 @@ CORPUS_DOC_MIN_CHARS = 180
 # Minimum chunk character length; shared by _char_chunk and _article_chunk
 MIN_CHUNK_CHARS = 180
 ARTICLE_CHUNKING_ENABLED = True  # True → split at MADDE boundaries first
-ARTICLE_REGEX = r'(?=(?:MADDE|Madde)\s+\d+)'
 
 # Data
 QA_EVAL_EXPECTED = 300
@@ -46,8 +45,17 @@ HMGS_SOURCE_MAP = {
     "2577 sayılı İdari Yargılama Usulü Kanunu": "İdari Yargılama Usulü Kanunu",
     "2004 sayılı İcra ve İflas Kanunu":      "İcra ve İflas Kanunu",
     "657 sayılı Devlet Memurları Kanunu":    "Devlet Memurları Kanunu",
+    # Present in the corpus index (results/index/metadata.jsonl), so mapped here.
+    # VUK is mapped but its HMGS rows are excluded via HMGS_DROPPED_SOURCES.
+    "213 sayılı Vergi Usul Kanunu":          "Vergi Usul Kanunu",
+    "4982 sayılı Bilgi Edinme Hakkı Kanunu": "Bilgi Edinme Kanunu",
+    "Türk Bayrağı Tüzüğü":                   "Türk Bayrağı Tüzüğü",
 }
-HMGS_EVAL_EXPECTED = 161  # 240 raw - 49 no corpus - 5 VUK (misattributed) - 25 MC-ref; enforced as soft assertion in build_gold_eval_set
+# HMGS rows whose kaynak is excluded from the eval set although the corpus has
+# the law: the 5 VUK rows are misattributed (3/5 are really Avukatlik Kanunu /
+# HMK questions), so their gold source label is wrong.
+HMGS_DROPPED_SOURCES = frozenset({"213 sayılı Vergi Usul Kanunu"})
+HMGS_EVAL_EXPECTED = 161  # 240 raw - 49 no corpus - 5 VUK (HMGS_DROPPED_SOURCES) - 25 MC-ref; soft assertion in build_gold_eval_set
 
 # turkish_legal_rag eval set (HF mtntasci/turkish-legal-rag, CC-BY-4.0); built by
 # scripts/16_prepare_turkish_legal_rag.py and committed under results/processed_data/.
@@ -85,11 +93,13 @@ RERANKER_CANDIDATES = 50   # fetch more candidates than TOP_K so reranker has a 
 RRF_K = 60                 # RRF smoothing constant
 
 GRAPH_FILE = "graph.json"
-GRAPH_EXPANSION_ENABLED = False
 GRAPH_HOPS = 1
 GRAPH_NEIGHBOR_BUDGET = 3
-GRAPH_EDGE_KINDS = ("adj", "intra", "cross")
-GRAPH_DECAY = {"adj": 0.85, "intra": 0.70, "cross": 0.60}
+# When True, up to GRAPH_NEIGHBOR_BUDGET of the TOP_K_FOR_GENERATION context
+# slots are reserved for graph neighbours of the top-ranked chunks, so graph
+# expansion can change generation.  Retrieval metrics (recall/MRR/nDCG/source
+# hit) always use the pre-expansion ranking.
+GRAPH_CONTEXT_RESERVE = True
 
 # Direct madde lookup: when True, queries that explicitly reference a law article
 # (e.g. "TCK 86. madde") inject that article's chunks via _source_madde_lookup.
@@ -97,24 +107,47 @@ GRAPH_DECAY = {"adj": 0.85, "intra": 0.70, "cross": 0.60}
 DIRECT_MADDE_LOOKUP_ENABLED = False
 
 # LLM (Ollama — free, no API key)
-LLM_MODEL = "qwen2.5:14b"
+# Ablation one-factor rule: the base-LLM stages and the fine-tuned-LLM stages
+# must differ ONLY in the LoRA weights.  LLM_BASE_FOR_ABLATION is therefore the
+# Ollama tag of the exact base the LoRA adapter was trained on
+# (LORA_BASE_HF_MODEL = Qwen/Qwen2.5-7B-Instruct, see
+# results/model_configs/qwen25_lora/adapter_config.json); both use
+# LLM_MAX_TOKENS and LLM_NUM_CTX.  Sized for a 12 GB GPU (RTX 4070 Super);
+# on a larger GPU qwen2.5:14b / llama3.3:70b are options, but the LoRA must
+# then be retrained on the matching base.
+LLM_BASE_FOR_ABLATION = "qwen2.5:7b"
+LORA_BASE_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+LLM_MODEL = LLM_BASE_FOR_ABLATION
 LLM_FINETUNED_MODEL = "qwen25-legal-ft"   # created by scripts/13_export_lora_to_ollama.py
 LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_API_KEY = "ollama"
 LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 512
+# Context window for BOTH LLMs.  Baked into the fine-tuned Modelfile; for the
+# base model start Ollama with OLLAMA_CONTEXT_LENGTH=8192 (the OpenAI-compatible
+# endpoint cannot set num_ctx per request).
+LLM_NUM_CTX = 8192
 # Stage is marked failed when more than this fraction of generations / judge calls fail
 MAX_FAILURE_RATE = 0.2
-LLM_FINETUNED_MAX_TOKENS = 256  # shorter cap for fine-tuned model to reduce runaway generation
-LLM_JUDGE_MODEL = "llama3.3:70b"   # separate judge model to avoid self-evaluation bias
-
-KAGGLE_MIN_SCORE = 6
+# trust_remote_code executes code shipped with a model repo.  Qwen2.5 and
+# BGE-M3 are natively supported by transformers, so keep False.  Set True only
+# for a model that really needs custom modelling code.
+TRUST_REMOTE_CODE = False
+# Judge differs from the generator (Qwen) to avoid self-evaluation bias.
+# llama3.3:70b is an option on a larger GPU.
+LLM_JUDGE_MODEL = "llama3.1:8b"
 
 # Evaluation
 HALLUCINATION_SAMPLE_SIZE = 150
-# Number of predictions sampled for each LLM-judge metric call.
-# Increase for higher-fidelity estimates (at the cost of more Ollama calls).
-LLM_JUDGE_SAMPLE_SIZE = 20
+
+# NLI model for hallucination analysis (multilingual, covers Turkish).
+NLI_MODEL = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+# Multilingual sentence-embedding model for answer semantic similarity.
+SEMANTIC_SIM_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+SEMANTIC_SIM_MAX_SEQ_LEN = 512  # encoder window; longer answers are chunked
+# Number of predictions sampled for each LLM-judge metric call.  None = judge
+# every prediction (needed for tight CIs); an int caps cost (Ollama calls).
+LLM_JUDGE_SAMPLE_SIZE = None
 
 # Hallucination stratification thresholds (applied to top-1 retrieval score)
 HALLUCINATION_HIT_THRESHOLD = 0.7
@@ -122,13 +155,6 @@ HALLUCINATION_PARTIAL_THRESHOLD = 0.4
 
 # BM25 tokenization
 BM25_MIN_TOKEN_LENGTH = 2
-
-# Oracle relevance (scripts/03_evaluate_retrieval.py)
-TOP_K_ORACLE = 5
-
-# Maximum number of chunks assigned as relevant by strategy-3 (source-level fallback).
-# Caps the per-query relevant set so MRR/Recall/NDCG remain meaningful for HMGS queries.
-MAX_STRATEGY3_RELEVANT = 20
 
 # Custom corpus / benchmark support
 CUSTOM_CORPUS_FILE = "corpus_chunks_custom.jsonl"

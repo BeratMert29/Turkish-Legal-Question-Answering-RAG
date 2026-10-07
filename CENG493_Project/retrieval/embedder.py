@@ -30,6 +30,8 @@ class Embedder:
     def load_model(self) -> None:
         """Load SentenceTransformer model onto device."""
         self.model = SentenceTransformer(self.model_name, device=self.device)
+        if self.device == "cuda":
+            self.model.half()  # fp16 on CUDA: ~half the VRAM, faster encode
 
     def encode(self, texts: list[str], is_query: bool = False,
                show_progress: bool = True) -> np.ndarray:

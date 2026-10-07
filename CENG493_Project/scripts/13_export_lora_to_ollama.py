@@ -93,9 +93,9 @@ def merge_adapter(dry_run: bool) -> None:
         hf_base_model,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        trust_remote_code=True,
+        trust_remote_code=config.TRUST_REMOTE_CODE,
     )
-    tok = AutoTokenizer.from_pretrained(hf_base_model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(hf_base_model, trust_remote_code=config.TRUST_REMOTE_CODE)
 
     print("  Loading LoRA adapter …")
     model = PeftModel.from_pretrained(base, str(ADAPTER_DIR))

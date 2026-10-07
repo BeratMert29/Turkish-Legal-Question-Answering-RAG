@@ -179,3 +179,40 @@ def test_gecici_madde_no_not_matched_as_int():
     from data.data_processor import CorpusChunk, _chunk_matches_article
     c = CorpusChunk(chunk_id="c", doc_id="d", source="s", text="t", char_len=1, madde_no="gecici-2")
     assert _chunk_matches_article(c, 2) is False
+
+
+class TestContinuationChunks:
+    """Every chunk of an article carries its madde_no, not only the heading chunk."""
+
+    def _article(self, n, filler=3000):
+        return f"MADDE {n}- " + "Bu madde uzun bir hüküm içerir. " * (filler // 33)
+
+    def test_article_continuation_chunks_inherit_madde_no(self):
+        chunks = DataProcessor._article_chunk(self._article(7), "d", "L")
+        assert len(chunks) >= 3
+        assert {c.madde_no for c in chunks} == {"7"}
+
+    def test_char_chunk_carries_heading_forward(self):
+        text = self._article(12, 4000)
+        chunks = DataProcessor._char_chunk(text, "d", "L")
+        assert len(chunks) >= 3 and {c.madde_no for c in chunks} == {"12"}
+
+    def test_chunk_with_new_heading_mid_text_keeps_previous_lead_article(self):
+        from data.data_processor import _assign_madde_nos
+        out = _assign_madde_nos(["MADDE 1- a", "devam eden metin\nMADDE 2- b", "devam 2"])
+        assert out == ["1", "1", "2"]
+
+    def test_heading_beyond_600_chars_is_found(self):
+        text = "Giriş metni " * 100 + "\nMADDE 44- Hüküm."
+        assert len(text) > 600
+        assert _madde_no_from_text(text) == "44"
+
+    def test_legacy_chunks_without_madde_no_label_all_chunks_of_gold_article(self):
+        long = "MADDE 9- " + "uzun hüküm metni. " * 120
+        parts = DataProcessor._article_chunk(long + "\nMADDE 10- diğer " + "x " * 100, "d", "L")
+        legacy = [CorpusChunk(c.chunk_id, c.doc_id, c.text, c.source, c.char_len) for c in parts]
+        qa = [{"query_id": "q", "question": "", "answer": "", "context": "",
+               "source": "L", "madde_no": "9"}]
+        rel = DataProcessor.build_relevant_chunk_map(legacy, qa)["q"]
+        nine = [c.chunk_id for c in parts if c.madde_no == "9"]
+        assert len(nine) >= 2 and rel == nine
