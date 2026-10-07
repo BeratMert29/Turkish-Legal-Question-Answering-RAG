@@ -2,9 +2,9 @@
 # Heavy modules (torch, faiss, sentence_transformers, transformers,
 # rank_bm25, openai, …) are stubbed in tests/conftest.py when absent.
 
-pytest>=7.4
+pytest>=7.4,<9
 numpy>=1.24,<3
-pandas>=2.0
-scipy>=1.10
-ranx>=0.3.5
-langchain-text-splitters>=0.3.0
+pandas>=2.0,<3
+scipy>=1.10,<2
+ranx>=0.3.5,<1
+langchain-text-splitters>=0.3.0,<1
