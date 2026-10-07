@@ -10,15 +10,11 @@ _project_root = str(Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from utils import read_jsonl
 import config
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever
 from retrieval.bm25_retriever import BM25Index
-
-
-def load_jsonl(path: Path) -> list[dict]:
-    from utils import read_jsonl
-    return list(read_jsonl(path))
 
 
 def assemble_context(chunks: list, top_k: int, context_window_chars: int) -> str:
@@ -54,7 +50,7 @@ def main() -> None:
         print(f"ERROR: training dataset not found at {dataset_path}")
         sys.exit(1)
     print(f"Loading training records from {dataset_path} ...")
-    records = load_jsonl(dataset_path)
+    records = list(read_jsonl(dataset_path))
     print(f"  {len(records)} records loaded.")
 
     index_path = config.INDEX_DIR / config.INDEX_FILE

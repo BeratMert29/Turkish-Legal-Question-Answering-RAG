@@ -25,6 +25,7 @@ _project_root = str(Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from utils import read_jsonl
 import config
 
 # ── Paths & hyperparameters ──────────────────────────────────────────────────
@@ -50,11 +51,6 @@ TRAINING_CONFIG = {
 }
 
 
-def load_jsonl(path: Path) -> list[dict]:
-    from utils import read_jsonl
-    return list(read_jsonl(path))
-
-
 def main() -> None:
     # Lazy imports so the script fails fast if deps are missing
     try:
@@ -77,7 +73,7 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Loading triplets from {TRIPLET_FILE} ...")
-    raw = load_jsonl(TRIPLET_FILE)
+    raw = list(read_jsonl(TRIPLET_FILE))
     print(f"  {len(raw):,} triplets loaded.")
 
     # ── Build HuggingFace Dataset ────────────────────────────────────────────
