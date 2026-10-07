@@ -180,3 +180,29 @@ class TestSourceMRR:
         ]
         m = compute_source_hit_metrics(results)
         assert m["source_mrr_all"] == pytest.approx(1.0)
+
+
+class TestPrecisionDenominatorIsK:
+    """Verify source_precision_at_k always divides by k (not len(top_k)).
+
+    Before the fix the denominator was max(len(top_k), 1), which inflated
+    precision when fewer than k chunks were retrieved.
+    """
+
+    def test_single_hit_in_k5_denominator_is_5(self):
+        """1 hit out of 1 retrieved chunk → precision = 1/5, not 1/1."""
+        results = [_r("q1", "LawA", ["LawA"])]
+        m = compute_source_hit_metrics(results)
+        assert m["source_precision_at_5_all"] == pytest.approx(1 / 5)
+
+    def test_single_hit_in_k10_denominator_is_10(self):
+        """1 hit out of 3 retrieved → precision@10 = 1/10."""
+        results = [_r("q1", "LawA", ["LawA", "LawB", "LawC"])]
+        m = compute_source_hit_metrics(results)
+        assert m["source_precision_at_10_all"] == pytest.approx(1 / 10)
+
+    def test_full_k_unchanged(self):
+        """When exactly k chunks are retrieved the denominator change has no effect."""
+        results = [_r("q1", "LawA", ["LawA", "LawB", "LawA", "LawC", "LawD"])]
+        m = compute_source_hit_metrics(results)
+        assert m["source_precision_at_5_all"] == pytest.approx(2 / 5)
