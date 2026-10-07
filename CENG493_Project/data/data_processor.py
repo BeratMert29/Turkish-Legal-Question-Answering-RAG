@@ -329,6 +329,13 @@ def _inherited_madde_nos(corpus_chunks) -> "dict[str, str]":
     return out
 
 
+def normalize_question(text) -> str:
+    """Question key for leakage checks: Turkish-lowercased, punctuation and
+    whitespace runs collapsed."""
+    from utils import normalize_turkish
+    return re.sub(r"\W+", " ", normalize_turkish(str(text or ""))).strip()
+
+
 @dataclass
 class CorpusChunk:
     chunk_id: str   # f"{source}_{doc_id}_{chunk_index}"
@@ -397,64 +404,69 @@ class DataProcessor:
         self._ensure_loaded()
         return self._df[self._df["split"] == split].reset_index(drop=True)
 
-    def _get_kaggle_corpus_eval_split(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Split kaggle rows into (corpus_df, eval_df) holding eval rows out of corpus.
+    def kaggle_eval_df(self) -> pd.DataFrame:
+        """The kaggle rows used as the ``kaggle`` eval set.
 
-        Uses an article-hash split to prevent data leakage: rows sharing the same
-        context text (same article) are always kept together on the same side of the
-        split.  A plain row-level sample would allow the same article to appear in
-        both the FAISS corpus and the eval set under different doc_ids, leaking the
-        gold context into the retrieval index.
+        Up to ``config.QA_EVAL_EXPECTED`` rows, taken round-robin over the
+        distinct contexts (one question per context first, then a second,
+        ...), each in a fixed hash order, so the questions are as independent
+        as the data allows and the set is deterministic.  Questions that also
+        occur in the ``train`` split are left out (train/eval leakage).
 
-        Algorithm:
-        1. Compute MD5 of each row's context text (NaN/empty → treated as "" so
-           all context-less rows stay in the corpus, not the eval set).
-        2. Build a sorted, deduplicated list of unique non-empty context hashes.
-        3. Assign the last N unique hashes to the eval set (deterministic, no shuffle
-           needed because the list is sorted — equivalent to random_state=42 row
-           sampling for uniformly-distributed hashes).
-        4. Eval rows = all rows whose context hash is in the eval hash set.
-        5. Corpus rows = everything else (including all NaN-context rows).
-
-        Returns:
-            corpus_df: rows NOT sampled for eval — used for FAISS index construction.
-            eval_df:   rows sampled for eval — used to build the QA eval set.
-
-        Result is cached on the instance so the expensive split is computed only once
-        per pipeline run even when both build_corpus_chunks() and build_qa_eval_set()
-        call this method.
+        The contexts stay in the index: a retrieval eval needs its gold
+        passages in the corpus, so leakage control happens on the training
+        data (:meth:`build_qa_train_set`, :meth:`build_kaggle_train_set`),
+        not by removing passages from the index.
         """
-        if hasattr(self, "_split_cache"):
-            return self._split_cache
+        if hasattr(self, "_kaggle_eval_cache"):
+            return self._kaggle_eval_cache
+
+        def _md5(val) -> str:
+            return hashlib.md5(str(val).encode("utf-8")).hexdigest()
 
         df = self.get_corpus_rows()
+        df = df[df["context"].notna() & (df["context"].astype(str) != "")]
+        train_keys = {normalize_question(q) for q in self.get_qa_split("train")["question"].dropna()}
+        df = df[~df["question"].fillna("").map(normalize_question).isin(train_keys)]
+        groups = [
+            sorted(g.index, key=lambda i: _md5(df.at[i, "id"]))
+            for _, g in sorted(df.groupby(df["context"].map(_md5)), key=lambda kv: kv[0])
+        ]
+        picked: list[int] = []
+        depth = 0
+        while len(picked) < config.QA_EVAL_EXPECTED and any(len(g) > depth for g in groups):
+            for g in groups:
+                if depth < len(g) and len(picked) < config.QA_EVAL_EXPECTED:
+                    picked.append(g[depth])
+            depth += 1
+        self._kaggle_eval_cache = df.loc[picked].reset_index(drop=True)
+        return self._kaggle_eval_cache
 
-        # Step 1 — compute per-row context hash (empty string for NaN).
-        def _ctx_hash(val):
-            text = "" if (val is None or (isinstance(val, float) and pd.isna(val))) else str(val)
-            return hashlib.md5(text.encode()).hexdigest() if text else ""
+    def eval_question_keys(self) -> set[str]:
+        """Normalised questions of every eval set (kaggle, turkish_legal_rag,
+        HMGS) -- to be kept out of any training data."""
+        keys = {normalize_question(q) for q in self.kaggle_eval_df()["question"].dropna()}
+        return keys | DataProcessor.saved_eval_question_keys()
 
-        ctx_hashes = [_ctx_hash(val) for val in df["context"]]
-
-        # Step 2 — unique non-empty hashes, sorted for determinism.
-        unique_hashes = sorted({h for h in ctx_hashes if h})
-        n = min(config.QA_EVAL_EXPECTED, len(unique_hashes))
-
-        # Step 3 — take the last N unique hashes as the eval set.
-        eval_hash_set = set(unique_hashes[-n:])
-
-        # Step 4 — partition rows via boolean mask.
-        eval_mask = np.array([h in eval_hash_set for h in ctx_hashes])
-        eval_df = df[eval_mask].reset_index(drop=True)
-        corpus_df = df[~eval_mask].reset_index(drop=True)
-
-        self._split_cache = (corpus_df, eval_df)
-        return corpus_df, eval_df
-
-    def get_eval_only_rows(self) -> pd.DataFrame:
-        """Return only the kaggle rows held out for eval (not in the FAISS corpus)."""
-        _, eval_df = self._get_kaggle_corpus_eval_split()
-        return eval_df
+    @staticmethod
+    def saved_eval_question_keys() -> set[str]:
+        """Normalised questions of the eval sets available without the raw
+        CSV: turkish_legal_rag (incl. label conflicts), HMGS and any saved
+        qa_eval.jsonl."""
+        keys: set[str] = set()
+        files = [
+            pathlib.Path(config.TLR_DATA_PATH),
+            pathlib.Path(config.TLR_PROCESSED_DIR) / "qa_turkish_legal_rag.label_conflicts.jsonl",
+            pathlib.Path(config.TLR_PROCESSED_DIR) / "qa_eval.jsonl",
+            pathlib.Path(config.PROCESSED_DIR) / "qa_eval.jsonl",
+        ]
+        for f in files:
+            if f.exists():
+                keys |= {normalize_question(r.get("question", "")) for r in _read_jsonl(f)}
+        if pathlib.Path(config.HMGS_DATA_PATH).exists():
+            keys |= {normalize_question(q.question) for q in DataProcessor.build_gold_eval_set()}
+        keys.discard("")
+        return keys
 
     # ------------------------------------------------------------------
     # Chunking
@@ -568,13 +580,16 @@ class DataProcessor:
         ``doc_id`` get a ``__dupN`` suffix so FAISS ids / metadata do not collide.
 
         Args:
-            holdout: When True, the kaggle rows held out for the legacy
-                ``kaggle`` eval set (see ``_get_kaggle_corpus_eval_split``)
-                are NOT indexed.  Leave False (default) for the
-                ``turkish_legal_rag`` / ``hmgs`` eval sets: they are labelled
-                against the full kaggle law texts, and holding out would drop
-                all eval laws from the corpus.
+            holdout: Deprecated and ignored.  It removed the kaggle eval
+                contexts from the index, which made their gold passages
+                unretrievable (with 240 distinct contexts every one was held
+                out); see :meth:`kaggle_eval_df` for the leakage control
+                that replaced it.
         """
+        if holdout:
+            import warnings
+            warnings.warn("build_corpus_chunks(holdout=True) is ignored: eval "
+                          "passages stay in the index", DeprecationWarning, stacklevel=2)
         seen_hashes: set[str] = set()
         seen_ids: set[str] = set()
         kept = 0
@@ -594,10 +609,7 @@ class DataProcessor:
             seen_ids.add(cid)
             return chunk
 
-        if holdout:
-            corpus_df, _ = self._get_kaggle_corpus_eval_split()
-        else:
-            corpus_df = self.get_corpus_rows()
+        corpus_df = self.get_corpus_rows()
 
         for row in corpus_df.itertuples(index=False):
             context = row.context if pd.notna(row.context) else ""
@@ -640,7 +652,7 @@ class DataProcessor:
                   f"(cleaning: {clean_stats})")
 
         print(f"[build_corpus_chunks] kept={kept}, skipped={skipped} duplicate chunks, "
-              f"renamed={renamed} colliding chunk_ids, holdout={holdout}")
+              f"renamed={renamed} colliding chunk_ids")
 
     # ------------------------------------------------------------------
     # QA set builders
@@ -676,19 +688,27 @@ class DataProcessor:
         return examples
 
     def build_qa_eval_set(self) -> list[QAExample]:
-        """Build QA eval set from the held-out kaggle split (data leakage fix).
+        """The ``kaggle`` eval set (see :meth:`kaggle_eval_df`)."""
+        return self._rows_to_qa_examples(self.kaggle_eval_df())
 
-        Eval rows are the same subset held out from the FAISS corpus by
-        _get_kaggle_corpus_eval_split(), so retrieval is always evaluated on
-        unseen queries.  Uses random_state=42 for reproducibility.
-        """
-        _, eval_df = self._get_kaggle_corpus_eval_split()
-        return self._rows_to_qa_examples(eval_df)
+    def _without_eval_questions(self, df: pd.DataFrame) -> pd.DataFrame:
+        keys = self.eval_question_keys()
+        mask = df["question"].fillna("").map(normalize_question).isin(keys)
+        if mask.any():
+            print(f"[train data] dropped {int(mask.sum())} rows whose question is in an eval set")
+        return df[~mask]
 
     def build_qa_train_set(self) -> list[QAExample]:
-        """Build QA train set (train split)."""
-        df = self.get_qa_split("train")
-        return self._rows_to_qa_examples(df)
+        """QA train set: the ``train`` split minus any question of an eval set."""
+        return self._rows_to_qa_examples(self._without_eval_questions(self.get_qa_split("train")))
+
+    def build_kaggle_train_set(self) -> list[QAExample]:
+        """Kaggle rows (with contexts) for supervised retrieval training: every
+        kaggle row except the eval rows and any question of an eval set."""
+        df = self.get_corpus_rows()
+        eval_ids = set(self.kaggle_eval_df()["id"])
+        df = df[df["context"].notna() & ~df["id"].isin(eval_ids)]
+        return self._rows_to_qa_examples(self._without_eval_questions(df))
 
     @staticmethod
     def build_gold_eval_set(hmgs_path=None) -> list[QAExample]:
@@ -737,8 +757,8 @@ class DataProcessor:
         skipped_mc = 0
         skipped_src = 0
 
-        for i, row in enumerate(df.itertuples(index=False)):
-            raw = row._asdict()
+        # to_dict keeps column names such as "veri türü" (itertuples renames them)
+        for i, raw in enumerate(df.to_dict("records")):
 
             def _str(val):
                 return "" if pd.isna(val) else str(val)

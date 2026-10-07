@@ -100,12 +100,12 @@ def _parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def build_index(processor, embedder, chunks=None, holdout=False):
+def build_index(processor, embedder, chunks=None):
     from retrieval.retriever import Retriever
 
     if chunks is None:
         log.info("Building corpus chunks …")
-        chunks = list(processor.build_corpus_chunks(holdout=holdout))
+        chunks = list(processor.build_corpus_chunks())
     log.info("  %d chunks total", len(chunks))
 
     texts = [c.text for c in chunks]
@@ -193,10 +193,7 @@ def main() -> None:
         summary = processor.load_and_validate()
         log.info("Dataset summary: %s", summary)
         log.info("Building corpus chunks for reuse …")
-        # Eval rows are held out of the index only for the Kaggle-split eval set.
-        corpus_chunks = list(processor.build_corpus_chunks(
-            holdout=(args.eval_set == "kaggle" and not args.hmgs)
-        ))
+        corpus_chunks = list(processor.build_corpus_chunks())
 
     from retrieval.embedder import Embedder
 
@@ -211,7 +208,7 @@ def main() -> None:
     else:
         retriever = load_index(embedder)
         # Gold labels, BM25 and the graph are built from corpus_chunks; an
-        # index built from another corpus (e.g. scripts/01's holdout corpus)
+        # index built from another corpus (another chunker or corpus file)
         # silently makes gold chunks unretrievable.
         index_ids = [m.get("chunk_id") for m in retriever.metadata]
         if index_ids != [c.chunk_id for c in corpus_chunks]:

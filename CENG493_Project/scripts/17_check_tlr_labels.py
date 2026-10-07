@@ -54,7 +54,7 @@ def main(argv=None) -> None:
 
     processor = DataProcessor(args.csv)
     processor.load_and_validate()
-    chunks = list(processor.build_corpus_chunks(holdout=False))
+    chunks = list(processor.build_corpus_chunks())
 
     eval_rows, conflicts, report = apply_label_checks(rows, chunks)
     print(json.dumps({k: v for k, v in report.items() if k != "relabelled_query_ids"},

@@ -90,6 +90,11 @@ def main() -> None:
     print(f"Loading QA pairs from {QA_PATH} ...")
     qa_pairs = list(read_jsonl(QA_PATH))
     print(f"  {len(qa_pairs)} QA pairs loaded.")
+    from data.data_processor import DataProcessor, normalize_question
+    eval_keys = DataProcessor.saved_eval_question_keys()
+    n_before = len(qa_pairs)
+    qa_pairs = [qa for qa in qa_pairs if normalize_question(qa["question"]) not in eval_keys]
+    print(f"  {n_before - len(qa_pairs)} dropped: question is in an eval set")
 
     print(f"Loading corpus chunks from {CORPUS_PATH} ...")
     corpus = list(read_jsonl(CORPUS_PATH))

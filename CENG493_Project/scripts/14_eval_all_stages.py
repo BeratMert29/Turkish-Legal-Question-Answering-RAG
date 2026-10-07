@@ -267,11 +267,7 @@ def main() -> None:
         print(f"  Chunking/loading corpus from {args.docs_path} …")
         corpus_chunks = load_external_corpus(Path(corpus_path))
     else:
-        corpus_chunks = list(
-            # Hold the eval rows out of the index only for the Kaggle-split
-            # eval set; the other eval sets are not drawn from the corpus.
-            _processor().build_corpus_chunks(holdout=args.eval_set == "kaggle")
-        )
+        corpus_chunks = list(_processor().build_corpus_chunks())
 
     if args.eval_data:
         print(f"  QA source     : {args.eval_data} (external evaluator format)")
@@ -329,7 +325,7 @@ def main() -> None:
             )
 
     # The kaggle eval set is labeled from its own contexts; zero labels means
-    # the holdout removed every gold passage and retrieval metrics are void.
+    # the corpus does not hold them and retrieval metrics would be void.
     if (not args.eval_data and args.eval_set == "kaggle"
             and labeling_coverage["labeled"] == 0):
         sys.exit(

@@ -16,8 +16,7 @@ def main():
     # Build corpus chunks
     print("Building corpus chunks...")
     t0 = time.time()
-    # qa_eval.jsonl rows are held out
-    chunks = list(dp.build_corpus_chunks(holdout=True))
+    chunks = list(dp.build_corpus_chunks())
     corpus_path = config.PROCESSED_DIR / "corpus_chunks.jsonl"
     n_chunks = DataProcessor.save_jsonl(chunks, corpus_path)
     print(f"  → {n_chunks} chunks written to {corpus_path} ({time.time()-t0:.1f}s)")
