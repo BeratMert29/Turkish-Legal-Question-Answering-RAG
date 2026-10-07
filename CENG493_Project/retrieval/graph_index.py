@@ -19,8 +19,15 @@ _QUERY_KANUN_RE = re.compile(
     r"(?:Kanunu?|Yasası?)[a-zçğıöşü]*",
 )
 
-# "madde 86" / "MADDE 86" — used in the window after a law reference, or standalone.
-_QUERY_MADDE_NUM_RE = re.compile(r"(?:madde|MADDE)\s*(\d{1,4})", re.IGNORECASE)
+# "madde 86" / "MADDE 86" / "md. 86" / "86. madde" / "86. md." — used in the window
+# after a law reference, or standalone.
+# group 1: madde/md prefix form  e.g. "madde 86", "md. 86"
+# group 2: number-first form     e.g. "86. madde", "86. md.", "5. md"
+_QUERY_MADDE_NUM_RE = re.compile(
+    r"(?:madde|md)\.?\s*(\d{1,4})"         # g1: "madde 86", "md. 86"
+    r"|(\d{1,4})\s*\.?\s*(?:madde|md)\.?", # g2: "86. madde", "86. md.", "5. md"
+    re.IGNORECASE,
+)
 
 # Common Turkish law abbreviations → normalized source name.
 _LAW_ABBREVS: dict[str, str] = {
@@ -181,7 +188,7 @@ class GraphIndex:
                 window = query[lm.end(): lm.end() + _LOOKUP_WINDOW]
                 mm = _QUERY_MADDE_NUM_RE.search(window)
                 if mm:
-                    _add_chunks(src, mm.group(1))
+                    _add_chunks(src, mm.group(1) or mm.group(2))
 
         # Pattern B: abbreviation like "TCK madde 86" / "TCK 86. madde"
         for abbrev, madde_no in find_abbrev_maddes(query):

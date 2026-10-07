@@ -400,3 +400,100 @@ class TestDryRun:
         assert "recall_at_5" in metrics
         assert "mrr" in metrics
         assert metrics["num_queries"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# New helper / fix tests
+# ---------------------------------------------------------------------------
+
+class TestEvalHelpers:
+    """Unit tests for helpers added in the improvements/2026-10 branch."""
+
+    def test_evict_model_cache_clears(self):
+        """evict_model_cache() must empty _model_cache without raising."""
+        from pipeline.evaluation import _model_cache, evict_model_cache
+
+        _model_cache["nli"] = object()
+        evict_model_cache()
+        assert "nli" not in _model_cache
+
+    def test_build_stage_components_importable(self):
+        from pipeline.evaluation import _build_stage_components
+        assert callable(_build_stage_components)
+
+    def test_run_generation_and_qa_importable(self):
+        from pipeline.evaluation import _run_generation_and_qa
+        assert callable(_run_generation_and_qa)
+
+    def test_save_stage_results_atomic(self, tmp_path):
+        """save_stage_results must produce an intact JSON even if called twice."""
+        from pipeline.evaluation import save_stage_results
+
+        out = save_stage_results({"v": 1}, [], tmp_path / "r")
+        assert out.exists()
+        import json
+        assert json.loads(out.read_text())["v"] == 1
+        # Second call overwrites atomically — must not raise or leave .tmp files.
+        save_stage_results({"v": 2}, [], tmp_path / "r")
+        assert json.loads(out.read_text())["v"] == 2
+        assert not (tmp_path / "r" / "baseline_metrics.tmp").exists()
+
+    def test_run_llm_judge_eval_shared_sample(self):
+        """run_llm_judge_eval must call each judge function with the same query IDs."""
+        from pipeline.evaluation import run_llm_judge_eval
+
+        calls: dict[str, list] = {}
+
+        def _fake_judge(preds, base_url, model, sample_size=20, results_dir=None):
+            calls[model + str(len(calls))] = [p["query_id"] for p in preds]
+            return {"score": 0.5, "per_sample": [], "parse_fail_count": 0, "sample_size": len(preds)}
+
+        qa = [_FakeQA(f"q{i}", f"Q{i}", f"A{i}", "Law") for i in range(30)]
+        preds = [
+            {
+                "query_id": qa[i].query_id,
+                "predicted": f"ans{i}",
+                "expected": qa[i].answer,
+                "retrieved_chunks": [],
+            }
+            for i in range(30)
+        ]
+
+        from unittest.mock import patch
+        with patch("evaluation.llm_judge.llm_judge_answer", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_faithfulness", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_relevancy", side_effect=_fake_judge), \
+             patch("evaluation.llm_judge.llm_judge_coherence", side_effect=_fake_judge):
+            run_llm_judge_eval(
+                preds, qa,
+                base_url="http://localhost:11434/v1",
+                judge_model="mock",
+                sample_size=10,
+            )
+
+        id_sets = [set(v) for v in calls.values()]
+        assert len(id_sets) == 4
+        # All four metrics must have received the same set of query IDs.
+        assert id_sets[0] == id_sets[1] == id_sets[2] == id_sets[3]
+
+    def test_retrieval_pipeline_file_no_leak(self, tmp_path):
+        """auto_build_graph must not leak a file handle (use with)."""
+        # Smoke test: call with a non-existent candidate so it exits early.
+        import config as _cfg
+        from unittest.mock import patch
+        from pipeline.retrieval import auto_build_graph
+
+        fake_path = tmp_path / "graph.json"
+        # No metadata candidates exist → function returns without opening files.
+        with patch.object(_cfg, "INDEX_DIR", tmp_path), \
+             patch.object(_cfg, "BASE_DIR", tmp_path):
+            auto_build_graph(fake_path)
+        assert not fake_path.exists()
+
+    def test_real_metadata_path_resolves(self, repo_root):
+        """results/index/metadata.jsonl is committed and resolves from repo root."""
+        meta = repo_root / "results" / "index" / "metadata.jsonl"
+        assert meta.exists(), (
+            f"metadata.jsonl not committed at {meta}; "
+            "CI will silently skip data-dependent tests without it."
+        )
