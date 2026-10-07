@@ -73,19 +73,19 @@ _META_LEGACY = [
         "chunk_id": "tck_5237_m12",
         "doc_id": "5237",
         "source": "Türk Ceza Kanunu",
-        "text": "Madde 12 metni. Madde 13'e bakınız.",
+        "text": "Madde 12 – metni. Madde 13'e bakınız.",
     },
     {
         "chunk_id": "tck_5237_m13",
         "doc_id": "5237",
         "source": "Türk Ceza Kanunu",
-        "text": "Madde 13 metni.",
+        "text": "Madde 13 – metni.",
     },
     {
         "chunk_id": "tck_5237_m14",
         "doc_id": "5237",
         "source": "Türk Ceza Kanunu",
-        "text": "Madde 14 metni.",
+        "text": "Madde 14 – metni.",
     },
 ]
 
@@ -252,7 +252,7 @@ class TestBuildGraph:
     def test_intra_reference(self):
         """A chunk mentioning 'Madde 13' links to the chunk with madde_no=13."""
         graph = build_graph_from_metadata(_META_LEGACY)
-        # _META_LEGACY[0] text: "Madde 12 metni. Madde 13'e bakınız."
+        # _META_LEGACY[0] text: "Madde 12 – metni. Madde 13'e bakınız."
         # → intra edge from m12 to m13
         cid_m12 = "tck_5237_m12"
         kinds = {kind for _, kind in graph.get(cid_m12, [])}
