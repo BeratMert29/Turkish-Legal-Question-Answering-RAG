@@ -788,3 +788,16 @@ class TestCorruptGraphRecovery:
         # After rebuild the file on disk should be valid JSON
         reloaded = json.loads(g_path.read_text(encoding="utf-8"))
         assert "_source_madde_lookup" in reloaded
+
+
+def test_graph_index_from_metadata_builds_adjacency_in_memory():
+    from retrieval.graph_index import GraphIndex
+    meta = [
+        {"chunk_id": "a", "doc_id": "d", "source": "TCK", "text": "MADDE 1 - x", "madde_no": "1"},
+        {"chunk_id": "b", "doc_id": "d", "source": "TCK", "text": "MADDE 2 - y", "madde_no": "2"},
+        {"chunk_id": "c", "doc_id": "d", "source": "TCK", "text": "MADDE 9 - z", "madde_no": "9"},
+    ]
+    gi = GraphIndex.from_metadata(meta)
+    out = gi.expand([{"chunk_id": "a", "score": 1.0}], budget=3, kinds=("adj",))
+    assert [c["chunk_id"] for c in out] == ["a", "b"]
+    assert out[1]["text"] == "MADDE 2 - y"

@@ -28,7 +28,7 @@ Available stages:
     hybrid       BGE-M3 base    + hybrid BM25    + qwen2.5:7b
     rrf          BGE-M3 base    + RRF            + qwen2.5:7b
     rrf_rerank   BGE-M3 base    + RRF+rerank     + qwen2.5:7b   <- best retrieval
-    graph        BGE-M3 base    + RRF+rerank+graph + qwen2.5:7b  <- requires graph.json
+    graph        BGE-M3 base    + RRF+rerank+graph + qwen2.5:7b  (graph built from the corpus)
     llm_ft       BGE-M3 base    + dense          + qwen25-legal-ft (fine-tuned)
     emb_ft       BGE-M3 ft*     + RRF+rerank     + qwen2.5:7b   <- requires emb training
     full         BGE-M3 ft*     + RRF+rerank     + qwen25-legal-ft  <- best overall
@@ -57,7 +57,6 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import config
 from pipeline.stages import STAGE_REGISTRY, DEFAULT_STAGE_ORDER
-from pipeline.retrieval import auto_build_graph
 
 
 def _parse_args(argv=None):
@@ -202,25 +201,6 @@ def main() -> None:
             print(f"WARNING: Unknown stage '{key}' -- skipping.")
             continue
         stage = STAGE_REGISTRY[key]
-        if stage.requires_graph:
-            graph_path = config.INDEX_DIR / config.GRAPH_FILE
-            if not graph_path.exists():
-                auto_build_graph(graph_path)
-            # Rebuild if the existing file is corrupt JSON.
-            if graph_path.exists():
-                try:
-                    with graph_path.open(encoding="utf-8") as _gf:
-                        json.load(_gf)
-                except json.JSONDecodeError:
-                    print(f"  graph.json is corrupt — rebuilding …")
-                    auto_build_graph(graph_path)
-            if not graph_path.exists():
-                print(
-                    f"INFO: Stage '{key}' skipped -- "
-                    f"graph.json not found at {graph_path}\n"
-                    f"  Run: python scripts/15_build_graph.py first."
-                )
-                continue
         if stage.requires_emb_ft:
             emb_dir = Path(config.FINETUNED_EMBEDDING_MODEL)
             if not emb_dir.exists() or not any(emb_dir.iterdir()):

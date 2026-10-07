@@ -115,6 +115,9 @@ class GraphIndex:
         """
         with path.open(encoding="utf-8") as fh:
             raw: dict = json.load(fh)  # raises json.JSONDecodeError if corrupt
+        self._set_graph(raw)
+
+    def _set_graph(self, raw: dict) -> None:
         for key, edges in raw.items():
             if key == "_source_madde_lookup":
                 # Store lookup table; values may be lists or dicts depending on
@@ -126,9 +129,25 @@ class GraphIndex:
             elif not key.startswith("_"):
                 self._graph[key] = [(nb_id, kind) for nb_id, kind in edges]
 
+    @classmethod
+    def from_metadata(cls, metadata: list[dict]) -> "GraphIndex":
+        """Build the graph in memory from chunk records (chunk_id, doc_id,
+        text, source[, madde_no]) -- the corpus actually indexed for this
+        run, so neighbour ids and texts always match the retriever's chunks."""
+        from retrieval.graph_builder import build_graph_from_metadata
+
+        gi = cls.__new__(cls)
+        gi._graph, gi._chunk_meta, gi._source_madde_lookup = {}, {}, {}
+        gi._set_graph(build_graph_from_metadata(metadata))
+        gi._add_metadata(metadata)
+        return gi
+
     def _load_metadata(self, path: Path) -> None:
         from utils import read_jsonl
-        for record in read_jsonl(path):
+        self._add_metadata(read_jsonl(path))
+
+    def _add_metadata(self, records) -> None:
+        for record in records:
             cid = record.get("chunk_id")
             if cid is None:
                 continue

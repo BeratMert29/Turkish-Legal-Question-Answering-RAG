@@ -710,33 +710,21 @@ def _build_stage_components(
             reranker_cache["reranker"] = r
         reranker = reranker_cache["reranker"]
 
-    # Graph index — validate JSON before loading; rebuild if corrupt
+    # Graph index -- built in memory from this run's corpus (not from a saved
+    # graph.json / metadata.jsonl, whose chunk ids may belong to another
+    # chunking of the corpus).
     graph_index = None
     if stage.use_graph:
         if "graph_index" not in reranker_cache:
             from retrieval.graph_index import GraphIndex
 
-            graph_path = config.INDEX_DIR / config.GRAPH_FILE
-            meta_path = config.INDEX_DIR / config.METADATA_FILE
-            if not meta_path.exists():
-                meta_path = (
-                    config.BASE_DIR.parent / "results" / "index"
-                    / config.METADATA_FILE
-                )
-            if graph_path.exists() and meta_path.exists():
-                try:
-                    with open(graph_path, encoding="utf-8") as _gf:
-                        json.load(_gf)
-                except (json.JSONDecodeError, OSError):
-                    print(f"  WARNING: graph.json corrupt at {graph_path}; rebuilding …")
-                    from pipeline.retrieval import auto_build_graph
-                    auto_build_graph(graph_path)
-                if graph_path.exists():
-                    print(f"  Loading graph index: {graph_path}")
-                    reranker_cache["graph_index"] = GraphIndex(graph_path, meta_path)
-            else:
-                print(f"  WARNING: graph.json not found at {graph_path}")
-        graph_index = reranker_cache.get("graph_index")
+            print("  Building graph index from the corpus …")
+            reranker_cache["graph_index"] = GraphIndex.from_metadata([
+                {"chunk_id": c.chunk_id, "doc_id": c.doc_id, "text": c.text,
+                 "source": c.source, "madde_no": getattr(c, "madde_no", None)}
+                for c in corpus_chunks
+            ])
+        graph_index = reranker_cache["graph_index"]
 
     llm_model = (
         config.LLM_FINETUNED_MODEL

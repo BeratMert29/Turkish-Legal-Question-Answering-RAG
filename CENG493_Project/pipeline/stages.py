@@ -20,7 +20,7 @@ class StageConfig:
     inject_citations: bool = False   # post-hoc citation injection (for ft LLM)
     requires_emb_ft: bool = False    # skip automatically if emb model dir is empty
     use_graph: bool = False          # apply graph expansion after reranking
-    requires_graph: bool = False     # skip automatically if graph.json is missing
+    requires_graph: bool = False     # graph stage (graph is built in memory from the corpus)
 
 
 STAGE_REGISTRY: dict[str, StageConfig] = {
