@@ -106,7 +106,8 @@ class RAGPipeline:
                  top_k_for_generation: int = config.TOP_K_FOR_GENERATION,
                  context_window_chars: int = config.CONTEXT_WINDOW_CHARS,
                  short_answer_mode: bool = False,
-                 chunk_expander: "ChunkExpander | None" = None):
+                 chunk_expander: "ChunkExpander | None" = None,
+                 graph_neighbor_budget: int = 0):
         self.retriever = retriever
         self.model = model
         self.temperature = temperature
@@ -116,6 +117,9 @@ class RAGPipeline:
         self.top_k_for_generation = top_k_for_generation
         self.context_window_chars = context_window_chars
         self._chunk_expander = chunk_expander
+        # Slots (out of top_k_for_generation) reserved for graph neighbours of
+        # the top-ranked chunks; 0 disables the reservation.
+        self.graph_neighbor_budget = graph_neighbor_budget
         self._client = openai.OpenAI(
             base_url=config.LLM_BASE_URL,
             api_key=config.LLM_API_KEY,
@@ -125,9 +129,34 @@ class RAGPipeline:
         """Ollama OpenAI-compatible client."""
         return self._client
 
+    def _select_for_generation(self, chunks: list) -> list:
+        """Pick the generation context from a (possibly graph-expanded) ranking.
+
+        Chunks flagged ``graph_neighbor`` come from GraphIndex.expand and sit
+        right after their parent.  Up to ``graph_neighbor_budget`` of the
+        ``top_k_for_generation`` slots go to neighbours (preferring those whose
+        parent is among the kept top results); the rest go to the top-ranked
+        regular chunks.  List order (parent, then its neighbours) is kept.
+        """
+        k = self.top_k_for_generation
+        budget = self.graph_neighbor_budget
+        neighbours = [c for c in chunks if c.get("graph_neighbor")]
+        if budget <= 0 or not neighbours:
+            return chunks[:k]
+        regular = [c for c in chunks if not c.get("graph_neighbor")]
+        n_nb = min(budget, len(neighbours), max(k - 1, 0))
+        keep_regular = regular[:k - n_nb]
+        kept_ids = {c["chunk_id"] for c in keep_regular}
+        # neighbours of kept parents first (list order), then any others
+        preferred = [c for c in neighbours if c.get("graph_root") in kept_ids]
+        others = [c for c in neighbours if c not in preferred]
+        chosen = {id(c) for c in (preferred + others)[:n_nb]}
+        keep_ids = {id(c) for c in keep_regular} | chosen
+        return [c for c in chunks if id(c) in keep_ids]
+
     def assemble_context(self, chunks: list) -> tuple[str, list]:
         """Numbered sources string and chunks included (respects context_window_chars)."""
-        selected = chunks[:self.top_k_for_generation]
+        selected = self._select_for_generation(chunks)
         parts = []
         included = []
         running_len = 0
