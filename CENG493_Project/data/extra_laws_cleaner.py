@@ -14,6 +14,9 @@ mislabel articles:
    absurd article numbers (``madde_32313``, law numbers such as 6728) and
    amending-law sections ("MADDE 1 – 12/1/2011 tarihli ve 6100 sayılı ...").
    These are dropped.
+4. Article titles (and section headers) sit at the end of the *previous*
+   record, because the scrape split right before "MADDE N".  They are moved
+   to the start of the article they name.
 
 ``clean_extra_law_records`` is pure (no I/O) so it is unit-testable.
 """
@@ -47,6 +50,47 @@ _AMENDING_BODY = re.compile(
     r"\bBu\s+Kanunla\b|\bBu\s+Kanun[^\n]{0,60}(?:yayımı|yürürlüğe\s+girer)|Bakanlar\s+Kurulu\s+yürütür",
     re.IGNORECASE,
 )
+
+
+# Trailing title block: short lines without sentence-final punctuation.
+_TITLE_MAX_CHARS = 120
+_TITLE_MAX_LINES = 8
+
+
+def split_trailing_titles(text: str) -> "tuple[str, str]":
+    """``(body, titles)``: the trailing article-title / section-header lines
+    of *text* (short, no sentence-final punctuation, at most
+    _TITLE_MAX_LINES) split off the body."""
+    lines = text.rstrip().split("\n")
+    k = len(lines)
+    taken = 0
+    while k > 1 and taken < _TITLE_MAX_LINES:
+        line = lines[k - 1].strip()
+        if line:
+            if (len(line) > _TITLE_MAX_CHARS or line[-1] in ".;:,!?)"
+                    or _HEADING.match(line)):
+                break
+            taken += 1
+        k -= 1
+    if not taken:
+        return text, ""
+    return "\n".join(lines[:k]).rstrip(), "\n".join(lines[k:]).strip()
+
+
+def _move_titles_forward(out: "list[dict]", stats: collections.Counter) -> None:
+    """Give each article record the title lines stranded at the end of the
+    record before it (same source, next record is an article)."""
+    # Decide which records are articles before any text is moved: a record
+    # that received titles no longer starts with its heading.
+    is_article = [bool(_HEADING.match(r.get("text", ""))) for r in out]
+    for k, (prev, cur) in enumerate(zip(out, out[1:])):
+        if prev.get("source") != cur.get("source") or not (is_article[k] and is_article[k + 1]):
+            continue
+        body, titles = split_trailing_titles(prev["text"])
+        if titles:
+            prev["text"] = body
+            cur["text"] = f"{titles}\n{cur['text']}"
+            stats["moved_title_lines"] += titles.count("\n") + 1
 
 
 def _key(num: int, letter: "str | None") -> tuple:
@@ -133,4 +177,5 @@ def clean_extra_law_records(records: "list[dict]") -> "tuple[list[dict], dict]":
                 st["max"] = max(st["max"], num)
         out.append(new)
         stats["kept"] += 1
+    _move_titles_forward(out, stats)
     return out, dict(stats)

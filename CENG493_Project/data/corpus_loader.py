@@ -48,6 +48,7 @@ def _normalize_corpus_record(record: dict) -> dict:
         "text": record.get("text", ""),
         "source": source,
         "char_len": char_len,
+        "madde_no": meta.get("madde_no"),
     }
 
 

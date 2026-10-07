@@ -20,9 +20,6 @@ _TEXT_SPLITTER = RecursiveCharacterTextSplitter(
     separators=["\n\n", "\n", ". ", " ", ""],
 )
 
-# Matches the start of a Turkish law article heading (e.g. "MADDE 1", "Madde 12").
-_ARTICLE_RE = re.compile(r"(?m)(?=^\s*MADDE\s+\d)", re.IGNORECASE)
-
 # Patterns for extracting a Turkish law article (madde) number from free text.
 _MADDE_PATTERNS = [
     re.compile(r"(\d+)\s*\.?\s*madde", re.IGNORECASE),   # "44. madde", "44 madde"
@@ -97,14 +94,14 @@ def _chunk_matches_madde_str(
     """Return True if *chunk* belongs to the article named by the normalised
     string *madde_no* (``"12"``, ``"183-a"``, ``"ek-3"``, ``"gecici-2"``).
 
-    *inherited* is the article carried forward from the preceding chunks of the
-    same document; it is used only when the chunk has no ``madde_no`` field."""
+    A chunk belongs to an article when its stored ``madde_no`` is that
+    article, when *inherited* (the article whose text continues into the
+    chunk, see :func:`_inherited_madde_nos`) is that article, or when the chunk
+    holds that article's line-anchored heading."""
     want = str(madde_no).strip().lower()
-    stored = getattr(chunk, "madde_no", None)
-    if stored is None:
-        stored = inherited  # continuation chunk of a legacy corpus without madde_no
-    if stored is not None and str(stored).strip().lower() == want:
-        return True
+    for cand in (getattr(chunk, "madde_no", None), inherited):
+        if cand is not None and str(cand).strip().lower() == want:
+            return True
     # The stored/leading article can differ from the one asked for when the
     # chunk opens with a section title or holds several articles, so also scan
     # every line-anchored article heading in the chunk text.
@@ -154,22 +151,82 @@ def _silver_lexical_score(query_tokens: "list[str]", chunk_text: str) -> float:
 
 
 # Anchored to line-start ((?m)^\s*) so mid-text references like
-# "Madde 5 uyarınca" are never mistaken for article headings.
-# Suffix "[/-][A-Za-z]" captures "183/A" or "183-A"; normalised to
-# "183-a" via _normalize_madde_suffix().
+# "Madde 5 uyarınca" are never mistaken for article headings, and followed by
+# a heading separator ("Madde 12 –", "MADDE 12. -", "Madde 12- (1)",
+# "MADDE 12 İşyeri…" or end of line), so amendment-table rows such as
+# "Madde 3 14/4/2011" or "Madde 9," are not headings either.
+# Suffix "[/-][A-Za-z]" captures "183/A" or "183-A" (only when no further
+# letter follows: "Madde 605-Yasal" is article 605); normalised to "183-a"
+# via _normalize_madde_suffix().
 # ekg : ekgecici-N — "Ek Geçici Madde 2"
 # ek  : ek-N       — "Ek Madde 3", "EK MADDE 3"
 # gec : gecici-N   — "Geçici Madde 7", "GEÇİCİ MADDE 4"
+# muk : mukerrer-N — "Mükerrer Madde 5"
 # reg : N          — "MADDE 86", "MADDE 183/A"
-_NUM = r"\d+(?:[/-][A-Za-zÇĞİÖŞÜçğıöşü])?"
+_TR_LETTERS = "A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû"
+_NUM = r"\d+(?:[/-][" + _TR_LETTERS + r"](?![" + _TR_LETTERS + r"]))?"
+_HEADING_SEP = r"(?=[ \t]*(?:\.[ \t]*)?[-–—(]|[ \t]*\.?[ \t]*$|[ \t]+[A-ZÇĞİÖŞÜ])"
 _MADDE_HEADING_RE = re.compile(
     r"(?m)^\s*(?:"
     r"(?:Ek|EK)\s+(?:[Gg]eçici|GEÇİCİ)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<ekg>" + _NUM + r")"
     r"|(?:Ek|EK)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<ek>" + _NUM + r")"
     r"|(?:[Gg]eçici|GEÇİCİ)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<gec>" + _NUM + r")"
+    r"|(?:[Mm]ükerrer|MÜKERRER)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<muk>" + _NUM + r")"
     r"|(?:MADDE|Madde)\s+(?P<reg>" + _NUM + r")"
-    r")"
+    r")" + _HEADING_SEP
 )
+# Longest line (chars) still treated as an article title above a heading.
+_TITLE_MAX_CHARS = 200
+_TITLE_MAX_LINES = 8
+
+
+def _heading_line_start(text: str, m: "re.Match") -> int:
+    """Offset of the start of the line holding heading match *m*."""
+    pos = m.start() + (len(m.group(0)) - len(m.group(0).lstrip()))
+    return text.rfind("\n", 0, pos) + 1
+
+
+def _title_start(text: str, line_start: int, floor: int = 0) -> int:
+    """Move a split point back over the title lines above an article heading.
+
+    Turkish codes put the article title (and section headers such as
+    "İKİNCİ BÖLÜM") on the lines just above "Madde N –".  Up to
+    _TITLE_MAX_LINES short lines without sentence-final punctuation are
+    taken, blank lines skipped; another heading or a sentence stops the walk.
+    Never goes below *floor* (the previous heading line).
+    """
+    start = i = line_start
+    taken = 0
+    while taken < _TITLE_MAX_LINES and i > floor:
+        j = text.rfind("\n", floor, i - 1) + 1
+        j = max(j, floor)
+        line = text[j:i].strip()
+        if line:
+            if (len(line) > _TITLE_MAX_CHARS or line[-1] in ".;:,!?"
+                    or _MADDE_HEADING_RE.match(line)):
+                break
+            start = j
+            taken += 1
+        i = j
+    return start
+
+
+def _article_parts(text: str) -> "list[str]":
+    """Split a law text into [preamble, article, article, ...]; each article
+    part starts with its title lines and heading."""
+    cuts: list[int] = []
+    floor = 0
+    for m in _MADDE_HEADING_RE.finditer(text):
+        line_start = _heading_line_start(text, m)
+        cut = _title_start(text, line_start, floor)
+        if cuts and cut <= cuts[-1]:
+            cut = line_start
+        if cuts and cut <= cuts[-1]:
+            continue
+        cuts.append(cut)
+        floor = line_start + 1
+    bounds = [0, *cuts, len(text)]
+    return [text[a:b] for a, b in zip(bounds, bounds[1:])]
 
 
 def _normalize_madde_suffix(raw: str) -> str:
@@ -189,6 +246,8 @@ def _heading_key(m: "re.Match") -> str:
         return f"ek-{_normalize_madde_suffix(m.group('ek'))}"
     if m.group("gec"):
         return f"gecici-{_normalize_madde_suffix(m.group('gec'))}"
+    if m.group("muk"):
+        return f"mukerrer-{_normalize_madde_suffix(m.group('muk'))}"
     return _normalize_madde_suffix(m.group("reg"))
 
 
@@ -204,6 +263,7 @@ def _madde_no_from_text(text: str) -> "str | None":
         ``"ek-N"`` for supplementary articles (Ek Madde),
         ``"gecici-N"`` for transitory articles (Geçici Madde),
         ``"ekgecici-N"`` for Ek Geçici Madde,
+        ``"mukerrer-N"`` for Mükerrer Madde,
         or ``None`` when no heading is found.
     """
     m = _MADDE_HEADING_RE.search(text)
@@ -229,25 +289,41 @@ def _assign_madde_nos(texts: "list[str]", carry: "str | None" = None) -> "list[s
     return out
 
 
-def _inherited_madde_nos(corpus_chunks) -> "dict[str, str]":
-    """Carry the article number forward over continuation chunks.
+# Text before a chunk's first heading counts as the tail of the previous
+# article only when it reads like body text (a sentence end after a lowercase
+# letter / closing paren), not like a title block ("I. Devletin şekli").
+_TAIL_MIN_CHARS = 100
+_SENTENCE_END_RE = re.compile(r"[a-zçğıöşü)][.;:](?:\s|$)")
 
-    For corpora built before ``madde_no`` was stored (or by external tools)
-    a chunk in the middle of an article has no heading, so only the first
-    chunk of the article would be labelled gold.  Walk each document in order
-    and give heading-less chunks the last article seen in the same document.
+
+def _is_article_tail(lead: str) -> bool:
+    lead = lead.strip()
+    return len(lead) >= _TAIL_MIN_CHARS and bool(_SENTENCE_END_RE.search(lead))
+
+
+def _inherited_madde_nos(corpus_chunks) -> "dict[str, str]":
+    """Article whose text continues into each chunk, from the previous
+    chunks of the same document.
+
+    A chunk with no heading continues the last article seen; a chunk whose
+    text before its first heading is body text (the end of the previous
+    article, e.g. a character chunk "...fıkra (3) ... MADDE 95 –") also
+    continues it, so that article is labelled gold too.  Needed for corpora
+    built before ``madde_no`` was stored, by external tools, or by the
+    character chunker.
     """
     out: dict[str, str] = {}
     carry: dict[tuple, "str | None"] = {}
     for c in corpus_chunks:
         key = (c.source, c.doc_id)
-        keys = [_heading_key(m) for m in _MADDE_HEADING_RE.finditer(c.text)]
-        if getattr(c, "madde_no", None):
-            carry[key] = c.madde_no if not keys else keys[-1]
-        elif keys:
-            carry[key] = keys[-1]
-        elif carry.get(key):
-            out[c.chunk_id] = carry[key]
+        heads = list(_MADDE_HEADING_RE.finditer(c.text))
+        prev = carry.get(key)
+        if prev and (not heads or _is_article_tail(c.text[:heads[0].start()])):
+            out[c.chunk_id] = prev
+        if heads:
+            carry[key] = _heading_key(heads[-1])
+        elif getattr(c, "madde_no", None):
+            carry[key] = c.madde_no
     return out
 
 
@@ -403,49 +479,57 @@ class DataProcessor:
 
     @staticmethod
     def _article_chunk(text: str, doc_id: str, source: str) -> list["CorpusChunk"]:
-        """Article-level chunking: split at MADDE boundaries, sub-split oversized articles."""
-        parts = _ARTICLE_RE.split(text)
-        chunks: list[CorpusChunk] = []
-        chunk_index = 0
-        for part in parts:
+        """Article-level chunking: one chunk per article (title + heading +
+        body), oversized articles sub-split with overlap.
+
+        Every article is kept whatever its length ("Türkiye Devleti bir
+        Cumhuriyettir." is a whole article); short heading-less text (a
+        section header, a preamble fragment) is merged into the next article,
+        and a short trailing sub-chunk of a long article into the one before.
+        """
+        texts: list[tuple[str, "str | None"]] = []
+        pending = ""
+        for part in _article_parts(text):
             part = part.strip()
-            if not part or len(part) < config.MIN_CHUNK_CHARS:
+            if not part:
                 continue
             madde_no = _madde_no_from_text(part)
+            if madde_no is None and len(part) < config.MIN_CHUNK_CHARS:
+                pending = f"{pending}\n\n{part}".strip()
+                continue
+            if pending:
+                part, pending = f"{pending}\n\n{part}", ""
             if len(part) <= config.CHUNK_SIZE:
-                chunks.append(CorpusChunk(
-                    chunk_id=f"{source}_{doc_id}_{chunk_index}",
-                    doc_id=doc_id,
-                    text=part,
-                    source=source,
-                    char_len=len(part),
-                    madde_no=madde_no,
-                ))
-                chunk_index += 1
+                texts.append((part, madde_no))
+                continue
+            # Article is larger than CHUNK_SIZE — sub-split it.
+            subs = _TEXT_SPLITTER.split_text(part)
+            merged: list[str] = []
+            for sub in subs:
+                if merged and len(sub) < config.MIN_CHUNK_CHARS:
+                    merged[-1] = f"{merged[-1]}\n{sub}"
+                else:
+                    merged.append(sub)
+            # Continuation chunks inherit the article of the heading chunk.
+            texts.extend(zip(merged, _assign_madde_nos(merged, carry=madde_no)))
+        if pending:
+            if texts:
+                last, no = texts[-1]
+                texts[-1] = (f"{last}\n\n{pending}", no)
             else:
-                # Article is larger than CHUNK_SIZE — sub-split it.
-                sub_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=config.CHUNK_SIZE,
-                    chunk_overlap=config.CHUNK_OVERLAP,
-                    length_function=len,
-                    separators=["\n\n", "\n", ". ", " ", ""],
-                )
-                subs = sub_splitter.split_text(part)
-                # Continuation chunks inherit the article of the heading chunk.
-                sub_nos = _assign_madde_nos(subs, carry=madde_no)
-                for sub_chunk, sub_no in zip(subs, sub_nos):
-                    if len(sub_chunk) < config.MIN_CHUNK_CHARS:
-                        continue
-                    chunks.append(CorpusChunk(
-                        chunk_id=f"{source}_{doc_id}_{chunk_index}",
-                        doc_id=doc_id,
-                        text=sub_chunk,
-                        source=source,
-                        char_len=len(sub_chunk),
-                        madde_no=sub_no,
-                    ))
-                    chunk_index += 1
-        return chunks
+                texts.append((pending, None))
+
+        return [
+            CorpusChunk(
+                chunk_id=f"{source}_{doc_id}_{i}",
+                doc_id=doc_id,
+                text=chunk_text,
+                source=source,
+                char_len=len(chunk_text),
+                madde_no=madde_no,
+            )
+            for i, (chunk_text, madde_no) in enumerate(texts)
+        ]
 
     @staticmethod
     def chunk_text(text: str, doc_id: str, source: str) -> list["CorpusChunk"]:
