@@ -76,14 +76,23 @@ def normalize_madde_no(raw) -> "str | None":
     """
     if raw is None:
         return None
-    s = str(raw).strip().lower().replace("ç", "c").replace("ı", "i")
+    s = _fold(str(raw).strip())
     s = re.sub(r"\bmadde\b", " ", s).strip(" -.")
-    m = re.fullmatch(r"(ek|gecici)?[\s-]*(\d+)(?:[\s/-]*([a-z]))?", s)
+    m = re.fullmatch(r"(ek[\s-]*gecici|ek|gecici)?[\s-]*(\d+)(?:[\s/-]*([a-z]))?", s)
     if not m:
         return None
     prefix, num, letter = m.groups()
+    if prefix:
+        prefix = "ekgecici" if "gecici" in prefix and prefix.startswith("ek") else prefix
     out = num + (f"-{letter}" if letter else "")
     return f"{prefix}-{out}" if prefix else out
+
+
+def _fold(text: str) -> str:
+    """Turkish-lowercase (İ->i, I->ı before lower(), so "GEÇİCİ" does not
+    gain combining dots) and fold to ASCII letters."""
+    from utils import normalize_turkish
+    return normalize_turkish(text).translate(str.maketrans("çğıöşü", "cgiosu"))
 
 
 _SECTION_RE = re.compile(r"(?i)\b(ek\s+geçici|ek|geçici)\s+madde\s+(\d+)")
@@ -105,8 +114,8 @@ def refine_madde_no(madde_no, question: str, answer: str) -> "str | None":
     for m in _SECTION_RE.finditer(f"{question} {answer}"):
         if m.group(2) != base:
             continue
-        kind = m.group(1).lower().replace("İ", "i")
-        if "geçici" in kind:
+        kind = _fold(m.group(1))
+        if "gecici" in kind:
             return f"{'ekgecici' if kind.startswith('ek') else 'gecici'}-{madde_no}"
         return f"ek-{madde_no}"
     return madde_no

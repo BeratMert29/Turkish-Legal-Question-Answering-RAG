@@ -100,6 +100,10 @@ class TestAdapterFilters:
         assert n("Geçici 2-") == "gecici-2"
         assert n(None) is None
         assert n("abc") is None
+        # upper-case Turkish İ must not turn GEÇİCİ into something else
+        assert n("GEÇİCİ MADDE 5") == "gecici-5"
+        assert n("EK GEÇİCİ MADDE 1") == "ekgecici-1"
+        assert adapter.refine_madde_no("5", "GEÇİCİ MADDE 5 nedir?", "") == "gecici-5"
 
 
 def _chunk(cid, source, text, madde_no=None):
