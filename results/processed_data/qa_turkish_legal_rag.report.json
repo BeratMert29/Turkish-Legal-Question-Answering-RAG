@@ -1,0 +1,23 @@
+{
+  "dataset": "mtntasci/turkish-legal-rag/qa_benchmark/test",
+  "license": "CC-BY-4.0",
+  "total_rows": 290,
+  "kept": 195,
+  "dropped": {
+    "source_origin": 90,
+    "unknown_law": 0,
+    "train_leakage": 5
+  },
+  "kept_without_madde_no": 1,
+  "kept_per_law": {
+    "Türk Medeni Kanunu": 50,
+    "Türk Ceza Kanunu": 40,
+    "Türk Borçlar Kanunu": 36,
+    "Ceza Muhakemesi Kanunu": 24,
+    "Türkiye Cumhuriyeti Anayasası": 17,
+    "Türkiye Cumhuriyeti İş Kanunu": 13,
+    "Türk Bayrağı Tüzüğü": 8,
+    "Bilgi Edinme Kanunu": 7
+  },
+  "overlap_with_qa_eval_kept": 4
+}
