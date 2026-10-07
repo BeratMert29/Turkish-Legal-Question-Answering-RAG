@@ -498,7 +498,8 @@ class TestEvalHelpers:
 
         calls: dict[str, list] = {}
 
-        def _fake_judge(preds, base_url, model, sample_size=20, results_dir=None):
+        def _fake_judge(preds, base_url, model, sample_size=20, results_dir=None,
+                        query_ids=None):
             calls[model + str(len(calls))] = [p["query_id"] for p in preds]
             return {"score": 0.5, "per_sample": [], "parse_fail_count": 0, "sample_size": len(preds)}
 
@@ -529,6 +530,41 @@ class TestEvalHelpers:
         assert len(id_sets) == 4
         # All four metrics must have received the same set of query IDs.
         assert id_sets[0] == id_sets[1] == id_sets[2] == id_sets[3]
+
+    def test_run_judge_phase_samples_once_via_sample_judge_query_ids(self):
+        """_run_judge_phase must call sample_judge_query_ids once and pass
+        the returned IDs as query_ids= to run_llm_judge_eval."""
+        from pipeline import evaluation as _eval
+        from unittest.mock import patch, MagicMock, call
+        import config
+
+        sampled = [f"q{i}" for i in range(config.LLM_JUDGE_SAMPLE_SIZE)]
+        fake_stage = MagicMock()
+        fake_stage.results_dir = None
+
+        preds = [
+            {"query_id": f"q{i}", "predicted": f"a{i}",
+             "expected": f"e{i}", "retrieved_chunks": []}
+            for i in range(50)
+        ]
+        qa = [_FakeQA(f"q{i}", f"Q{i}", f"A{i}", "Law") for i in range(50)]
+
+        with patch("evaluation.llm_judge.sample_judge_query_ids",
+                   return_value=sampled) as mock_sji, \
+             patch.object(_eval, "run_llm_judge_eval",
+                          return_value={
+                              "score": 0.5, "faithfulness": 0.5,
+                              "relevancy": 0.5, "coherence": 0.5,
+                              "parse_failures": {}, "failure_count": 0,
+                              "call_count": len(sampled),
+                          }) as mock_rje:
+            _eval._run_judge_phase(preds, qa, fake_stage, "test", 0.2)
+
+        # sample_judge_query_ids called exactly once
+        mock_sji.assert_called_once()
+        # run_llm_judge_eval called with the sampled IDs
+        _, kwargs = mock_rje.call_args
+        assert kwargs.get("query_ids") == sampled
 
     def test_retrieval_pipeline_file_no_leak(self, tmp_path):
         """auto_build_graph must not leak a file handle (use with)."""
@@ -575,7 +611,8 @@ class TestEvalHelpers:
 
         captured: list[int] = []
 
-        def _fake_judge(preds, base_url, model, sample_size=20, results_dir=None):
+        def _fake_judge(preds, base_url, model, sample_size=20, results_dir=None,
+                        query_ids=None):
             captured.append(len(preds))
             return {"score": 0.5, "per_sample": [], "parse_fail_count": 0, "sample_size": len(preds)}
 

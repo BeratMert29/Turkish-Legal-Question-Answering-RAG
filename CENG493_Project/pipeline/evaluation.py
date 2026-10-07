@@ -237,9 +237,18 @@ def run_llm_judge_eval(
     base_url: str,
     judge_model: str,
     sample_size: Optional[int] = None,
+    query_ids: Optional[list[str]] = None,
     results_dir: Optional[Path] = None,
 ) -> dict:
     """Run all four LLM judge metrics.
+
+    Parameters
+    ----------
+    query_ids:
+        When supplied (pre-sampled by the caller via
+        ``sample_judge_query_ids``), all four judge functions receive exactly
+        these IDs and per-function sampling is bypassed.  When ``None`` the
+        function builds a shared sample internally.
 
     Returns a dict with keys: ``score``, ``faithfulness``, ``relevancy``,
     ``coherence``, ``parse_failures``.
@@ -276,36 +285,47 @@ def run_llm_judge_eval(
         for p in predictions
     ]
 
-    # Build ONE shared sample so all four judge metrics score the same queries.
-    # This makes cross-metric comparisons meaningful (same distribution of items).
-    _rng = _random_mod.Random(42)
-    _n = min(sample_size, len(predictions))
-    if len(predictions) > _n:
-        _shared_ids: set[str] = set(
-            _rng.sample([p["query_id"] for p in predictions], _n)
-        )
+    # Shared sample: either use caller-supplied query_ids or build internally.
+    # All four judge metrics must evaluate the same subset so cross-metric
+    # comparisons are valid.
+    if query_ids is not None:
+        _shared_ids: set[str] = set(query_ids)
         _shared_preds = [p for p in predictions if p["query_id"] in _shared_ids]
         _shared_judge_preds = [p for p in judge_preds if p["query_id"] in _shared_ids]
     else:
-        _shared_preds = predictions
-        _shared_judge_preds = judge_preds
+        _rng = _random_mod.Random(42)
+        _n = min(sample_size, len(predictions))
+        if len(predictions) > _n:
+            _built_ids: set[str] = set(
+                _rng.sample([p["query_id"] for p in predictions], _n)
+            )
+            _shared_preds = [p for p in predictions if p["query_id"] in _built_ids]
+            _shared_judge_preds = [
+                p for p in judge_preds if p["query_id"] in _built_ids
+            ]
+        else:
+            _shared_preds = predictions
+            _shared_judge_preds = judge_preds
     _actual_n = len(_shared_preds)
+    # When caller supplied query_ids, pass them through so the judge functions
+    # skip their own per-function sampling entirely.
+    _qids_arg = list(query_ids) if query_ids is not None else None
 
     judge_result = llm_judge_answer(
         _shared_judge_preds, base_url, judge_model,
-        sample_size=_actual_n, results_dir=results_dir,
+        sample_size=_actual_n, results_dir=results_dir, query_ids=_qids_arg,
     )
     faith_result = llm_judge_faithfulness(
         _shared_preds, base_url, judge_model,
-        sample_size=_actual_n, results_dir=results_dir,
+        sample_size=_actual_n, results_dir=results_dir, query_ids=_qids_arg,
     )
     relev_result = llm_judge_relevancy(
         _shared_judge_preds, base_url, judge_model,
-        sample_size=_actual_n, results_dir=results_dir,
+        sample_size=_actual_n, results_dir=results_dir, query_ids=_qids_arg,
     )
     coher_result = llm_judge_coherence(
         _shared_preds, base_url, judge_model,
-        sample_size=_actual_n, results_dir=results_dir,
+        sample_size=_actual_n, results_dir=results_dir, query_ids=_qids_arg,
     )
 
     result["score"] = judge_result["score"]
@@ -713,9 +733,16 @@ def _run_judge_phase(
         ``crashed``, ``failed``.
     """
     import config as _config
+    from evaluation.llm_judge import sample_judge_query_ids
 
     _judge_sample = _config.LLM_JUDGE_SAMPLE_SIZE
-    print(f"  LLM Judge (sample={min(_judge_sample, len(predictions))}) …")
+    # Sample ONCE here; all four judge functions receive the same IDs so every
+    # metric evaluates the identical subset — enabling valid cross-metric comparison.
+    _sampled_ids = sample_judge_query_ids(
+        [p["query_id"] for p in predictions],
+        n=_judge_sample,
+    )
+    print(f"  LLM Judge (sample={len(_sampled_ids)}) …")
 
     score = faithfulness = relevancy = coherence = None
     parse_failures: Optional[dict] = None
@@ -729,6 +756,7 @@ def _run_judge_phase(
             base_url=_config.LLM_BASE_URL,
             judge_model=_config.LLM_JUDGE_MODEL,
             sample_size=_judge_sample,
+            query_ids=_sampled_ids,
             results_dir=stage.results_dir,
         )
         score = j["score"]
