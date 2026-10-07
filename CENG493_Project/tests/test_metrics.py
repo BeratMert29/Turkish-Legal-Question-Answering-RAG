@@ -172,7 +172,7 @@ class TestComputeAllQaMetricsWithCitation:
         }]
         result = compute_all_qa_metrics_with_citation(preds)
         assert "answer_containment" in result
-        assert "citation_accuracy" in result
+        assert "citation_accuracy_injected" in result and "citation_accuracy_native" in result and "citation_accuracy" not in result
         assert "num_samples" in result
 
     def test_empty(self):

@@ -27,8 +27,31 @@ def strip_citations(text: str) -> str:
     return _STRIP_CITATION_PATTERN.sub("", text).strip()
 
 
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
 def _tokenize(text: str) -> list[str]:
-    return normalize_turkish(text).split()
+    """Turkish-lowercase (I->ı, İ->i) then split on Unicode word characters.
+
+    Punctuation never glues to words ("madde." == "madde") and Turkish letters
+    (ç ğ ı ö ş ü) stay inside tokens.
+    """
+    return _WORD_RE.findall(normalize_turkish(text or ""))
+
+
+def _rouge_tokenizer(text: str) -> list[str]:
+    # rouge_score's default tokenizer strips non-[a-z0-9] chars, destroying
+    # Turkish letters; pass our Unicode-aware one instead.
+    return _tokenize(text)
+
+
+def _bleu_text(text: str) -> str:
+    return " ".join(_tokenize(text))
+
+
+def answer_length_words(text: str) -> int:
+    """Number of words in an answer (citations stripped)."""
+    return len(_tokenize(strip_citations(text or "")))
 
 
 def _ngram_counts(tokens: list[str], n: int) -> Counter:
@@ -196,8 +219,8 @@ def token_f1(predicted: str, expected: str) -> float:
 
 
 def bleu_score(predicted: str, expected: str) -> float:
-    pred_norm = normalize_turkish(predicted)
-    ref_norm = normalize_turkish(expected)
+    pred_norm = _bleu_text(predicted)
+    ref_norm = _bleu_text(expected)
     if not pred_norm or not ref_norm:
         return 0.0
     if _USE_HF_EVALUATE:
@@ -207,15 +230,18 @@ def bleu_score(predicted: str, expected: str) -> float:
 
 
 def rouge_l_score(predicted: str, expected: str) -> float:
-    pred_norm = normalize_turkish(predicted)
-    exp_norm = normalize_turkish(expected)
+    pred_norm = _bleu_text(predicted)
+    exp_norm = _bleu_text(expected)
     if _USE_HF_EVALUATE:
+        if not pred_norm or not exp_norm:
+            return 0.0
         result = _ROUGE_METRIC.compute(
-            predictions=[pred_norm], references=[exp_norm], rouge_types=["rougeL"]
+            predictions=[pred_norm], references=[exp_norm], rouge_types=["rougeL"],
+            tokenizer=_rouge_tokenizer,
         )
         return float(result["rougeL"])
-    pred_tokens = pred_norm.split()
-    exp_tokens = exp_norm.split()
+    pred_tokens = _tokenize(predicted)
+    exp_tokens = _tokenize(expected)
     if not pred_tokens or not exp_tokens:
         return 0.0
     lcs = _lcs_length(pred_tokens, exp_tokens)
@@ -246,21 +272,36 @@ def compute_all_qa_metrics(predictions: list[dict]) -> dict:
     """
     if not predictions:
         return {"em": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0,
-                "answer_containment": 0.0, "num_samples": 0}
+                "answer_containment": 0.0, "mean_answer_len_words": 0.0, "num_samples": 0}
     metrics = [compute_qa_metrics(p["predicted"], p["expected"]) for p in predictions]
     keys = ["em", "f1", "rouge_l", "answer_containment"]
     result = {k: sum(m[k] for m in metrics) / len(metrics) for k in keys}
     # Corpus-level BLEU via evaluate
     if _USE_HF_EVALUATE:
-        preds_norm = [normalize_turkish(strip_citations(p["predicted"])) for p in predictions]
-        refs_norm = [[normalize_turkish(p["expected"])] for p in predictions]
+        preds_norm = [_bleu_text(strip_citations(p["predicted"])) for p in predictions]
+        refs_norm = [[_bleu_text(p["expected"])] for p in predictions]
         bleu_result = _BLEU_METRIC.compute(predictions=preds_norm, references=refs_norm)
         result["bleu"] = float(bleu_result["bleu"])
     else:
         stripped = [{**p, "predicted": strip_citations(p["predicted"])} for p in predictions]
         result["bleu"] = _corpus_bleu_fallback(stripped)
+    result["mean_answer_len_words"] = (
+        sum(answer_length_words(p["predicted"]) for p in predictions) / len(predictions)
+    )
     result["num_samples"] = len(predictions)
     return result
+
+
+def compute_per_query_qa_metrics(predictions: list[dict]) -> list[dict]:
+    """Per-query metrics for bootstrap CIs: query_id, em, f1, rouge_l,
+    bleu (sentence-level), answer_containment, answer_len_words."""
+    out = []
+    for p in predictions:
+        m = compute_qa_metrics(p["predicted"], p["expected"])
+        m["query_id"] = p.get("query_id", "")
+        m["answer_len_words"] = answer_length_words(p["predicted"])
+        out.append(m)
+    return out
 
 
 def source_in_retrieved_context(retrieved_sources: list[str], expected_source: str) -> float:
@@ -296,45 +337,45 @@ def compute_all_qa_metrics_with_citation(predictions: list[dict]) -> dict:
     """
     predictions: list of {"predicted": str, "expected": str,
                            "retrieved_sources": list[str], "retrieved_chunks": list[dict],
-                           "expected_source": str}
-    Returns: averaged em, f1, bleu, rouge_l, answer_containment, citation_accuracy,
-             source_in_context_rate, citation_presence_rate, num_samples
+                           "expected_source": str,
+                           "predicted_native": str (optional)}
+    ``predicted_native`` is the answer BEFORE utils.inject_citations; when
+    present it yields ``citation_accuracy_native`` (did the model itself cite
+    the gold source). ``predicted`` (possibly with injected citations) yields
+    ``citation_accuracy_injected``, which mostly reflects retrieval overlap
+    because injection is a token-overlap heuristic. The two are never merged;
+    ``citation_accuracy_native`` is None when no native text was recorded.
+
+    Returns: em, f1, bleu, rouge_l, answer_containment, mean_answer_len_words,
+             citation_accuracy_native, citation_accuracy_injected,
+             source_in_context_rate, citation_presence_rate_native/injected,
+             num_samples
     """
     if not predictions:
         return {"em": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0,
-                "answer_containment": 0.0,
-                "citation_accuracy": 0.0, "source_in_context_rate": 0.0,
-                "citation_presence_rate": 0.0, "num_samples": 0}
-    qa_m = [compute_qa_metrics(p["predicted"], p["expected"]) for p in predictions]
-    cite_scores = []
-    source_proxy_scores = []
-    citation_presence_scores = []
-    for p in predictions:
-        retrieved_chunks = p.get("retrieved_chunks", [])
-        retrieved_sources = p.get("retrieved_sources")
-        if retrieved_sources is None:
-            retrieved_sources = [c.get("source", "") for c in retrieved_chunks]
-        cite_scores.append(
-            citation_accuracy(p.get("predicted", ""), retrieved_chunks, p.get("expected_source", ""))
-        )
-        source_proxy_scores.append(
-            source_in_retrieved_context(retrieved_sources, p.get("expected_source", ""))
-        )
-        citation_presence_scores.append(citation_presence(p.get("predicted", "")))
+                "answer_containment": 0.0, "mean_answer_len_words": 0.0,
+                "citation_accuracy_native": None, "citation_accuracy_injected": 0.0,
+                "source_in_context_rate": 0.0,
+                "citation_presence_rate_native": None,
+                "citation_presence_rate_injected": 0.0, "num_samples": 0}
+    result = compute_all_qa_metrics(predictions)
     n = len(predictions)
-    keys = ["em", "f1", "rouge_l", "answer_containment"]
-    result = {k: sum(m[k] for m in qa_m) / n for k in keys}
-    # Corpus-level BLEU via evaluate
-    if _USE_HF_EVALUATE:
-        preds_norm = [normalize_turkish(strip_citations(p["predicted"])) for p in predictions]
-        refs_norm = [[normalize_turkish(p["expected"])] for p in predictions]
-        bleu_result = _BLEU_METRIC.compute(predictions=preds_norm, references=refs_norm)
-        result["bleu"] = float(bleu_result["bleu"])
-    else:
-        stripped = [{**p, "predicted": strip_citations(p["predicted"])} for p in predictions]
-        result["bleu"] = _corpus_bleu_fallback(stripped)
-    result["citation_accuracy"] = sum(cite_scores) / n
-    result["source_in_context_rate"] = sum(source_proxy_scores) / n
-    result["citation_presence_rate"] = sum(citation_presence_scores) / n
-    result["num_samples"] = n
+    inj, nat, nat_pres, inj_pres, proxy = [], [], [], [], []
+    for p in predictions:
+        chunks = p.get("retrieved_chunks", [])
+        sources = p.get("retrieved_sources")
+        if sources is None:
+            sources = [c.get("source", "") for c in chunks]
+        exp_src = p.get("expected_source", "")
+        inj.append(citation_accuracy(p.get("predicted", ""), chunks, exp_src))
+        inj_pres.append(citation_presence(p.get("predicted", "")))
+        proxy.append(source_in_retrieved_context(sources, exp_src))
+        if p.get("predicted_native") is not None:
+            nat.append(citation_accuracy(p["predicted_native"], chunks, exp_src))
+            nat_pres.append(citation_presence(p["predicted_native"]))
+    result["citation_accuracy_injected"] = sum(inj) / n
+    result["citation_presence_rate_injected"] = sum(inj_pres) / n
+    result["citation_accuracy_native"] = sum(nat) / len(nat) if nat else None
+    result["citation_presence_rate_native"] = sum(nat_pres) / len(nat_pres) if nat_pres else None
+    result["source_in_context_rate"] = sum(proxy) / n
     return result
