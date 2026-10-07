@@ -401,7 +401,7 @@ class DataProcessor:
         if len(text) < config.CORPUS_DOC_MIN_CHARS:
             return []
 
-        if getattr(config, "ARTICLE_CHUNKING_ENABLED", False):
+        if config.ARTICLE_CHUNKING_ENABLED:
             return DataProcessor._article_chunk(text, doc_id, source)
         return DataProcessor._char_chunk(text, doc_id, source)
 
@@ -551,7 +551,7 @@ class DataProcessor:
         # Avukatlık Kanunu) — drop the entire source to avoid noise.
         _DROPPED_SOURCES = {"213 sayılı Vergi Usul Kanunu"}
 
-        source_map = getattr(config, "HMGS_SOURCE_MAP", {})
+        source_map = config.HMGS_SOURCE_MAP
         examples: list[QAExample] = []
         skipped = 0
         skipped_mc = 0
@@ -592,8 +592,8 @@ class DataProcessor:
             "build_gold_eval_set: kept=%d  dropped=no_corpus:%d  mc_ref:%d  noisy_src:%d",
             len(examples), skipped, skipped_mc, skipped_src,
         )
-        expected = getattr(config, "HMGS_EVAL_EXPECTED", None)
-        if expected and len(examples) < expected * 0.8:
+        expected = config.HMGS_EVAL_EXPECTED
+        if len(examples) < expected * 0.8:
             log.warning(
                 "build_gold_eval_set: only %d examples built, expected ~%d. "
                 "Check HMGS CSV filtering or HMGS_SOURCE_MAP.",
@@ -688,9 +688,9 @@ class DataProcessor:
         labeled_silver = 0
         unlabeled = 0
         # Silver config (read once for performance)
-        silver_enabled = getattr(config, "RELEVANCE_SILVER_LEXICAL", False)
-        silver_top_m = getattr(config, "SILVER_TOP_M", 3)
-        silver_threshold = getattr(config, "SILVER_THRESHOLD", 0.10)
+        silver_enabled = config.RELEVANCE_SILVER_LEXICAL
+        silver_top_m = config.SILVER_TOP_M
+        silver_threshold = config.SILVER_THRESHOLD
 
         for qa in qa_examples:
             relevant: list[str] = []
