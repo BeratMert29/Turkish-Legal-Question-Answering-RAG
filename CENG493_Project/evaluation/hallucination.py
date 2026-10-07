@@ -1,38 +1,72 @@
 import random
 import config
 from scipy.special import softmax as scipy_softmax
+from evaluation.nli import entailment_index, nli_context_faithfulness
 
 
-def _classify_result(result: dict) -> str:
-    """Hit/partial/miss from top-1 retrieval score."""
-    chunks = result.get("retrieved_chunks", [])
-    if not chunks:
-        return "miss"
-    top_score = chunks[0]["score"]
-    if top_score > config.HALLUCINATION_HIT_THRESHOLD:
-        return "hit"
-    elif top_score >= config.HALLUCINATION_PARTIAL_THRESHOLD:
-        return "partial"
+def _norm_source(s) -> str:
+    from utils import normalize_turkish
+    return normalize_turkish(str(s).strip()) if s else ""
+
+
+def gold_rank(result: dict, k: int | None = None) -> int | None:
+    """1-based rank of the first gold item in the retrieved list, or None.
+
+    Gold is determined, in order, from: id-level ``relevant`` vs ``retrieved``;
+    else ``expected_source`` vs ``retrieved_sources`` (or chunk sources).
+    Returns None when the gold chunk is absent from the top-k. Raises
+    LookupError when the result carries no gold label at all.
+    """
+    if result.get("relevant") and result.get("retrieved") is not None:
+        rel = {str(x) for x in result["relevant"]}
+        ranked = [str(x) for x in result["retrieved"]]
+    elif result.get("expected_source"):
+        rel = {_norm_source(result["expected_source"])}
+        srcs = result.get("retrieved_sources")
+        if srcs is None:
+            srcs = [c.get("source", "") for c in result.get("retrieved_chunks", [])]
+        ranked = [_norm_source(x) for x in srcs]
     else:
+        raise LookupError("no gold label")
+    if k is not None:
+        ranked = ranked[:k]
+    for i, r in enumerate(ranked, start=1):
+        if r in rel:
+            return i
+    return None
+
+
+def _classify_result(result: dict, k: int = 5) -> str | None:
+    """Stratum by gold retrieval, independent of score scale per stage.
+
+    hit     : gold at rank 1
+    partial : gold at rank 2..k
+    miss    : gold not in top-k
+    None    : no gold label (excluded from stratification)
+    """
+    try:
+        rank = gold_rank(result, k)
+    except LookupError:
+        return None
+    if rank is None:
         return "miss"
+    return "hit" if rank == 1 else "partial"
 
 
-def stratified_sample(results: list[dict], sample_size: int = config.HALLUCINATION_SAMPLE_SIZE) -> dict:
-    """Sample ~third from each retrieval-score bucket (hit/partial/miss); fills to sample_size."""
+def stratified_sample(results: list[dict], sample_size: int = config.HALLUCINATION_SAMPLE_SIZE,
+                      k: int = 5) -> dict:
+    """Sample ~third from each gold-retrieval stratum (hit/partial/miss); fills to sample_size."""
     # Use a local RNG instance to avoid mutating the global random state across runs.
     rng = random.Random(42)
 
-    hit_threshold = config.HALLUCINATION_HIT_THRESHOLD      # 0.7
-    partial_threshold = config.HALLUCINATION_PARTIAL_THRESHOLD  # 0.4
-
     hits, partial, misses = [], [], []
     for r in results:
-        category = _classify_result(r)
+        category = _classify_result(r, k)
         if category == "hit":
             hits.append(r)
         elif category == "partial":
             partial.append(r)
-        else:
+        elif category == "miss":
             misses.append(r)
 
     target = sample_size // 3
@@ -45,13 +79,9 @@ def stratified_sample(results: list[dict], sample_size: int = config.HALLUCINATI
         sampled_ids = {r.get("query_id") for r in h + p + m if r.get("query_id") is not None}
         pool = [x for x in hits + partial + misses if x.get("query_id") not in sampled_ids]
         extra = rng.sample(pool, min(sample_size - total, len(pool)))
-        for i, item in enumerate(extra):
-            if i % 3 == 0:
-                h.append(item)
-            elif i % 3 == 1:
-                p.append(item)
-            else:
-                m.append(item)
+        for item in extra:
+            c = _classify_result(item, k)
+            {"hit": h, "partial": p, "miss": m}[c].append(item)
 
     return {"hits": h, "partial": p, "misses": m}
 
@@ -61,12 +91,7 @@ def evaluate_faithfulness(answer: str, context: str, nli_model) -> dict:
     logits = nli_model.predict([(context, answer)])
     logit_vec = logits[0]
     probs = scipy_softmax(logit_vec)
-    entailment_idx = 1
-    _model_config = getattr(nli_model, 'config', None) or getattr(getattr(nli_model, 'model', None), 'config', None)
-    if _model_config is not None and hasattr(_model_config, 'id2label'):
-        id2label = _model_config.id2label
-        label2id = {v.lower(): k for k, v in id2label.items()}
-        entailment_idx = label2id.get('entailment', 1)
+    entailment_idx = entailment_index(nli_model)
     entailment_prob = float(probs[entailment_idx])
     return {"faithful": entailment_prob >= 0.5, "score": entailment_prob}
 
@@ -79,12 +104,7 @@ def run_hallucination_analysis(
     """Batch NLI: context grounding + gold-answer consistency (entailment probs)."""
     import numpy as np
 
-    entailment_idx = 1
-    _model_config = getattr(nli_model, 'config', None) or getattr(getattr(nli_model, 'model', None), 'config', None)
-    if _model_config is not None and hasattr(_model_config, 'id2label'):
-        id2label = _model_config.id2label
-        label2id = {v.lower(): k for k, v in id2label.items()}
-        entailment_idx = int(label2id.get('entailment', 1))
+    entailment_idx = entailment_index(nli_model)
 
     ordered_items = []
     for category, items in sample_dict.items():
@@ -96,13 +116,15 @@ def run_hallucination_analysis(
             context = "\n\n".join(c["text"] for c in chunks[:5]) if chunks else ""
             ordered_items.append((query_id, predicted, context, gold_answer, category))
 
-    grounding_pairs = [(ctx, pred) for _, pred, ctx, _, _ in ordered_items]
-    if grounding_pairs:
-        grounding_logits = nli_model.predict(grounding_pairs, batch_size=8)
-        if grounding_logits.ndim == 1:
-            grounding_logits = grounding_logits.reshape(1, -1)
-    else:
-        grounding_logits = np.zeros((0, 3), dtype=np.float32)
+    # Grounding: answer sentences vs each retrieved chunk (max over chunks,
+    # mean over sentences); not the gold answer.
+    _g = nli_context_faithfulness(
+        [{"query_id": qid, "predicted": pred,
+          "retrieved_chunks": retrieved_results.get(qid, [])[:5]}
+         for qid, pred, _, _, _ in ordered_items],
+        nli_model, max_chunks=5, batch_size=8,
+    )
+    grounding_scores_raw = [x["score"] for x in _g["per_sample"]]
 
     has_gold = [bool(gold) for _, _, _, gold, _ in ordered_items]
     faith_pairs = [
@@ -131,8 +153,7 @@ def run_hallucination_analysis(
 
     faith_idx = 0
     for i, (query_id, predicted, context, gold_answer, category) in enumerate(ordered_items):
-        grounding_probs = softmax(grounding_logits[i])
-        grounding_prob = float(grounding_probs[entailment_idx])
+        grounding_prob = grounding_scores_raw[i] if grounding_scores_raw[i] is not None else 0.0
         is_grounded = grounding_prob >= 0.5
 
         answer_faith_prob = None
@@ -189,6 +210,8 @@ def run_hallucination_analysis(
             "answer_faithfulness_count": faith_count,
             "answer_faithfulness_total": faith_total,
             "answer_faithfulness_rate": answer_faithfulness_rate,
+            # Explicit name for the legacy metric: NLI(gold answer -> predicted answer).
+            "gold_answer_entailment_rate": answer_faithfulness_rate,
             "context_grounding_count": grounding_count,
             "context_grounding_rate":  context_grounding_rate,
             "by_category": by_category,
