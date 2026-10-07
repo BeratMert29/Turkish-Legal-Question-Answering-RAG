@@ -425,6 +425,60 @@ class TestEvalHelpers:
         from pipeline.evaluation import _run_generation_and_qa
         assert callable(_run_generation_and_qa)
 
+    def test_run_stage_phase_helpers_importable(self):
+        """All phase helpers extracted from run_stage must be importable."""
+        from pipeline.evaluation import (
+            _run_retrieval_phase,
+            _run_supplemental_metrics,
+            _run_hallucination_phase,
+            _run_judge_phase,
+            _run_semantic_sim_phase,
+            _assemble_final_result,
+        )
+        for fn in (
+            _run_retrieval_phase, _run_supplemental_metrics,
+            _run_hallucination_phase, _run_judge_phase,
+            _run_semantic_sim_phase, _assemble_final_result,
+        ):
+            assert callable(fn)
+
+    def test_run_stage_slimmed(self):
+        """run_stage body must be shorter than the old 295-line monolith."""
+        import inspect
+        from pipeline.evaluation import run_stage
+
+        src = inspect.getsource(run_stage)
+        lines = [l for l in src.splitlines() if l.strip()]
+        assert len(lines) < 90, (
+            f"run_stage is {len(lines)} non-blank lines; expected < 90 after extraction"
+        )
+
+    def test_hallucination_phase_uses_model_cache(self):
+        """_run_hallucination_phase must store nli_model in _model_cache['nli']."""
+        from unittest.mock import patch, MagicMock
+        from pipeline import evaluation as _eval
+
+        fake_hall = {"summary": {"context_grounding_rate": 0.9}}
+        fake_nli = MagicMock()
+
+        with patch.object(_eval, "evict_model_cache") as mock_evict, \
+             patch.object(_eval, "run_hallucination_eval",
+                          return_value=(fake_hall, 0.9, fake_nli)) as mock_rhe:
+            _eval._model_cache.clear()
+            hall, rate = _eval._run_hallucination_phase([], {}, "mock-model")
+
+        mock_evict.assert_called_once()
+        assert _eval._model_cache.get("nli") is fake_nli
+        assert rate == 0.9
+        assert hall is fake_hall
+
+    def test_no_run_stage_nli_attribute(self):
+        """run_stage must not cache NLI on a function attribute."""
+        from pipeline.evaluation import run_stage
+        assert not hasattr(run_stage, "_nli_model"), (
+            "run_stage._nli_model found; NLI must go through _model_cache"
+        )
+
     def test_save_stage_results_atomic(self, tmp_path):
         """save_stage_results must produce an intact JSON even if called twice."""
         from pipeline.evaluation import save_stage_results
