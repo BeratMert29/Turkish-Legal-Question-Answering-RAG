@@ -78,8 +78,8 @@ def main():
 
     retrieved_results = {p["query_id"]: p.get("retrieved_chunks", []) for p in valid}
 
-    print("Loading NLI model: cross-encoder/nli-deberta-v3-small (~180 MB, first run downloads)")
-    nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small")
+    print(f"Loading NLI model: {config.NLI_MODEL}")
+    nli_model = CrossEncoder(config.NLI_MODEL)
 
     sample = stratified_sample(valid, config.HALLUCINATION_SAMPLE_SIZE)
     print(f"Stratified sample: hits={len(sample['hits'])}, partial={len(sample['partial'])}, misses={len(sample['misses'])}")
