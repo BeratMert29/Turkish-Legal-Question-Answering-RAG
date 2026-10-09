@@ -477,4 +477,4 @@ SILVER_THRESHOLD = 0.10          # minimum token-overlap score
 - **Retrieval**: FAISS (GPU/CPU), rank_bm25
 - **Inference**: Ollama (local, no API key)
 - **Evaluation**: RAGAS, NLI-based hallucination detection, LLM judge
-- **GPU**: Tested on NVIDIA A100 (80GB) and RTX 5070 Ti (16GB)
+- **GPU**: Tested on NVIDIA A100 (80GB) and RTX 4070 Super (12GB)
