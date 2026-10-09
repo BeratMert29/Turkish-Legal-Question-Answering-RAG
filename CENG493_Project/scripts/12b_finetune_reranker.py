@@ -119,17 +119,28 @@ def main() -> None:
     corpus_chunks = list(processor.build_corpus_chunks(holdout=True))  # keep eval rows out of training
     print(f"  Corpus chunks: {len(corpus_chunks)}")
 
-    # Combine Kaggle 300 eval + HMGS gold as annotation source
-    kaggle_examples = processor.build_qa_eval_set()
+    # Use the training split to avoid leaking held-out eval questions into training.
+    kaggle_train = processor.build_qa_train_set()
     try:
         hmgs_examples = DataProcessor.build_gold_eval_set()
     except Exception as e:
         print(f"  HMGS load failed ({e}), using Kaggle only.")
         hmgs_examples = []
 
-    qa_examples = kaggle_examples + hmgs_examples
+    qa_examples = kaggle_train + hmgs_examples
     print(f"  QA examples  : {len(qa_examples)} "
-          f"(kaggle={len(kaggle_examples)}, hmgs={len(hmgs_examples)})")
+          f"(kaggle_train={len(kaggle_train)}, hmgs={len(hmgs_examples)})")
+
+    # Assertion: no training question must appear in the held-out eval set.
+    kaggle_eval = processor.build_qa_eval_set()
+    eval_questions = {qa.question for qa in kaggle_eval}
+    train_questions = {qa.question for qa in kaggle_train}
+    leaked = train_questions & eval_questions
+    assert not leaked, (
+        f"Data leak detected: {len(leaked)} question(s) appear in both the "
+        "training set and the eval set."
+    )
+    print(f"  Leak check   : OK (0 questions overlap between train and eval)")
 
     index_path = config.INDEX_DIR / config.INDEX_FILE
     metadata_path = config.INDEX_DIR / config.METADATA_FILE
@@ -141,7 +152,7 @@ def main() -> None:
     print(f"  Index: {retriever.index.ntotal} vectors")
 
     print(f"\nBuilding training pairs (hard_neg_per_query={HARD_NEG_PER_QUERY}) ...")
-    pairs = build_pairs(corpus_chunks, kaggle_examples, retriever, HARD_NEG_PER_QUERY)
+    pairs = build_pairs(corpus_chunks, kaggle_train, retriever, HARD_NEG_PER_QUERY)
 
     pos = sum(1 for _, _, l in pairs if l == 1.0)
     neg = sum(1 for _, _, l in pairs if l == 0.0)
@@ -158,12 +169,12 @@ def main() -> None:
     # Train/eval split at the query level to prevent the same query from
     # appearing in both train and eval sets.
     n_eval = max(1, int(len(pairs) * args.eval_split))
-    all_queries = list({qa.question for qa in kaggle_examples})
+    all_queries = list({qa.question for qa in kaggle_train})
     random.shuffle(all_queries)
     n_eval_q = max(20, len(all_queries) // 10)
     eval_query_set = set(all_queries[:n_eval_q])
-    train_qa = [qa for qa in kaggle_examples if qa.question not in eval_query_set]
-    eval_qa  = [qa for qa in kaggle_examples if qa.question in eval_query_set]
+    train_qa = [qa for qa in kaggle_train if qa.question not in eval_query_set]
+    eval_qa  = [qa for qa in kaggle_train if qa.question in eval_query_set]
 
     train_pairs = build_pairs(corpus_chunks, train_qa, retriever, HARD_NEG_PER_QUERY)
     eval_pairs  = build_pairs(corpus_chunks, eval_qa,  retriever, HARD_NEG_PER_QUERY)
