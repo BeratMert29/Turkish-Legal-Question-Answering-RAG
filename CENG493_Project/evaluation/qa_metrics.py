@@ -157,7 +157,10 @@ def _cited_sources(predicted: str, retrieved_chunks: list[dict]) -> list[str]:
 
 
 def exact_match(predicted: str, expected: str) -> float:
-    """Return 1.0 if the normalised expected text is a substring of predicted.
+    """Return 1.0 iff the normalised predicted text equals the normalised expected.
+
+    Strict normalised equality: both strings are lowercased with Turkish-aware
+    normalisation (I→ı, İ→i) and whitespace-stripped before comparison.
 
     Note on HMGS questions: HMGS is a Turkish bar-exam dataset whose questions
     ask which statement is true/false (çoktan seçmeli, multiple-choice style).
@@ -172,7 +175,7 @@ def exact_match(predicted: str, expected: str) -> float:
     exp_norm = normalize_turkish(expected.strip())
     if not exp_norm:
         return 0.0
-    return 1.0 if exp_norm in pred_norm else 0.0
+    return 1.0 if pred_norm == exp_norm else 0.0
 
 
 def answer_containment(predicted: str, expected: str) -> float:

@@ -33,9 +33,9 @@ class TestExactMatch:
     def test_identical(self):
         assert exact_match("hello world", "hello world") == 1.0
 
-    def test_substring(self):
-        # EM uses containment: expected substring of predicted
-        assert exact_match("The answer is 42 exactly.", "42") == 1.0
+    def test_substring_no_longer_matches(self):
+        # EM is now strict equality; a substring of predicted is no longer enough.
+        assert exact_match("The answer is 42 exactly.", "42") == 0.0
 
     def test_no_match(self):
         assert exact_match("completely different text", "expected answer") == 0.0
