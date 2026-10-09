@@ -86,16 +86,6 @@ def stratified_sample(results: list[dict], sample_size: int = config.HALLUCINATI
     return {"hits": h, "partial": p, "misses": m}
 
 
-def evaluate_faithfulness(answer: str, context: str, nli_model) -> dict:
-    """NLI entailment prob (context → answer)."""
-    logits = nli_model.predict([(context, answer)])
-    logit_vec = logits[0]
-    probs = scipy_softmax(logit_vec)
-    entailment_idx = entailment_index(nli_model)
-    entailment_prob = float(probs[entailment_idx])
-    return {"faithful": entailment_prob >= 0.5, "score": entailment_prob}
-
-
 def run_hallucination_analysis(
     sample_dict: dict,
     retrieved_results: dict,
@@ -212,8 +202,6 @@ def run_hallucination_analysis(
             "answer_faithfulness_rate": answer_faithfulness_rate,
             # Explicit name for the legacy metric: NLI(gold answer -> predicted answer).
             "gold_answer_entailment_rate": answer_faithfulness_rate,
-            "context_grounding_count": grounding_count,
-            "context_grounding_rate":  context_grounding_rate,
             "by_category": by_category,
             "context_grounding_score_stats":  _stats(grounding_scores),
             "answer_faithfulness_score_stats": _stats(faith_scores),
