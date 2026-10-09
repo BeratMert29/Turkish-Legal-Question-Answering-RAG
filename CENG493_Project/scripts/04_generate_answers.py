@@ -11,25 +11,13 @@ _project_root = str(Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.append(_project_root)
 import config
+from utils import check_ollama
 from data.data_processor import DataProcessor
 from data.qa_loader import resolve_qa_set
 from data.corpus_loader import resolve_corpus, load_corpus_jsonl
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever
 from generation.rag_pipeline import RAGPipeline, ChunkExpander
-
-def check_ollama():
-    """Pre-flight: verify Ollama is running."""
-    try:
-        import httpx
-        r = httpx.get("http://localhost:11434/api/tags", timeout=5.0)
-        r.raise_for_status()
-    except Exception as e:
-        print("ERROR: Ollama is not running.")
-        print(f"  Start it with: ollama serve")
-        print(f"  Then pull the model: ollama pull {config.LLM_MODEL}")
-        print(f"  Details: {e}")
-        sys.exit(1)
 
 def count_valid_lines(path) -> int:
     """Count valid JSON lines in checkpoint file. Truncates corrupt last line."""
@@ -72,7 +60,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    check_ollama()
+    if not check_ollama(config.LLM_BASE_URL, config.LLM_MODEL):
+        print(f"ERROR: Ollama is not running or model '{config.LLM_MODEL}' is not available.")
+        print(f"  Start it with: ollama serve")
+        print(f"  Then pull the model: ollama pull {config.LLM_MODEL}")
+        sys.exit(1)
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Load eval set
