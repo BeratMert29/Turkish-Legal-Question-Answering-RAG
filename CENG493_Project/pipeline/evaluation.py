@@ -461,7 +461,7 @@ def build_per_query(
             "query_id": qid,
             "generation_failed": not p.get("predicted"),
             **ret_rows.get(qid, {}),
-            **{k: q.get(k) for k in ("em", "f1", "rouge_l", "bleu",
+            **{k: q.get(k) for k in ("em", "substring_match", "f1", "rouge_l", "bleu",
                                       "answer_containment", "answer_len_words")},
             "semantic_similarity": sem.get(qid),
             "nli_context_grounding": n.get("context_grounding_score"),
@@ -476,7 +476,7 @@ def build_per_query(
 
 _CI_METRICS = (
     "recall_at_5", "recall_at_10", "reciprocal_rank", "source_hit_at_5",
-    "f1", "rouge_l", "answer_containment", "em", "semantic_similarity",
+    "f1", "rouge_l", "answer_containment", "em", "substring_match", "semantic_similarity",
     "nli_context_grounding", "judge_answer", "judge_faithfulness",
     "judge_relevancy", "judge_coherence",
 )

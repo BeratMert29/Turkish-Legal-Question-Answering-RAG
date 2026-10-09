@@ -170,12 +170,39 @@ def exact_match(predicted: str, expected: str) -> float:
     paraphrases, not verbatim copies of the answer text.
     Use ``answer_containment`` (recall-side token overlap) and ``token_f1`` as
     the primary lexical metrics for HMGS; EM is reported for completeness only.
+
+    For the lenient variant that checks whether the expected text is a substring
+    of the predicted text, see :func:`substring_match`.
     """
     pred_norm = normalize_turkish(predicted.strip())
     exp_norm = normalize_turkish(expected.strip())
     if not exp_norm:
         return 0.0
     return 1.0 if pred_norm == exp_norm else 0.0
+
+
+def substring_match(predicted: str, expected: str) -> float:
+    """Return 1.0 iff the normalised expected text is a substring of the normalised predicted.
+
+    This reproduces the lenient behaviour that ``exact_match`` had before it was
+    tightened to strict equality.  Normalisation is identical to
+    :func:`exact_match`: Turkish-aware lowercasing (I→ı, İ→i) and
+    whitespace-stripping.
+
+    Args:
+        predicted: The model-generated answer text.
+        expected:  The ground-truth answer text.
+
+    Returns:
+        1.0 if ``normalize_turkish(expected.strip())`` is found anywhere inside
+        ``normalize_turkish(predicted.strip())``; 0.0 otherwise, including when
+        ``expected`` is empty.
+    """
+    pred_norm = normalize_turkish(predicted.strip())
+    exp_norm = normalize_turkish(expected.strip())
+    if not exp_norm:
+        return 0.0
+    return 1.0 if exp_norm in pred_norm else 0.0
 
 
 def answer_containment(predicted: str, expected: str) -> float:
@@ -261,6 +288,7 @@ def compute_qa_metrics(predicted: str, expected: str) -> dict:
     pred_clean = strip_citations(predicted)
     return {
         "em": exact_match(pred_clean, expected),
+        "substring_match": substring_match(pred_clean, expected),
         "f1": token_f1(pred_clean, expected),
         "bleu": bleu_score(pred_clean, expected),
         "rouge_l": rouge_l_score(pred_clean, expected),
@@ -271,13 +299,13 @@ def compute_qa_metrics(predicted: str, expected: str) -> dict:
 def compute_all_qa_metrics(predictions: list[dict]) -> dict:
     """
     predictions: list of {"predicted": str, "expected": str}
-    Returns: {"em", "f1", "bleu", "rouge_l", "answer_containment", "num_samples"}
+    Returns: {"em", "substring_match", "f1", "bleu", "rouge_l", "answer_containment", "num_samples"}
     """
     if not predictions:
-        return {"em": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0,
+        return {"em": 0.0, "substring_match": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0,
                 "answer_containment": 0.0, "mean_answer_len_words": 0.0, "num_samples": 0}
     metrics = [compute_qa_metrics(p["predicted"], p["expected"]) for p in predictions]
-    keys = ["em", "f1", "rouge_l", "answer_containment"]
+    keys = ["em", "substring_match", "f1", "rouge_l", "answer_containment"]
     result = {k: sum(m[k] for m in metrics) / len(metrics) for k in keys}
     # Corpus-level BLEU via evaluate
     if _USE_HF_EVALUATE:
@@ -355,7 +383,7 @@ def compute_all_qa_metrics_with_citation(predictions: list[dict]) -> dict:
              num_samples
     """
     if not predictions:
-        return {"em": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0,
+        return {"em": 0.0, "substring_match": 0.0, "f1": 0.0, "bleu": 0.0, "rouge_l": 0.0,
                 "answer_containment": 0.0, "mean_answer_len_words": 0.0,
                 "citation_accuracy_native": None, "citation_accuracy_injected": 0.0,
                 "source_in_context_rate": 0.0,

@@ -17,6 +17,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from evaluation.qa_metrics import (
     exact_match,
+    substring_match,
     token_f1,
     answer_containment,
     compute_qa_metrics,
@@ -49,6 +50,38 @@ class TestExactMatch:
         expected = "Karar yeter sayısı sağlanmış olsa da toplantı yeter sayısı sağlanamamıştır."
         predicted = "Toplantı yeter sayısı eksik olduğundan karar geçerli değildir."
         assert exact_match(predicted, expected) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# substring_match
+# ---------------------------------------------------------------------------
+
+class TestSubstringMatch:
+    def test_substring_returns_one(self):
+        # expected is a substring of predicted
+        assert substring_match("The answer is 42 exactly.", "42") == 1.0
+
+    def test_full_match_returns_one(self):
+        assert substring_match("hello world", "hello world") == 1.0
+
+    def test_mismatch_returns_zero(self):
+        assert substring_match("completely different text", "expected answer") == 0.0
+
+    def test_empty_expected_returns_zero(self):
+        assert substring_match("anything", "") == 0.0
+
+    def test_turkish_normalization_I(self):
+        # Turkish I→ı, İ→i normalisation must apply before comparison
+        assert substring_match("İstanbul kararı", "istanbul kararı") == 1.0
+
+    def test_turkish_normalization_dotless_i(self):
+        # ı (dotless i) stays as ı after normalization; lookup via normalized form
+        assert substring_match("Madde kırk dört hükmü geçerlidir", "kırk dört") == 1.0
+
+    def test_strict_em_differs_for_substring(self):
+        # substring_match is lenient; exact_match is strict
+        assert substring_match("The answer is 42.", "42") == 1.0
+        assert exact_match("The answer is 42.", "42") == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +155,7 @@ class TestTokenF1:
 class TestComputeQaMetrics:
     def test_keys_present(self):
         result = compute_qa_metrics("test answer", "test answer")
-        expected_keys = {"em", "f1", "bleu", "rouge_l", "answer_containment"}
+        expected_keys = {"em", "substring_match", "f1", "bleu", "rouge_l", "answer_containment"}
         assert expected_keys.issubset(result.keys())
 
     def test_answer_containment_in_output(self):
@@ -139,6 +172,7 @@ class TestComputeAllQaMetrics:
     def test_empty_returns_zeros(self):
         result = compute_all_qa_metrics([])
         assert result["em"] == 0.0
+        assert result["substring_match"] == 0.0
         assert result["f1"] == 0.0
         assert result["answer_containment"] == 0.0
         assert result["num_samples"] == 0

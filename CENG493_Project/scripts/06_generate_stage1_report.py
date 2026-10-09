@@ -129,7 +129,8 @@ nDCG@10    {ascii_bar(retrieval.get("ndcg_at_10"))}
 
 | Metric | Value |
 | --- | ---: |
-| Exact Match | {pct(qa.get("em"))} |
+| Exact Match (strict) | {pct(qa.get("em"))} |
+| Substring Match (lenient) | {pct(qa.get("substring_match"))} |
 | F1 | {pct(qa.get("f1"))} |
 | ROUGE-L | {pct(qa.get("rouge_l"))} |
 | BLEU | {pct(qa.get("bleu"))} |
@@ -139,11 +140,12 @@ nDCG@10    {ascii_bar(retrieval.get("ndcg_at_10"))}
 ### QA Bars
 
 ```text
-EM         {ascii_bar(qa.get("em"))}
-F1         {ascii_bar(qa.get("f1"))}
-ROUGE-L    {ascii_bar(qa.get("rouge_l"))}
-BLEU       {ascii_bar(qa.get("bleu"))}
-Citation   {ascii_bar(qa.get("citation_accuracy"))}
+EM (strict)      {ascii_bar(qa.get("em"))}
+SubstrMatch      {ascii_bar(qa.get("substring_match"))}
+F1               {ascii_bar(qa.get("f1"))}
+ROUGE-L          {ascii_bar(qa.get("rouge_l"))}
+BLEU             {ascii_bar(qa.get("bleu"))}
+Citation         {ascii_bar(qa.get("citation_accuracy"))}
 ```
 
 ## Faithfulness
