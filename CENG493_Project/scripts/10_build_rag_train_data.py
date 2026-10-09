@@ -15,19 +15,7 @@ import config
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever
 from retrieval.bm25_retriever import BM25Index
-
-
-def assemble_context(chunks: list, top_k: int, context_window_chars: int) -> str:
-    selected = chunks[:top_k]
-    parts = []
-    running_len = 0
-    for i, chunk in enumerate(selected):
-        part = f"[Kaynak {i+1}] ({chunk['source']})\n{chunk['text']}\n\n"
-        if running_len + len(part) > context_window_chars:
-            break
-        parts.append(part)
-        running_len += len(part)
-    return "".join(parts)
+from generation.rag_pipeline import RAGPipeline
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +50,14 @@ def main() -> None:
     retriever.load_index(index_path, metadata_path)
     print(f"  Index loaded: {retriever.index.ntotal} vectors")
 
+    rag_pipeline = RAGPipeline(
+        retriever,
+        top_k_for_generation=config.TOP_K_FOR_GENERATION,
+        context_window_chars=config.CONTEXT_WINDOW_CHARS,
+        chunk_expander=None,
+        graph_neighbor_budget=0,
+    )
+
     bm25_index = None
     if not args.dense_only:
         print(f"\nBuilding BM25 index over {retriever.index.ntotal} metadata entries ...")
@@ -93,7 +89,7 @@ def main() -> None:
 
     with open(out_path, "w", encoding="utf-8") as fout:
         for record, chunks in tqdm(zip(records, all_chunks), total=len(records), desc="Assembling"):
-            ctx_str = assemble_context(chunks, top_k, ctx_chars)
+            ctx_str, _ = rag_pipeline.assemble_context(chunks)
 
             # detect if we hit the char limit (last chunk was not fully included)
             if len(chunks) > 0:
