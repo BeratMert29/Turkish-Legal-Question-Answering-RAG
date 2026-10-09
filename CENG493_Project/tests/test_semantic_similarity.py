@@ -39,5 +39,6 @@ def test_long_text_not_truncated_and_averaged():
 
 
 def test_config_defaults():
-    from evaluation.semantic_similarity import _DEFAULT_MODEL
-    assert "multilingual" in _DEFAULT_MODEL and "MiniLM" not in _DEFAULT_MODEL
+    import config
+    # Model name is now sourced directly from config (no module-level fallback)
+    assert "multilingual" in config.SEMANTIC_SIM_MODEL and "MiniLM" not in config.SEMANTIC_SIM_MODEL

@@ -15,9 +15,10 @@ import re
 import numpy as np
 from scipy.special import softmax
 
-_CITATION = re.compile(r"\[\s*kaynak\s+\d+\s*\]", re.IGNORECASE)
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
-DEFAULT_NLI_MODEL = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+
+# Import shared citation-strip pattern from qa_metrics to avoid duplication.
+from evaluation.qa_metrics import _STRIP_CITATION_PATTERN as _CITATION
 
 
 def load_nli_model(model_name: str | None = None, device: str | None = None):
@@ -26,11 +27,8 @@ def load_nli_model(model_name: str | None = None, device: str | None = None):
     from sentence_transformers import CrossEncoder
 
     if model_name is None:
-        try:
-            import config
-            model_name = config.NLI_MODEL
-        except Exception:
-            model_name = DEFAULT_NLI_MODEL
+        import config
+        model_name = config.NLI_MODEL
     if device is None:
         if torch.cuda.is_available():
             device = "cuda"

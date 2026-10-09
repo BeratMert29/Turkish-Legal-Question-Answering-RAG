@@ -22,16 +22,6 @@ else:
     _DEVICE = "cpu"
 
 
-def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two 1-D vectors."""
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0.0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
-
-
-_DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-_DEFAULT_MAX_SEQ = 512
 
 
 def _chunk_words(text: str, max_words: int) -> list[str]:
@@ -99,12 +89,9 @@ def compute_semantic_similarity(
         ]
         return {"mean_similarity": 0.0, "per_sample": per_sample}
 
-    try:
-        import config as _cfg
-    except Exception:
-        _cfg = None
-    model_name = model_name or getattr(_cfg, "SEMANTIC_SIM_MODEL", _DEFAULT_MODEL)
-    max_seq_length = int(max_seq_length or getattr(_cfg, "SEMANTIC_SIM_MAX_SEQ_LEN", _DEFAULT_MAX_SEQ))
+    import config as _cfg
+    model_name = model_name or _cfg.SEMANTIC_SIM_MODEL
+    max_seq_length = int(max_seq_length or _cfg.SEMANTIC_SIM_MAX_SEQ_LEN)
 
     model = SentenceTransformer(model_name, device=_DEVICE)
     limit = getattr(model, "max_seq_length", None)
