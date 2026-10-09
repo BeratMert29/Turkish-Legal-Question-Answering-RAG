@@ -28,6 +28,10 @@ jobs:
       - name: Install test dependencies
         run: pip install -r CENG493_Project/requirements-test.txt
 
+      - name: Compile-check scripts
+        working-directory: CENG493_Project
+        run: python -m compileall -q scripts
+
       - name: Run pytest
         working-directory: CENG493_Project
         run: python -m pytest tests -v --tb=short
