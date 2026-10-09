@@ -149,10 +149,6 @@ SEMANTIC_SIM_MAX_SEQ_LEN = 512  # encoder window; longer answers are chunked
 # every prediction (needed for tight CIs); an int caps cost (Ollama calls).
 LLM_JUDGE_SAMPLE_SIZE = None
 
-# Hallucination stratification thresholds (applied to top-1 retrieval score)
-HALLUCINATION_HIT_THRESHOLD = 0.7
-HALLUCINATION_PARTIAL_THRESHOLD = 0.4
-
 # BM25 tokenization
 BM25_MIN_TOKEN_LENGTH = 2
 

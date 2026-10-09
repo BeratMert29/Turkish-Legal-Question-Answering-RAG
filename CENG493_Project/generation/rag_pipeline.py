@@ -125,10 +125,6 @@ class RAGPipeline:
             api_key=config.LLM_API_KEY,
         )
 
-    def get_llm_client(self) -> openai.OpenAI:
-        """Ollama OpenAI-compatible client."""
-        return self._client
-
     def _select_for_generation(self, chunks: list) -> list:
         """Pick the generation context from a (possibly graph-expanded) ranking.
 
