@@ -19,7 +19,7 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import numpy as np
-from utils import read_jsonl
+from utils import read_jsonl, set_seeds
 import config
 from retrieval.embedder import Embedder
 
@@ -60,7 +60,7 @@ def _find_gt_positive(context: str, chunk_texts: list[str]) -> tuple[int | None,
 
 
 def main() -> None:
-    random.seed(RANDOM_SEED)
+    set_seeds(RANDOM_SEED)
 
     # ── Load data ────────────────────────────────────────────────────────────
     print(f"Loading QA pairs from {QA_PATH} ...")

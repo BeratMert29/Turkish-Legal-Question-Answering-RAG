@@ -15,7 +15,7 @@ _project_root = str(Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from utils import read_jsonl
+from utils import read_jsonl, set_seeds
 import config
 from generation.rag_pipeline import TURKISH_PROMPT
 
@@ -166,6 +166,7 @@ def find_last_checkpoint(adapter_dir: Path):
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    set_seeds(42)
 
     # Heavy imports deferred so --help and import-time errors are readable
     import torch
@@ -292,6 +293,7 @@ def main() -> None:
 
     training_args = SFTConfig(
         output_dir=str(ADAPTER_DIR),
+        seed=42,
         num_train_epochs=tc["num_train_epochs"],
         per_device_train_batch_size=tc["per_device_train_batch_size"],
         gradient_accumulation_steps=tc["gradient_accumulation_steps"],

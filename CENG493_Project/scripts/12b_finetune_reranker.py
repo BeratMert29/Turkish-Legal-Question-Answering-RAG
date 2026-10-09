@@ -8,6 +8,7 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import config
+from utils import set_seeds
 from data.data_processor import DataProcessor
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever
@@ -111,7 +112,7 @@ def compute_ap(model, pairs: list[tuple[str, str, float]]) -> float:
 
 def main() -> None:
     args = parse_args()
-    random.seed(RANDOM_SEED)
+    set_seeds(RANDOM_SEED)
 
     print(f"Loading corpus from {config.RAW_DATA_PATH} ...")
     processor = DataProcessor(config.RAW_DATA_PATH)

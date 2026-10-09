@@ -25,7 +25,7 @@ _project_root = str(Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from utils import read_jsonl
+from utils import read_jsonl, set_seeds
 import config
 
 # ── Paths & hyperparameters ──────────────────────────────────────────────────
@@ -52,6 +52,7 @@ TRAINING_CONFIG = {
 
 
 def main() -> None:
+    set_seeds(42)
     # Lazy imports so the script fails fast if deps are missing
     try:
         from sentence_transformers import (
@@ -115,6 +116,7 @@ def main() -> None:
 
     args = SentenceTransformerTrainingArguments(
         output_dir=str(OUTPUT_DIR),
+        seed=42,
         num_train_epochs=TRAINING_CONFIG["epochs"],
         per_device_train_batch_size=TRAINING_CONFIG["batch_size"],
         learning_rate=TRAINING_CONFIG["learning_rate"],
