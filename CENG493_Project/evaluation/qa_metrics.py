@@ -324,7 +324,7 @@ def compute_all_qa_metrics(predictions: list[dict]) -> dict:
 
 
 def compute_per_query_qa_metrics(predictions: list[dict]) -> list[dict]:
-    """Per-query metrics for bootstrap CIs: query_id, em, f1, rouge_l,
+    """Per-query metrics for bootstrap CIs: query_id, em, substring_match, f1, rouge_l,
     bleu (sentence-level), answer_containment, answer_len_words."""
     out = []
     for p in predictions:
