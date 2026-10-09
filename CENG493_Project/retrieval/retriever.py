@@ -1,9 +1,12 @@
 import json
+import logging
 import numpy as np
 import faiss
 from pathlib import Path
 from typing import TypedDict
 import config
+
+logger = logging.getLogger(__name__)
 
 class RetrievedChunk(TypedDict):
     text: str
@@ -378,9 +381,10 @@ class Retriever:
             ) for i in top_indices]
 
         except Exception as e:
-            import logging
-            logging.warning(
-                f"multi_vector_retrieve failed ({e}), falling back to dense-only retrieve()"
+            logger.warning(
+                "multi_vector_retrieve failed (%s), falling back to dense-only retrieve()",
+                e,
+                exc_info=True,
             )
             return self.retrieve(query, top_k=top_k)
 
