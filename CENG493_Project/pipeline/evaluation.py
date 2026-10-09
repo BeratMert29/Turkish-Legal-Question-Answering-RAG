@@ -33,13 +33,23 @@ if TYPE_CHECKING:  # pragma: no cover
 _model_cache: dict[str, Any] = {}
 
 
-def evict_model_cache() -> None:
+def evict_model_cache(keep_nli: bool = False) -> None:
     """Clear cached models and release GPU memory.
 
     Call between pipeline stages to avoid having the 14B generation LLM,
     the 70B judge, and the NLI cross-encoder all resident simultaneously.
+
+    Args:
+        keep_nli: When True, preserve the cached NLI cross-encoder so it can
+            be reused across consecutive stages without reloading.
     """
-    _model_cache.clear()
+    if keep_nli:
+        nli = _model_cache.get("nli")
+        _model_cache.clear()
+        if nli is not None:
+            _model_cache["nli"] = nli
+    else:
+        _model_cache.clear()
     _gc.collect()
     try:
         import torch as _torch
@@ -47,6 +57,15 @@ def evict_model_cache() -> None:
             _torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_scenario_score(v) -> str:
+    """Format a scenario score for display; returns 'n/a' when score is None."""
+    return f"{v:.4f}" if v is not None else "n/a"
 
 
 # ---------------------------------------------------------------------------
@@ -860,7 +879,8 @@ def _run_hallucination_phase(
     import config as _config
 
     # Evict perplexity/RAGAS models before loading the NLI cross-encoder.
-    evict_model_cache()
+    # keep_nli=True preserves any already-loaded NLI model across stages.
+    evict_model_cache(keep_nli=True)
 
     print("  Hallucination analysis …")
     hall, faithful_rate, nli_model = run_hallucination_eval(
@@ -1022,9 +1042,9 @@ def _assemble_final_result(
         llm_scores=llm_scores_dict if llm_scores_dict else None,
     )
     print(
-        f"    Scenario1={scenario_scores['scenario1']:.4f}  "
-        f"Scenario2={scenario_scores['scenario2']:.4f}  "
-        f"Scenario3={scenario_scores['scenario3']:.4f}"
+        f"    Scenario1={_fmt_scenario_score(scenario_scores['scenario1'])}  "
+        f"Scenario2={_fmt_scenario_score(scenario_scores['scenario2'])}  "
+        f"Scenario3={_fmt_scenario_score(scenario_scores['scenario3'])}"
     )
 
     return {

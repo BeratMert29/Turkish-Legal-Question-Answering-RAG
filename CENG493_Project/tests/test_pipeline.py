@@ -644,6 +644,43 @@ class TestEvalHelpers:
                 f"(config.LLM_JUDGE_SAMPLE_SIZE={config.LLM_JUDGE_SAMPLE_SIZE})"
             )
 
+    # ------------------------------------------------------------------
+    # Task 1: None scenario score → "n/a"
+    # ------------------------------------------------------------------
+
+    def test_fmt_scenario_score_none_returns_na(self):
+        """_fmt_scenario_score must return 'n/a' for None, not raise TypeError."""
+        from pipeline.evaluation import _fmt_scenario_score
+        assert _fmt_scenario_score(None) == "n/a"
+
+    def test_fmt_scenario_score_float_formats(self):
+        from pipeline.evaluation import _fmt_scenario_score
+        assert _fmt_scenario_score(0.75) == "0.7500"
+        assert _fmt_scenario_score(1.0) == "1.0000"
+
+    # ------------------------------------------------------------------
+    # Task 3: keep_nli=True preserves NLI model in cache
+    # ------------------------------------------------------------------
+
+    def test_evict_model_cache_keep_nli_preserves_nli(self):
+        """evict_model_cache(keep_nli=True) must keep 'nli' while evicting others."""
+        from pipeline.evaluation import _model_cache, evict_model_cache
+
+        nli_sentinel = object()
+        _model_cache["nli"] = nli_sentinel
+        _model_cache["other"] = object()
+        evict_model_cache(keep_nli=True)
+        assert _model_cache.get("nli") is nli_sentinel
+        assert "other" not in _model_cache
+
+    def test_evict_model_cache_default_clears_nli(self):
+        """evict_model_cache() with default keep_nli=False still removes 'nli'."""
+        from pipeline.evaluation import _model_cache, evict_model_cache
+
+        _model_cache["nli"] = object()
+        evict_model_cache()
+        assert "nli" not in _model_cache
+
 
 class TestGraphGenerationContext:
     """Graph neighbours must reach the generation context; metrics ignore them."""
