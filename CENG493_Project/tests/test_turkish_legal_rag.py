@@ -52,6 +52,25 @@ class TestAdapterFilters:
         assert [e["hf_row_id"] for e in ex] == ["2"]
         assert rep["dropped"]["train_leakage"] == 1
 
+    def test_normalize_question_turkish_dotted_i(self):
+        """İ (U+0130) must not produce a spurious space after lowercasing.
+
+        Python's str.lower() expands İ to i + combining-dot (two code-points).
+        The old local normalize_question used plain .lower() which made
+        ``re.sub(r'\\W+', ' ', ...)`` split on the combining dot, turning
+        "TAKİP" into "taki p".  The imported normalize_question from
+        data.data_processor uses normalize_turkish() which handles this.
+        """
+        from data.data_processor import normalize_question as nq
+        # normalize_turkish maps İ->i and I->ı before lowercasing, so
+        # "İSRARLI" -> "israrlı" (dotless ı preserved) and "TAKİP" -> "takip"
+        # (no spurious space from combining dot).
+        assert nq("İSRARLI TAKİP") == "israrlı takip"
+        assert nq("İSTANBUL") == "istanbul"
+        assert " " not in nq("TAKİP"), "combining-dot must not create a space"
+        # Ensure adapter.normalize_question is the same function (task 2 fix).
+        assert adapter.normalize_question("İSRARLI TAKİP") == "israrlı takip"
+
     def test_unknown_law_drop(self):
         rows = [_row(1, "q1", kaynak="Olmayan Kanun"), _row(2, "q2")]
         ex, rep = adapter.build_examples(rows, KNOWN, set())
