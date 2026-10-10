@@ -431,7 +431,7 @@ def main() -> None:
         "qa_metrics": qa_metrics,
         "hallucination_summary": hallucination.get("summary", {}),
         "faithfulness_rate": hallucination.get("summary", {}).get(
-            "context_grounding_rate",
+            "context_supported_sentence_rate",
         ),
     }
     save_results(final_results, args.results_dir)

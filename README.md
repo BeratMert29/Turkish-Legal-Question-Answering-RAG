@@ -186,7 +186,7 @@ PYTHONUTF8=1 python scripts/14_eval_all_stages.py --stages base,rrf_rerank
 
 ## Local run (12 GB GPU)
 
-Tested target: RTX 4070 Super 12 GB. Run from `CENG493_Project/`; the 7B
+Tested target: RTX 4070 Super 12GB. Run from `CENG493_Project/`; the 7B
 generator (`qwen2.5:7b`) and 8B judge (`llama3.1:8b`) are loaded one at a time.
 The 14B generator and `llama3.3:70b` judge are options on a larger GPU, but then
 the LoRA must be retrained on the matching base.
@@ -441,8 +441,11 @@ all of which have gold chunks in the corpus.
   from the Kaggle legal QA data our corpus is built from.
 - **Filtering** (`scripts/16_prepare_turkish_legal_rag.py`, 290 -> 195):
   - drop 90 rows whose `source_origin` is not `kaggle_batuhankalem` (templated, low quality)
+  - drop 0 rows whose law has no chunks in the corpus (`unknown_law`)
   - drop 5 rows whose question appears in a `qa_train*.jsonl` fine-tuning file (leakage)
   - `madde_no` is normalised to the corpus convention (`"3-"` -> `"3"`)
+  - 195 = 178 rows with clean labels + 17 flagged as label conflicts (written to a
+    separate `.label_conflicts.jsonl` file and re-evaluated by the next step)
 - **Label check** (`scripts/17_check_tlr_labels.py`, `data/tlr_labels.py`):
   about a quarter of the HF article labels point 1–3 articles before the one
   that holds the answer (İş Kanunu "Ara dinlenmesi" is article 68, labelled 67).
@@ -510,4 +513,4 @@ SILVER_THRESHOLD = 0.10          # minimum token-overlap score
 - **Retrieval**: FAISS (GPU/CPU), rank_bm25
 - **Inference**: Ollama (local, no API key)
 - **Evaluation**: ranx, sacrebleu (BLEU, chrF++), multilingual NLI, LLM judge, paired bootstrap
-- **GPU**: Tested on NVIDIA A100 (80GB) and RTX 5070 Ti (16GB)
+- **GPU**: Tested on NVIDIA A100 (80GB) and RTX 4070 Super 12GB

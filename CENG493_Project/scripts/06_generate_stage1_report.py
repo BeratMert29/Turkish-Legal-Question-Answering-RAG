@@ -151,7 +151,8 @@ Citation   {ascii_bar(qa.get("citation_accuracy"))}
 | Metric | Value |
 | --- | ---: |
 | Context-grounded answers | {hall.get("context_grounding_count", "N/A")} / {hall.get("total", "N/A")} |
-| Context-grounding rate | {pct(hall.get("context_grounding_rate"))} |
+| Context-supported sentence rate | {pct(hall.get("context_supported_sentence_rate"))} |
+| Gold claim recall | {pct(hall.get("gold_claim_recall"))} |
 
 ### By Retrieval Category
 
@@ -162,7 +163,8 @@ Citation   {ascii_bar(qa.get("citation_accuracy"))}
 | Misses | {misses.get("context_grounded", "N/A")} | {misses.get("total", "N/A")} | {pct((misses.get("context_grounded", 0) / misses.get("total", 1)) if misses.get("total") else None)} |
 
 ```text
-Context-grounding  {ascii_bar(hall.get("context_grounding_rate"))}
+Context-supported  {ascii_bar(hall.get("context_supported_sentence_rate"))}
+Gold claim recall  {ascii_bar(hall.get("gold_claim_recall"))}
 ```
 
 ## Hardware Snapshot
@@ -175,7 +177,7 @@ Context-grounding  {ascii_bar(hall.get("context_grounding_rate"))}
 
 - This file summarizes the saved Step 1 baseline artifact already present in the repo.
 - Retrieval quality is mixed: `MRR` and `nDCG@10` are strong, while `Recall@5/10` is low under the project's strict chunk-level relevance definition.
-- Answer quality is still limited (`EM` and `F1` are low), but citation accuracy ({pct(qa.get("citation_accuracy"))}) and context-grounding rate ({pct(hall.get("context_grounding_rate"))}) are strong enough to report that grounding behavior is working.
+- Answer quality is still limited (`EM` and `F1` are low), but citation accuracy ({pct(qa.get("citation_accuracy"))}) and context-supported sentence rate ({pct(hall.get("context_supported_sentence_rate"))}) are strong enough to report that grounding behavior is working.
 - For future runs, log `nvidia-smi` samples during evaluation if you need report-grade GPU utilization curves.
 """
 

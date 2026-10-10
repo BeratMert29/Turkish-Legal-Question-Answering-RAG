@@ -5,7 +5,7 @@ Tests exercise the pure-function logic of compute_all_metrics:
   * Recall@5 / Recall@10
   * MRR
   * nDCG@10
-  * source_hit_at_k (custom hit-rate metric)
+  * hit_at_k (custom hit-rate metric)
   * capped_recall_at_k
   * Precision@5 / Precision@10
   * total_queries / num_queries counting
