@@ -187,6 +187,19 @@ def main() -> None:
     if args.sample_size is not None:
         raw_records = raw_records[:args.sample_size]
     print(f"  {len(raw_records)} examples loaded.")
+    # Never fine-tune on an eval question (07 merges an external dataset that
+    # may overlap with the eval sets; 10 already filters its RAG output, but
+    # the merged / fallback paths are not pre-filtered).
+    from data.data_processor import DataProcessor, normalize_question
+    eval_keys = DataProcessor.saved_eval_question_keys()
+    before = len(raw_records)
+    raw_records = [r for r in raw_records
+                   if normalize_question(r.get("question", "")) not in eval_keys]
+    dropped = before - len(raw_records)
+    if dropped:
+        print(f"  {dropped} examples dropped (question matches an eval set).")
+    else:
+        print("  No eval-set overlap detected.")
 
     print("\nGPU memory at startup:")
     print_gpu_memory()
