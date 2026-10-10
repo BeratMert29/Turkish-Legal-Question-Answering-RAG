@@ -52,6 +52,12 @@ def main() -> None:
     print(f"Loading training records from {dataset_path} ...")
     records = list(read_jsonl(dataset_path))
     print(f"  {len(records)} records loaded.")
+    # Never fine-tune on an eval question (07 merges an external dataset).
+    from data.data_processor import DataProcessor, normalize_question
+    eval_keys = DataProcessor.saved_eval_question_keys()
+    kept = [r for r in records if normalize_question(r["question"]) not in eval_keys]
+    print(f"  {len(records) - len(kept)} records dropped: question is in an eval set")
+    records = kept
 
     index_path = config.INDEX_DIR / config.INDEX_FILE
     metadata_path = config.INDEX_DIR / config.METADATA_FILE
@@ -117,7 +123,7 @@ def main() -> None:
 
     n = len(records)
     avg_ctx = total_ctx_len / n if n else 0
-    print(f"\nDone.")
+    print("\nDone.")
     print(f"  Output       : {out_path}")
     print(f"  Examples     : {n}")
     print(f"  Avg ctx len  : {avg_ctx:.0f} chars")

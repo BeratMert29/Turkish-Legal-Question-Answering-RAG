@@ -17,7 +17,7 @@ ADAPTER_DIR = config.BASE_DIR / "models" / "bge_reranker_ft"
 HARD_NEG_PER_QUERY = 3
 TRAIN_EPOCHS = 3
 BATCH_SIZE = 4
-RANDOM_SEED = 42
+RANDOM_SEED = config.SEED
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +26,10 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Build dataset, print stats, exit without training.",
+    )
+    p.add_argument(
+        "--max-queries", type=int, default=3000,
+        help="Sample at most this many training questions (default: 3000).",
     )
     p.add_argument(
         "--eval-split",
@@ -116,24 +120,19 @@ def main() -> None:
     print(f"Loading corpus from {config.RAW_DATA_PATH} ...")
     processor = DataProcessor(config.RAW_DATA_PATH)
     processor.load_and_validate()
-    corpus_chunks = list(processor.build_corpus_chunks(holdout=True)  # keep eval rows out of training)
+    corpus_chunks = list(processor.build_corpus_chunks())
     print(f"  Corpus chunks: {len(corpus_chunks)}")
 
-    # Combine Kaggle 300 eval + HMGS gold as annotation source
-    kaggle_examples = processor.build_qa_eval_set()
-    try:
-        hmgs_examples = DataProcessor.build_gold_eval_set()
-    except Exception as e:
-        print(f"  HMGS load failed ({e}), using Kaggle only.")
-        hmgs_examples = []
-
-    qa_examples = kaggle_examples + hmgs_examples
-    print(f"  QA examples  : {len(qa_examples)} "
-          f"(kaggle={len(kaggle_examples)}, hmgs={len(hmgs_examples)})")
+    # Training questions: kaggle rows with contexts, minus every eval set's
+    # questions (the eval sets themselves were used here before -- leakage).
+    kaggle_examples = processor.build_kaggle_train_set()
+    if args.max_queries and len(kaggle_examples) > args.max_queries:
+        kaggle_examples = random.Random(RANDOM_SEED).sample(kaggle_examples, args.max_queries)
+    print(f"  QA examples  : {len(kaggle_examples)} (kaggle train rows)")
 
     index_path = config.INDEX_DIR / config.INDEX_FILE
     metadata_path = config.INDEX_DIR / config.METADATA_FILE
-    print(f"\nLoading FAISS index ...")
+    print("\nLoading FAISS index ...")
     embedder = Embedder()
     embedder.load_model()
     retriever = Retriever(embedder)

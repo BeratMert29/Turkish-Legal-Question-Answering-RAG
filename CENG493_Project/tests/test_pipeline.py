@@ -10,14 +10,11 @@ Covers:
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 
 _PROJECT = Path(__file__).resolve().parent.parent
 
@@ -36,7 +33,7 @@ class TestPipelineImports:
         assert hasattr(pipeline, "DEFAULT_STAGE_ORDER")
 
     def test_import_stages(self):
-        from pipeline.stages import StageConfig, STAGE_REGISTRY, DEFAULT_STAGE_ORDER
+        from pipeline.stages import STAGE_REGISTRY, DEFAULT_STAGE_ORDER
         assert isinstance(STAGE_REGISTRY, dict)
         assert isinstance(DEFAULT_STAGE_ORDER, list)
         assert len(STAGE_REGISTRY) > 0
@@ -339,7 +336,7 @@ class TestDryRun:
         out = save_stage_results(final, preds, tmp_path / "out")
 
         assert out.exists()
-        with open(out) as f:
+        with open(out, encoding="utf-8") as f:
             loaded = __import__("json").load(f)
         assert loaded["test"] is True
 
@@ -463,14 +460,32 @@ class TestEvalHelpers:
 
         with patch.object(_eval, "evict_model_cache") as mock_evict, \
              patch.object(_eval, "run_hallucination_eval",
-                          return_value=(fake_hall, 0.9, fake_nli)) as mock_rhe:
+                          return_value=(fake_hall, 0.9, fake_nli)):
             _eval._model_cache.clear()
-            hall, rate = _eval._run_hallucination_phase([], {}, "mock-model")
+            hall, rate = _eval._run_hallucination_phase([], "mock-model")
 
         mock_evict.assert_called_once()
         assert _eval._model_cache.get("nli") is fake_nli
         assert rate == 0.9
         assert hall is fake_hall
+
+    def test_hallucination_phase_scores_generation_context(self):
+        """NLI premises are each prediction's own retrieved_chunks (the
+        generator's context), and a cached NLI model survives eviction."""
+        from unittest.mock import patch, MagicMock
+        from pipeline import evaluation as _eval
+
+        cached = MagicMock()
+        preds = [{"query_id": "q1", "predicted": "a",
+                  "retrieved_chunks": [{"chunk_id": "ctx", "text": "t"}]}]
+        with patch.object(_eval, "run_hallucination_eval",
+                          return_value=({"summary": {}}, 0.5, cached)) as mock_rhe:
+            _eval._model_cache.clear()
+            _eval._model_cache["nli"] = cached
+            _eval._run_hallucination_phase(preds, "m")
+        args, kwargs = mock_rhe.call_args
+        assert args[1] == {"q1": [{"chunk_id": "ctx", "text": "t"}]}
+        assert kwargs["nli_model"] is cached
 
     def test_no_run_stage_nli_attribute(self):
         """run_stage must not cache NLI on a function attribute."""
@@ -486,10 +501,10 @@ class TestEvalHelpers:
         out = save_stage_results({"v": 1}, [], tmp_path / "r")
         assert out.exists()
         import json
-        assert json.loads(out.read_text())["v"] == 1
+        assert json.loads(out.read_text(encoding="utf-8"))["v"] == 1
         # Second call overwrites atomically — must not raise or leave .tmp files.
         save_stage_results({"v": 2}, [], tmp_path / "r")
-        assert json.loads(out.read_text())["v"] == 2
+        assert json.loads(out.read_text(encoding="utf-8"))["v"] == 2
         assert not (tmp_path / "r" / "baseline_metrics.tmp").exists()
 
     def test_run_llm_judge_eval_shared_sample(self):
@@ -535,8 +550,7 @@ class TestEvalHelpers:
         """_run_judge_phase must call sample_judge_query_ids once and pass
         the returned IDs as query_ids= to run_llm_judge_eval."""
         from pipeline import evaluation as _eval
-        from unittest.mock import patch, MagicMock, call
-        import config
+        from unittest.mock import patch, MagicMock
 
         sampled = [f"q{i}" for i in range(20)]
         fake_stage = MagicMock()
@@ -673,6 +687,22 @@ class TestGraphGenerationContext:
         ids = [c["chunk_id"] for c in sel]
         assert len(ids) == 5
         assert ids == ["r0", "n0", "r1", "n1", "r2"]
+
+    def test_neighbours_of_unkept_parents_do_not_displace_top_chunks(self):
+        reg = [{"chunk_id": f"r{i}", "text": "t", "source": "S", "score": 1.0 - i / 10}
+               for i in range(10)]
+        nb = [{"chunk_id": cid, "text": "t", "source": "S", "score": .1,
+               "graph_neighbor": True, "graph_parent": root, "graph_root": root}
+              for cid, root in (("n7a", "r7"), ("n7b", "r7"), ("n8a", "r8"))]
+        chunks = [*reg[:8], nb[0], nb[1], reg[8], nb[2], reg[9]]
+        sel = self._pipe(3)._select_for_generation(chunks)
+        assert [c["chunk_id"] for c in sel] == ["r0", "r1", "r2", "r3", "r4"]
+
+    def test_reservation_shrinks_to_available_neighbours(self):
+        # only r0 has a neighbour: one slot is reserved, not the full budget of 3
+        sel = self._pipe(3)._select_for_generation(
+            [c for c in self._chunks() if c["chunk_id"] != "n1"])
+        assert [c["chunk_id"] for c in sel] == ["r0", "n0", "r1", "r2", "r3"]
 
     def test_budget_zero_just_cuts_to_top_k(self):
         sel = self._pipe(0)._select_for_generation(self._chunks())

@@ -2,7 +2,6 @@
 import os, sys
 if sys.platform == "darwin":
     os.environ.setdefault("OMP_NUM_THREADS", "1")
-import json
 import time
 import sys
 from pathlib import Path
@@ -11,7 +10,6 @@ if _project_root not in sys.path:
     sys.path.append(_project_root)
 import argparse
 import config
-from data.data_processor import DataProcessor
 from data.corpus_loader import resolve_corpus, load_corpus_jsonl
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever

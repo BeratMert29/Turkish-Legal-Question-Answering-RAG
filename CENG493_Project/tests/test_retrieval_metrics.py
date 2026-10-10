@@ -33,24 +33,22 @@ def _single(query_id: str, retrieved: list[str], relevant: list[str]) -> list[di
 # ---------------------------------------------------------------------------
 
 class TestEdgeCases:
-    def test_empty_input_returns_zero_metrics(self):
+    def test_empty_input_returns_none_metrics(self):
+        """No gold-labeled query: metrics are unknown (None), never 0.0."""
         result = compute_all_metrics([])
         assert result["num_queries"] == 0
         assert result["total_queries"] == 0
-        assert result["recall_at_5"] == 0.0
-        assert result["recall_at_10"] == 0.0
-        assert result["mrr"] == 0.0
-        assert result["ndcg_at_10"] == 0.0
-        assert result["precision_at_5"] == 0.0
-        assert result["precision_at_10"] == 0.0
+        for key in ("recall_at_5", "recall_at_10", "mrr", "ndcg_at_10",
+                    "hit_at_5", "precision_at_5", "precision_at_10"):
+            assert result[key] is None, key
 
     def test_query_with_no_relevant_docs_is_excluded(self):
         results = _single("q1", ["c1", "c2"], relevant=[])
         result = compute_all_metrics(results)
         assert result["num_queries"] == 0
         assert result["total_queries"] == 1
-        # Metrics should still be 0.0 (no evaluable queries)
-        assert result["mrr"] == 0.0
+        # No evaluable queries: unknown, not zero
+        assert result["mrr"] is None
 
     def test_all_queries_have_no_relevant_docs(self):
         results = [
@@ -78,8 +76,8 @@ class TestSingleQueryMetrics:
         results = _single("q1", ["c1", "c2", "c3"], relevant=["c1"])
         result = compute_all_metrics(results)
         assert result["mrr"] == pytest.approx(1.0)
-        assert result["source_hit_at_5"] == pytest.approx(1.0)
-        assert result["source_hit_at_10"] == pytest.approx(1.0)
+        assert result["hit_at_5"] == pytest.approx(1.0)
+        assert result["hit_at_10"] == pytest.approx(1.0)
         assert result["num_queries"] == 1
 
     def test_relevant_at_rank2_gives_mrr_half(self):
@@ -97,7 +95,7 @@ class TestSingleQueryMetrics:
         results = _single("q1", ["c1", "c2", "c3"], relevant=["c99"])
         result = compute_all_metrics(results)
         assert result["mrr"] == pytest.approx(0.0)
-        assert result["source_hit_at_5"] == 0.0
+        assert result["hit_at_5"] == 0.0
         assert result["recall_at_5"] == pytest.approx(0.0)
 
     def test_precision_at_5_two_hits(self):
@@ -145,7 +143,7 @@ class TestSingleQueryMetrics:
 
 class TestMultiQueryAggregation:
     def test_two_queries_source_hit_average(self):
-        """One hit, one miss → source_hit_at_5 = 0.5."""
+        """One hit, one miss → hit_at_5 = 0.5."""
         results = [
             {"query_id": "q1", "retrieved": ["c1"], "relevant": ["c1"]},
             {"query_id": "q2", "retrieved": ["cx"], "relevant": ["cy"]},
@@ -153,7 +151,7 @@ class TestMultiQueryAggregation:
         result = compute_all_metrics(results)
         assert result["num_queries"] == 2
         assert result["total_queries"] == 2
-        assert result["source_hit_at_5"] == pytest.approx(0.5)
+        assert result["hit_at_5"] == pytest.approx(0.5)
 
     def test_mixed_relevant_and_no_relevant(self):
         """Queries with empty relevant sets are excluded from metrics."""
@@ -174,7 +172,7 @@ class TestMultiQueryAggregation:
         ]
         result = compute_all_metrics(results)
         assert result["num_queries"] == 5
-        assert result["source_hit_at_5"] == pytest.approx(1.0)
+        assert result["hit_at_5"] == pytest.approx(1.0)
         assert result["mrr"] == pytest.approx(1.0)
 
     def test_all_misses(self):
@@ -184,7 +182,7 @@ class TestMultiQueryAggregation:
         ]
         result = compute_all_metrics(results)
         assert result["num_queries"] == 3
-        assert result["source_hit_at_5"] == pytest.approx(0.0)
+        assert result["hit_at_5"] == pytest.approx(0.0)
         assert result["mrr"] == pytest.approx(0.0)
 
 
@@ -201,8 +199,8 @@ class TestReturnSchema:
             "recall_at_10",
             "mrr",
             "ndcg_at_10",
-            "source_hit_at_5",
-            "source_hit_at_10",
+            "hit_at_5",
+            "hit_at_10",
             "capped_recall_at_5",
             "capped_recall_at_10",
             "precision_at_5",
@@ -213,6 +211,11 @@ class TestReturnSchema:
         assert expected_keys <= set(result.keys()), (
             f"Missing keys: {expected_keys - set(result.keys())}"
         )
+
+    def test_duplicate_query_id_raises(self):
+        results = _single("q1", ["c1"], ["c1"]) + _single("q1", ["c2"], ["c2"])
+        with pytest.raises(ValueError, match="duplicate query_id"):
+            compute_all_metrics(results)
 
     def test_all_metric_values_are_floats_or_int(self):
         results = _single("q1", ["c1", "c2"], relevant=["c1"])
@@ -231,7 +234,7 @@ class TestReturnSchema:
         result = compute_all_metrics(results)
         ratio_keys = [
             "recall_at_5", "recall_at_10", "mrr", "ndcg_at_10",
-            "source_hit_at_5", "source_hit_at_10",
+            "hit_at_5", "hit_at_10",
             "capped_recall_at_5", "capped_recall_at_10",
             "precision_at_5", "precision_at_10",
         ]
@@ -247,3 +250,52 @@ class TestReturnSchema:
         ]
         result = compute_all_metrics(results)
         assert result["num_queries"] <= result["total_queries"]
+
+
+# ---------------------------------------------------------------------------
+# Duplicate chunk ids: every metric must score the same (deduplicated) ranking
+# ---------------------------------------------------------------------------
+
+class TestDuplicateChunkIds:
+    @pytest.mark.parametrize("retrieved,relevant,mrr", [
+        (["x", "R", "x"], ["R"], 0.5),   # repeat must not push x below R
+        (["R", "x", "R"], ["R"], 1.0),   # repeat must not push R down
+    ])
+    def test_mrr_uses_first_occurrence(self, retrieved, relevant, mrr):
+        assert compute_all_metrics(_single("q", retrieved, relevant))["mrr"] == pytest.approx(mrr)
+
+    def test_recall_and_hit_agree_after_dedup(self):
+        # deduplicated ranking: a, b, c, R -> R at rank 4 (inside top-5)
+        res = compute_all_metrics(_single("q", ["a", "a", "b", "b", "c", "R"], ["R"]))
+        assert res["recall_at_5"] == pytest.approx(1.0)
+        assert res["hit_at_5"] == pytest.approx(1.0)
+        assert res["mrr"] == pytest.approx(0.25)
+
+    def test_duplicate_relevant_ids_count_once(self):
+        res = compute_all_metrics(_single("q", ["R", "x"], ["R", "R"]))
+        assert res["recall_at_5"] == pytest.approx(1.0)
+        assert res["capped_recall_at_5"] == pytest.approx(1.0)
+
+
+class TestArticleLevel:
+    def test_two_chunks_of_one_article_count_once(self):
+        from evaluation.retrieval_metrics import compute_article_metrics
+        mi = [{"query_id": "q",
+               "relevant_articles": ["TCK||86"],
+               # ranks: TCK 85 (two chunks) then TCK 86 -> article rank 2
+               "retrieved_articles": ["TCK||85", "TCK||86", "chunk::x"]}]
+        res = compute_article_metrics(mi)
+        assert res["mrr"] == pytest.approx(0.5) and res["hit_at_5"] == 1.0
+
+    def test_prepare_metric_input_maps_chunks_to_articles(self):
+        from types import SimpleNamespace
+        from pipeline.evaluation import prepare_metric_input
+        qa = [SimpleNamespace(query_id="q", source="TCK", madde_no="86"),
+              SimpleNamespace(query_id="r", source="TCK", madde_no=None)]
+        chunks = [[{"chunk_id": "a1"}, {"chunk_id": "a2"}, {"chunk_id": "b1"}, {"chunk_id": "z"}],
+                  [{"chunk_id": "b1"}]]
+        arts = {"a1": "TCK||85", "a2": "TCK||85", "b1": "TCK||86"}
+        mi, _ = prepare_metric_input(qa, chunks, {"q": ["b1"], "r": ["b1"]}, arts)
+        assert mi[0]["relevant_articles"] == ["TCK||86"]
+        assert mi[0]["retrieved_articles"] == ["TCK||85", "TCK||86", "chunk::z"]
+        assert mi[1]["relevant_articles"] == ["TCK||86"]  # from gold chunks

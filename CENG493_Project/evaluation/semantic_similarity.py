@@ -22,14 +22,6 @@ else:
     _DEVICE = "cpu"
 
 
-def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two 1-D vectors."""
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0.0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
-
-
 _DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 _DEFAULT_MAX_SEQ = 512
 
@@ -87,17 +79,13 @@ def compute_semantic_similarity(
         }
     """
     if not predictions:
-        return {"mean_similarity": 0.0, "per_sample": []}
+        return {"mean_similarity": None, "per_sample": []}
 
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
-        # Graceful degradation: return 0.0 scores rather than crashing the pipeline
-        per_sample = [
-            {"query_id": p.get("query_id", i), "similarity": 0.0}
-            for i, p in enumerate(predictions)
-        ]
-        return {"mean_similarity": 0.0, "per_sample": per_sample}
+        # Unknown, not zero: a 0.0 here would be scored as a real similarity.
+        return {"mean_similarity": None, "per_sample": []}
 
     try:
         import config as _cfg
@@ -114,7 +102,10 @@ def compute_semantic_similarity(
         except Exception:
             max_seq_length = limit
 
-    predicted_texts = [p.get("predicted", "") for p in predictions]
+    from evaluation.qa_metrics import strip_citations
+
+    # [Kaynak N] markers are not answer content
+    predicted_texts = [strip_citations(p.get("predicted", "")) for p in predictions]
     expected_texts  = [p.get("expected",  "") for p in predictions]
 
     pred_embs = _encode_long(model, predicted_texts, max_seq_length)
@@ -131,5 +122,5 @@ def compute_semantic_similarity(
             "similarity": sim,
         })
 
-    mean_sim = float(np.mean(similarities)) if similarities else 0.0
+    mean_sim = float(np.mean(similarities)) if similarities else None
     return {"mean_similarity": mean_sim, "per_sample": per_sample}

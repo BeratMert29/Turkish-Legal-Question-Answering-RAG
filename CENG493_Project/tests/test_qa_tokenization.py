@@ -24,23 +24,53 @@ def test_turkish_letters_kept_in_tokens():
     assert _tokenize("çağrı öğüt şiir") == ["çağrı", "öğüt", "şiir"]
 
 
-def test_rouge_fallback_uses_unicode_tokens(monkeypatch):
-    monkeypatch.setattr(qm, "_USE_HF_EVALUATE", False)
+def test_rouge_uses_unicode_tokens():
     assert rouge_l_score("Çocuk, okula gitti.", "çocuk okula gitti") == pytest.approx(1.0)
+    assert rouge_l_score("Çağrı yapıldı", "çağrı") == pytest.approx(2 * 0.5 * 1 / 1.5)
 
 
-def test_rouge_hf_path_receives_custom_tokenizer(monkeypatch):
-    seen = {}
+@pytest.mark.skipif(not qm._USE_SACREBLEU, reason="sacrebleu not installed")
+def test_bleu_and_chrf_match_sacrebleu_on_normalised_text():
+    import sacrebleu
+    pred, ref = "Süre BEŞ gündür, itiraz edilebilir.", "süre beş gündür"
+    norm_p, norm_r = "süre beş gündür itiraz edilebilir", "süre beş gündür"
+    assert qm.chrf_score(pred, ref) == pytest.approx(
+        sacrebleu.sentence_chrf(norm_p, [norm_r], word_order=2).score / 100)
+    agg = compute_all_qa_metrics([{"predicted": pred, "expected": ref}])
+    assert agg["bleu"] == pytest.approx(
+        sacrebleu.corpus_bleu([norm_p], [[norm_r]], tokenize="none").score / 100)
+    assert agg["lexical_impl"]["bleu"].startswith("sacrebleu")
 
-    class R:
-        def compute(self, **kw):
-            seen.update(kw)
-            return {"rougeL": 0.5}
 
-    monkeypatch.setattr(qm, "_USE_HF_EVALUATE", True)
-    monkeypatch.setattr(qm, "_ROUGE_METRIC", R(), raising=False)
-    assert rouge_l_score("Çağrı.", "çağrı") == 0.5
-    assert seen["tokenizer"]("Çağrı, ÖĞÜT") == ["çağrı", "öğüt"]
+def test_short_perfect_answer_bleu_is_not_zero():
+    if qm._USE_SACREBLEU:
+        assert qm.bleu_score("Ankara", "Ankara") == pytest.approx(1.0)
+
+
+def test_fallback_without_sacrebleu(monkeypatch):
+    monkeypatch.setattr(qm, "_USE_SACREBLEU", False)
+    assert qm.chrf_score("a b", "a b") is None
+    agg = compute_all_qa_metrics([{"predicted": "a b c d e", "expected": "a b c d e"}])
+    assert agg["bleu"] == pytest.approx(1.0) and agg["chrf"] is None
+    assert agg["lexical_impl"]["bleu"] == "fallback"
+
+
+def test_token_precision_recall_split_length_effect():
+    from evaluation.qa_metrics import token_prf
+    p, r, f = token_prf("süre beş gündür ve ayrıca uzun bir açıklama metni", "süre beş gündür")
+    assert r == 1.0 and p == pytest.approx(3 / 9) and f == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("pred,gold,em", [
+    ("Cevap: C) 25", "5", 0.0),            # "5" inside "25"
+    ("28/10/2023 tarihinde", "2", 0.0),    # "2" inside a date
+    ("Süre 5 gündür.", "5", 1.0),
+    ("Başkent Ankara'dır.", "Ankara", 1.0),
+    ("Türkiye Devleti bir Cumhuriyettir.", "bir cumhuriyettir", 1.0),
+])
+def test_exact_match_respects_token_boundaries(pred, gold, em):
+    from evaluation.qa_metrics import exact_match
+    assert exact_match(pred, gold) == em
 
 
 def test_answer_length_strips_citations():

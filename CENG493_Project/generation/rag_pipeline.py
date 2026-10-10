@@ -1,6 +1,6 @@
-import json
+import time
 from pathlib import Path
-import openai
+
 import config
 
 TURKISH_PROMPT = """Sen Türk hukuku alanında uzman bir hukuki asistansın. Görevin, yalnızca aşağıda numaralandırılmış [Kaynak N] bağlamlarını kullanarak soruyu eksiksiz ve doğru biçimde yanıtlamaktır.
@@ -30,6 +30,31 @@ ZORUNLU KURALLAR:
 6. Yanıtının hemen ardına, kullandığın kaynağın numarasını şu formatta ekle: [Kaynak 1]
 
 Yanıtını yalnızca Türkçe ver."""
+
+def format_source(i: int, source: str, text: str) -> str:
+    """One numbered context block, exactly as the generator sees it."""
+    return f"[Kaynak {i}] ({source})\n{text}\n\n"
+
+
+def user_message(question: str, context: str) -> str:
+    """User turn sent to the generator."""
+    return f"Bağlam:\n{context}\n\nSoru: {question}"
+
+
+_RUNAWAY_MARKERS = ("Soru:", "Bağlam:", "Question:", "\nQ:")
+
+
+def cut_runaway(content: str) -> tuple[str, bool]:
+    """Cut a generation at the first invented follow-up turn ("Soru:",
+    "Bağlam:", ...) after the first 10 characters.  Returns
+    ``(answer, was_cut)``."""
+    cut = len(content)
+    for marker in _RUNAWAY_MARKERS:
+        idx = content.find(marker)
+        if idx >= 10:
+            cut = min(cut, idx)
+    return content[:cut].strip(), cut < len(content)
+
 
 class ChunkExpander:
     """Merge chunk text with adjacent chunks (same chunk_id prefix) from metadata."""
@@ -120,23 +145,22 @@ class RAGPipeline:
         # Slots (out of top_k_for_generation) reserved for graph neighbours of
         # the top-ranked chunks; 0 disables the reservation.
         self.graph_neighbor_budget = graph_neighbor_budget
-        self._client = openai.OpenAI(
-            base_url=config.LLM_BASE_URL,
-            api_key=config.LLM_API_KEY,
-        )
-
-    def get_llm_client(self) -> openai.OpenAI:
-        """Ollama OpenAI-compatible client."""
-        return self._client
+        self._chat_url = config.LLM_BASE_URL.rstrip("/").removesuffix("/v1") + "/api/chat"
+        # Details of the last generate() call: done_reason ("stop"/"length"),
+        # output token count, whether a runaway "Soru:" continuation was cut.
+        self.last_meta: dict = {}
 
     def _select_for_generation(self, chunks: list) -> list:
         """Pick the generation context from a (possibly graph-expanded) ranking.
 
         Chunks flagged ``graph_neighbor`` come from GraphIndex.expand and sit
         right after their parent.  Up to ``graph_neighbor_budget`` of the
-        ``top_k_for_generation`` slots go to neighbours (preferring those whose
-        parent is among the kept top results); the rest go to the top-ranked
-        regular chunks.  List order (parent, then its neighbours) is kept.
+        ``top_k_for_generation`` slots go to neighbours of the kept top-ranked
+        chunks (or to directly injected article chunks, which have no parent);
+        the rest go to the top-ranked regular chunks.  A slot is reserved only
+        when such a neighbour exists, so a top-ranked chunk is never displaced
+        by a neighbour of a chunk that was not kept.  List order (parent, then
+        its neighbours) is kept.
         """
         k = self.top_k_for_generation
         budget = self.graph_neighbor_budget
@@ -144,14 +168,17 @@ class RAGPipeline:
         if budget <= 0 or not neighbours:
             return chunks[:k]
         regular = [c for c in chunks if not c.get("graph_neighbor")]
-        n_nb = min(budget, len(neighbours), max(k - 1, 0))
-        keep_regular = regular[:k - n_nb]
-        kept_ids = {c["chunk_id"] for c in keep_regular}
-        # neighbours of kept parents first (list order), then any others
-        preferred = [c for c in neighbours if c.get("graph_root") in kept_ids]
-        others = [c for c in neighbours if c not in preferred]
-        chosen = {id(c) for c in (preferred + others)[:n_nb]}
-        keep_ids = {id(c) for c in keep_regular} | chosen
+        keep_regular, chosen = regular[:k], []
+        # Largest reservation n that neighbours of the kept parents can fill.
+        for n_nb in range(min(budget, len(neighbours), max(k - 1, 0)), 0, -1):
+            cand_regular = regular[:k - n_nb]
+            kept_ids = {c["chunk_id"] for c in cand_regular}
+            eligible = [c for c in neighbours
+                        if c.get("graph_root") is None or c.get("graph_root") in kept_ids]
+            if len(eligible) >= n_nb:
+                keep_regular, chosen = cand_regular, eligible[:n_nb]
+                break
+        keep_ids = {id(c) for c in keep_regular} | {id(c) for c in chosen}
         return [c for c in chunks if id(c) in keep_ids]
 
     def assemble_context(self, chunks: list) -> tuple[str, list]:
@@ -166,7 +193,7 @@ class RAGPipeline:
                 if self._chunk_expander is not None
                 else chunk["text"]
             )
-            part = f"[Kaynak {i+1}] ({chunk['source']})\n{text}\n\n"
+            part = format_source(i + 1, chunk['source'], text)
             if i > 0 and running_len + len(part) > self.context_window_chars:
                 break
             parts.append(part)
@@ -175,29 +202,53 @@ class RAGPipeline:
         context = "".join(parts)
         return context, included
 
+    def _options(self) -> dict:
+        """Ollama options sent with every request.  num_ctx and the stop
+        sequences are explicit so the base and fine-tuned models use the same
+        window and stops regardless of the server's OLLAMA_CONTEXT_LENGTH or a
+        Modelfile; the seed makes sampling reproducible."""
+        return {
+            "temperature": self.temperature,
+            "num_predict": self._effective_max_tokens,
+            "num_ctx": config.LLM_NUM_CTX,
+            "seed": config.SEED,
+            "stop": list(config.LLM_STOP),
+        }
+
+    def _chat(self, messages: list[dict]) -> dict:
+        import requests
+
+        payload = {"model": self.model, "messages": messages, "stream": False,
+                   "options": self._options()}
+        last_exc: Exception | None = None
+        for attempt in range(config.LLM_MAX_RETRIES):
+            try:
+                resp = requests.post(self._chat_url, json=payload,
+                                     timeout=config.LLM_TIMEOUT_S)
+                resp.raise_for_status()
+                return resp.json()
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_exc = exc
+                time.sleep(2.0 * (attempt + 1))
+        raise RuntimeError(f"Ollama chat failed after {config.LLM_MAX_RETRIES} attempts: {last_exc}")
+
     def generate(self, question: str, context: str) -> str:
-        """Single chat completion."""
-        response = self._client.chat.completions.create(
-            model=self.model,
-            temperature=self.temperature,
-            max_tokens=self._effective_max_tokens,
-            messages=[
-                {"role": "system", "content": self._system_prompt},
-                {"role": "user", "content": f"Bağlam:\n{context}\n\nSoru: {question}"},
-            ],
-        )
-        if not response.choices:
-            raise ValueError("LLM returned empty choices list")
-        content = response.choices[0].message.content
+        """Single chat completion via Ollama's native /api/chat."""
+        data = self._chat([
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": user_message(question, context)},
+        ])
+        content = (data.get("message") or {}).get("content", "")
         if not content:
             raise ValueError("LLM returned empty response")
-        cut = len(content)
-        for marker in ["Soru:", "Bağlam:", "Question:", "\nQ:"]:
-            idx = content.find(marker)
-            if idx != -1 and idx >= 10:
-                cut = min(cut, idx)
-        content = content[:cut]
-        return content.strip()
+        cleaned, runaway = cut_runaway(content)
+        self.last_meta = {
+            "done_reason": data.get("done_reason"),
+            "output_tokens": data.get("eval_count"),
+            "prompt_tokens": data.get("prompt_eval_count"),
+            "runaway_cut": runaway,
+        }
+        return cleaned
 
     def run(self, question: str, top_k_retrieval: int = config.TOP_K_RETRIEVAL) -> dict:
         """Retrieve, assemble context, generate."""

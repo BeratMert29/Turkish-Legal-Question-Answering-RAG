@@ -161,7 +161,6 @@ class TestArticleChunk:
 
     def test_oversized_article_sub_chunks_share_madde_no(self):
         """When an article exceeds CHUNK_SIZE, all its sub-chunks share madde_no."""
-        import config
         long_article = "MADDE 99- " + ("uzun metin içeriği. " * 500)
         chunks = DataProcessor._article_chunk(long_article, "kaggle_x", "BigSource")
         # All sub-chunks should have the same madde_no
@@ -216,3 +215,101 @@ class TestContinuationChunks:
         rel = DataProcessor.build_relevant_chunk_map(legacy, qa)["q"]
         nine = [c.chunk_id for c in parts if c.madde_no == "9"]
         assert len(nine) >= 2 and rel == nine
+
+    def test_article_tail_before_next_heading_is_labelled_for_both(self):
+        # character chunks: chunk 2 starts with the end of article 94's body
+        legacy = [
+            CorpusChunk("c1", "d", "MADDE 94- (1) Hüküm metni burada başlar.", "L", 40),
+            CorpusChunk("c2", "d", "(3) Tutuklama kararı gerekçeli olarak verilir ve "
+                        "şüpheliye ile müdafiine derhâl yazılı olarak bildirilir; "
+                        "itiraz yolu açıktır.\n"
+                        "MADDE 95- (1) Sonraki hüküm.", "L", 140),
+        ]
+        qa = [{"query_id": "q", "question": "", "answer": "", "context": "",
+               "source": "L", "madde_no": "94"}]
+        assert DataProcessor.build_relevant_chunk_map(legacy, qa)["q"] == ["c1", "c2"]
+
+    def test_title_lead_is_not_a_tail_of_the_previous_article(self):
+        legacy = [
+            CorpusChunk("c1", "d", "MADDE 1- Hüküm.", "L", 15),
+            CorpusChunk("c2", "d", "I. Devletin şekli\nMadde 2 – Diğer hüküm.", "L", 40),
+        ]
+        qa = [{"query_id": "q", "question": "", "answer": "", "context": "",
+               "source": "L", "madde_no": "1"}]
+        assert DataProcessor.build_relevant_chunk_map(legacy, qa)["q"] == ["c1"]
+
+
+# ---------------------------------------------------------------------------
+# Article boundaries on real code layout (title above the heading)
+# ---------------------------------------------------------------------------
+
+_LAW = """BİRİNCİ KISIM
+Genel Hükümler
+
+Devletin şekli
+Madde 1 – Türkiye Devleti bir Cumhuriyettir.
+
+Cumhuriyetin nitelikleri
+Madde 2 – Türkiye Cumhuriyeti, toplumun huzuru, millî dayanışma ve adalet anlayışı içinde, insan haklarına saygılı, Atatürk milliyetçiliğine bağlı, başlangıçta belirtilen temel ilkelere dayanan, demokratik, lâik ve sosyal bir hukuk Devletidir.
+
+Geçiş hükmü
+Geçici Madde 1 – Bu Kanunun yürürlüğe girdiği tarihte görevde bulunanlar görevlerine devam eder.
+"""
+
+
+class TestArticleBoundaries:
+    def _chunks(self, text=_LAW):
+        return DataProcessor._article_chunk(text, "d", "Anayasa")
+
+    def test_title_belongs_to_its_own_article(self):
+        by = {c.madde_no: c.text for c in self._chunks()}
+        assert by["2"].startswith("Cumhuriyetin nitelikleri\nMadde 2")
+        assert "Cumhuriyetin nitelikleri" not in by["1"]
+        assert by["1"].rstrip().endswith("Cumhuriyettir.")
+
+    def test_section_headers_go_with_the_first_article(self):
+        first = self._chunks()[0]
+        assert first.madde_no == "1"
+        assert first.text.startswith("BİRİNCİ KISIM\nGenel Hükümler")
+
+    def test_short_article_is_kept(self):
+        assert "1" in {c.madde_no for c in self._chunks()}
+
+    def test_gecici_madde_is_its_own_chunk(self):
+        by = {c.madde_no: c.text for c in self._chunks()}
+        assert by["gecici-1"].startswith("Geçiş hükmü\nGeçici Madde 1")
+        assert "Geçici Madde" not in by["2"]
+
+    def test_letter_glued_to_dash_is_not_a_suffix(self):
+        assert _madde_no_from_text("Madde 605-Yasal ve atanmış mirasçılar") == "605"
+        assert _madde_no_from_text("MADDE 6/A – (Ek) Hüküm") == "6-a"
+
+    @pytest.mark.parametrize("line", [
+        "Madde 3 14/4/2011",      # amendment table row
+        "MADDE 1,",
+        "Madde 9, Geçici",
+        "Madde 5 uyarınca işlem yapılır.",
+    ])
+    def test_amendment_rows_and_references_are_not_headings(self, line):
+        assert _madde_no_from_text(line) is None
+
+    def test_mukerrer_madde(self):
+        assert _madde_no_from_text("Mükerrer\nMadde 30 – (Ek: 1963)") == "mukerrer-30"
+
+    def test_short_trailing_sub_chunk_merged_into_previous(self):
+        body = "Madde 9 – " + ("Uzun bir fıkra metni. " * 80) + "Son."
+        chunks = DataProcessor._article_chunk(body, "d", "S")
+        assert all(c.madde_no == "9" for c in chunks)
+        assert all(len(c.text) >= 180 for c in chunks)
+        assert chunks[-1].text.rstrip().endswith("Son.")
+
+
+def test_consecutive_repealed_articles_are_not_cut_inside_a_heading():
+    text = ("A. Kuruluş\n\nMadde 109 – (Mülga: 21/1/2017-6771/16 md.)\n\n \n\n"
+            "B. Göreve başlama\n\nMadde 110 – (Mülga: 21/1/2017-6771/16 md.)\n\n"
+            "C. Görev\n\nMadde 111 – Hüküm metni burada yer alır.")
+    by = {c.madde_no: c.text for c in DataProcessor._article_chunk(text, "d", "A")}
+    assert by["109"].startswith("A. Kuruluş\n\nMadde 109")
+    assert by["110"].startswith("B. Göreve başlama\n\nMadde 110")
+    assert by["111"].startswith("C. Görev\n\nMadde 111")
+    assert all("\nadde" not in t and not t.startswith("adde") for t in by.values())

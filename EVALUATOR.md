@@ -132,19 +132,23 @@ PYTHONUTF8=1 python scripts/14_eval_all_stages.py \
 
 ## Output
 
-Results are written under:
+Results are written under one directory per run (`external_<benchmark file
+name>` for `--eval-data`, plus `_limitN` with `--limit`):
 
 ```
-CENG493_Project/results/
-├── ablation_summary.json
-├── stage_base/
-├── stage_reranker/          # rrf_rerank
-├── stage_emb_finetuned/     # emb_ft
-├── stage_llm_finetuned/     # llm_ft
-└── stage_full_optimized/    # full
+CENG493_Project/results/external_gold_benchmark/
+├── ablation_summary.json    # all stages + paired stage comparisons
+├── base/
+├── rrf_rerank/
+├── emb_ft/
+├── llm_ft/
+└── full/
 ```
 
-Each stage folder contains `baseline_metrics.json` (retrieval, QA, faithfulness, rubric scenario scores).
+Each stage folder contains `baseline_metrics.json` (retrieval, QA, faithfulness,
+citations, judge, rubric scenario scores, provenance), `predictions.jsonl` and
+`per_query.jsonl`.  A stage with too many failed generations is written to
+`<stage>_FAILED/` instead.
 
 ---
 

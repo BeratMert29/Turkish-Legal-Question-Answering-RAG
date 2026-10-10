@@ -21,7 +21,7 @@ from generation.rag_pipeline import TURKISH_PROMPT
 
 HF_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 QLORA_MODEL_ID = config.LORA_BASE_HF_MODEL  # 7B; matches config.LLM_BASE_FOR_ABLATION
-ADAPTER_DIR = config.BASE_DIR / "models" / "qwen25_lora"
+ADAPTER_DIR = config.LORA_ADAPTER_DIR
 
 RAG_DATASET    = config.PROCESSED_DIR / "qa_train_rag.jsonl"
 MERGED_DATASET = config.PROCESSED_DIR / "qa_train_merged.jsonl"
@@ -313,6 +313,8 @@ def main() -> None:
         max_grad_norm=0.0,
         gradient_checkpointing=tc["gradient_checkpointing"],
         dataloader_num_workers=tc["dataloader_num_workers"],
+        seed=config.SEED,
+        data_seed=config.SEED,
         dataloader_pin_memory=False,
         # SFT-specific fields live here in TRL 1.x
         dataset_text_field=tc["dataset_text_field"],
@@ -338,7 +340,7 @@ def main() -> None:
     with open(config_out_path, "w", encoding="utf-8") as f:
         json.dump(TRAINING_CONFIG, f, ensure_ascii=False, indent=2)
 
-    print(f"\nTraining complete.")
+    print("\nTraining complete.")
     print(f"  Adapter saved to       : {ADAPTER_DIR}")
     print(f"  Training config saved  : {config_out_path}")
     print("\nFinal GPU memory:")

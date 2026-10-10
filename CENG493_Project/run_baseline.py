@@ -100,12 +100,12 @@ def _parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def build_index(processor, embedder, chunks=None, holdout=False):
+def build_index(processor, embedder, chunks=None):
     from retrieval.retriever import Retriever
 
     if chunks is None:
         log.info("Building corpus chunks …")
-        chunks = list(processor.build_corpus_chunks(holdout=holdout))
+        chunks = list(processor.build_corpus_chunks())
     log.info("  %d chunks total", len(chunks))
 
     texts = [c.text for c in chunks]
@@ -166,12 +166,12 @@ def main() -> None:
     if args.corpus and args.docs_path:
         sys.exit("ERROR: --corpus and --docs-path are mutually exclusive")
 
-    from data.data_processor import DataProcessor, CorpusChunk
+    from data.data_processor import DataProcessor
     from pipeline.data_loading import load_external_corpus, load_external_qa
     from pipeline.retrieval import retrieve
     from utils import set_seeds, check_ollama
 
-    set_seeds(42)
+    set_seeds(config.SEED)
 
     # -- Load corpus and QA data -------------------------------------------
     short_answer_mode: bool = False
@@ -193,10 +193,7 @@ def main() -> None:
         summary = processor.load_and_validate()
         log.info("Dataset summary: %s", summary)
         log.info("Building corpus chunks for reuse …")
-        # Eval rows are held out of the index only for the Kaggle-split eval set.
-        corpus_chunks = list(processor.build_corpus_chunks(
-            holdout=(args.eval_set == "kaggle" and not args.hmgs)
-        ))
+        corpus_chunks = list(processor.build_corpus_chunks())
 
     from retrieval.embedder import Embedder
 
@@ -210,6 +207,18 @@ def main() -> None:
         )
     else:
         retriever = load_index(embedder)
+        # Gold labels, BM25 and the graph are built from corpus_chunks; an
+        # index built from another corpus (another chunker or corpus file)
+        # silently makes gold chunks unretrievable.
+        # Chunk ids are positional, so compare ids AND texts: a re-chunked
+        # corpus can reuse every id for different text.
+        from utils import corpus_fingerprint
+        if corpus_fingerprint(retriever.metadata) != corpus_fingerprint(corpus_chunks):
+            sys.exit(
+                f"ERROR: the saved index ({len(retriever.metadata)} chunks, "
+                f"{config.INDEX_DIR}) does not match this run's corpus "
+                f"({len(corpus_chunks)} chunks).\n  Re-run with --build-index."
+            )
 
     graph_index = None
     if args.graph:
@@ -330,16 +339,11 @@ def main() -> None:
     retrieval_time = round(time.time() - t0, 2)
 
     from evaluation.retrieval_metrics import compute_all_metrics
+    from pipeline.evaluation import prepare_metric_input
 
-    results_list = []
-    for qa, retrieved_chunks in zip(qa_examples, all_retrieved):
-        results_list.append({
-            "query_id": qa.query_id,
-            "retrieved": [c["chunk_id"] for c in retrieved_chunks],
-            "relevant": relevant_map.get(qa.query_id, []),
-            "retrieved_chunks": [dict(c) for c in retrieved_chunks],
-        })
-
+    # Same metric input as scripts/14: pre-expansion ranking (graph neighbours
+    # excluded), deduplicated chunk ids.
+    results_list, _ = prepare_metric_input(qa_examples, all_retrieved, relevant_map)
     retrieval_metrics = compute_all_metrics(results_list)
     retrieval_metrics["retrieval_time_s"] = retrieval_time
     log.info("Retrieval metrics: %s", retrieval_metrics)

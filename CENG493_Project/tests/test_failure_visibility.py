@@ -115,8 +115,7 @@ def test_empty_retrieved_scores_zero():
 
 # --- BLEU fallback ----------------------------------------------------------
 
-def test_bleu_uses_fallback_not_stub():
+def test_bleu_is_a_real_number_not_a_stub():
     from evaluation import qa_metrics
-    assert qa_metrics._USE_HF_EVALUATE is False
     assert qa_metrics.bleu_score("tamamen farklı kelimeler burada", "bambaşka cümle yok ki") < 0.5
     assert 0.0 <= qa_metrics.bleu_score("a b c d e", "a b c d e") <= 1.0

@@ -1,5 +1,9 @@
 """Evaluation orchestration for RAG pipeline stages.
 
+Metric input / per-query records live in ``pipeline.metric_input`` and the
+ablation tables / stage comparisons in ``pipeline.report``; both are
+re-exported here.
+
 Every import of heavy modules (torch, sentence_transformers, evaluation.*,
 generation.*, retrieval.*) is deferred to function bodies so the module
 loads on a CPU-only / light-deps test environment.
@@ -16,11 +20,17 @@ from typing import Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     from pipeline.stages import StageConfig
-    from retrieval.bm25_retriever import BM25Index
-    from retrieval.embedder import Embedder
-    from retrieval.reranker import Reranker
-    from retrieval.retriever import Retriever
-    from retrieval.graph_index import GraphIndex
+
+
+# Re-exported so existing imports from pipeline.evaluation keep working.
+from pipeline.metric_input import (  # noqa: F401
+    _CI_METRICS, _retrieval_per_query, build_per_query, chunk_article_map,
+    compute_confidence_intervals, prepare_metric_input,
+)
+from pipeline.report import (  # noqa: F401
+    ABLATION_PAIRS, COMPARISON_METRICS, compare_stages, headline_mode,
+    print_ablation_table, print_comparison_table,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -50,47 +60,6 @@ def evict_model_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Metric-input preparation
-# ---------------------------------------------------------------------------
-
-def prepare_metric_input(
-    qa_examples,
-    retrieved_all: list[list[dict]],
-    relevant_map: dict,
-) -> tuple[list[dict], dict[str, list]]:
-    """Build the metric_input list and full_retrieved map from retrieval results.
-
-    Returns
-    -------
-    tuple[list[dict], dict[str, list]]
-        ``(metric_input, full_retrieved)``
-    """
-    metric_input: list[dict] = []
-    full_retrieved: dict[str, list] = {}
-
-    for qa, chunks in zip(qa_examples, retrieved_all):
-        # Retrieval metrics use the pre-expansion ranking: graph neighbours
-        # (flagged ``graph_neighbor``) are spliced in only to feed generation.
-        ranked = [c for c in chunks if not c.get("graph_neighbor")]
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for c in ranked:
-            if c["chunk_id"] not in seen:
-                seen.add(c["chunk_id"])
-                deduped.append(c["chunk_id"])
-        metric_input.append({
-            "query_id": qa.query_id,
-            "relevant": relevant_map.get(qa.query_id, []),
-            "retrieved": deduped,
-            "source_law": qa.source,
-            "retrieved_sources": [c.get("source", "") for c in ranked],
-        })
-        full_retrieved[qa.query_id] = chunks
-
-    return metric_input, full_retrieved
-
-
-# ---------------------------------------------------------------------------
 # Generation loop
 # ---------------------------------------------------------------------------
 
@@ -117,6 +86,7 @@ def run_generation_loop(
         try:
             ctx, ctx_chunks = pipeline.assemble_context(chunks)
             native_answer = pipeline.generate(qa.question, ctx)
+            meta = getattr(pipeline, "last_meta", None) or {}
             answer = native_answer
             if inject_citations_fn is not None:
                 answer = inject_citations_fn(native_answer, ctx_chunks)
@@ -131,6 +101,10 @@ def run_generation_loop(
                 "retrieved_sources": [c["source"] for c in ctx_chunks],
                 "expected_source": qa.source,
                 "retrieved_chunks": [dict(c) for c in ctx_chunks],
+                # hit max_tokens / an invented "Soru:" turn was cut off
+                "truncated": meta.get("done_reason") == "length",
+                "runaway_cut": bool(meta.get("runaway_cut")),
+                "output_tokens": meta.get("output_tokens"),
             })
         except Exception as exc:
             print(f"\n    ERROR on {qa.query_id}: {exc}")
@@ -165,20 +139,22 @@ def failure_rate_exceeded(failed: int, total: int, max_rate: float) -> bool:
 def run_hallucination_eval(
     predictions: list[dict],
     full_retrieved: dict[str, list],
-    sample_size: int,
+    sample_size: Optional[int],
     *,
     nli_model=None,
     llm_model: Optional[str] = None,
     gold_info: Optional[dict[str, dict]] = None,
-) -> tuple[dict, float, Any]:
+) -> tuple[dict, Optional[float], Any]:
     """Run hallucination analysis.
 
-    Loads NLI model if *nli_model* is ``None``.  Frees VRAM from the generation
+    *full_retrieved* maps query_id to the premise chunks, i.e. the context
+    the generator saw for that query.  *sample_size* None scores every
+    prediction.  Loads NLI model if *nli_model* is ``None``.  Frees VRAM from the generation
     LLM before loading the NLI cross-encoder.
 
     Returns
     -------
-    tuple[dict, float, Any]
+    tuple[dict, Optional[float], Any]
         ``(hallucination_result, faithful_rate, nli_model)``
     """
     import gc
@@ -226,12 +202,14 @@ def run_hallucination_eval(
         for p in predictions
     ]
     sample = stratified_sample(strat_input, sample_size)
-    hall = run_hallucination_analysis(sample, full_retrieved, nli_model)
+    hall = run_hallucination_analysis(
+        sample, full_retrieved, nli_model, threshold=config.NLI_SUPPORT_THRESHOLD,
+    )
 
-    # Faithfulness headline = NLI of the answer against its RETRIEVED context
-    # (context_grounding_rate); the gold-answer entailment rate is reported
-    # separately in hallucination_summary.
-    faithful_rate = hall["summary"].get("context_grounding_rate", 0.0)
+    # Faithfulness headline = mean fraction of answer sentences entailed by the
+    # context the generator saw; gold claim recall is reported separately in
+    # hallucination_summary.
+    faithful_rate = hall["summary"].get("context_supported_sentence_rate")
 
     return hall, faithful_rate, nli_model
 
@@ -359,7 +337,12 @@ def run_llm_judge_eval(
         "coherence": coher_result.get("parse_fail_count", 0),
     }
 
-    _all = (judge_result, faith_result, relev_result, coher_result)
+    _named = {"answer": judge_result, "faithfulness": faith_result,
+              "relevancy": relev_result, "coherence": coher_result}
+    result["call_failures"] = {k: r.get("call_fail_count", 0) for k, r in _named.items()}
+    result["score_failures_as_zero"] = {
+        k: r.get("score_failures_as_zero") for k, r in _named.items()}
+    _all = tuple(_named.values())
     result["failure_count"] = sum(r.get("parse_fail_count", 0) for r in _all)
     result["call_count"] = sum(r.get("sample_size", 0) for r in _all)
 
@@ -384,100 +367,32 @@ def run_llm_judge_eval(
 
 
 # ---------------------------------------------------------------------------
-# Per-query arrays and confidence intervals
+# Citation metrics, gold info
 # ---------------------------------------------------------------------------
 
-def _retrieval_per_query(metric_input: list[dict]) -> dict[str, dict]:
-    """Per-query recall@5/10, reciprocal rank (gold-labeled queries only) and
-    source-hit@5 (queries with a known gold law)."""
-    from utils import normalize_turkish
+def _add_citation_metrics(qa_metrics: dict, predictions: list[dict],
+                          metric_input: list[dict], chunk_articles: dict) -> None:
+    """Article-level citation precision/recall (native and injected) into
+    ``qa_metrics["citation_article_level"]``; per-query values are attached
+    to the predictions as ``cite_precision_native`` / ``cite_recall_native``."""
+    from evaluation.citation_metrics import compute_citation_metrics
 
-    out: dict[str, dict] = {}
-    for m in metric_input:
-        rel = set(m.get("relevant") or [])
-        ranked = m.get("retrieved", [])
-        rec: dict = {"recall_at_5": None, "recall_at_10": None,
-                     "reciprocal_rank": None, "source_hit_at_5": None}
-        if rel:
-            rec["recall_at_5"] = len(rel & set(ranked[:5])) / len(rel)
-            rec["recall_at_10"] = len(rel & set(ranked[:10])) / len(rel)
-            first = next((i for i, c in enumerate(ranked, 1) if c in rel), None)
-            rec["reciprocal_rank"] = 1.0 / first if first else 0.0
-        gold = normalize_turkish(str(m.get("source_law") or "").strip())
-        if gold:
-            srcs = [normalize_turkish(str(x).strip())
-                    for x in m.get("retrieved_sources", [])[:5]]
-            rec["source_hit_at_5"] = float(gold in srcs)
-        out[str(m["query_id"])] = rec
-    return out
+    gold = {str(m["query_id"]): m.get("relevant_articles") or [] for m in metric_input}
+    summary, per_query = compute_citation_metrics(predictions, gold, chunk_articles)
+    qa_metrics["citation_article_level"] = summary
+    for p in predictions:
+        p.update(per_query.get(str(p.get("query_id")), {}))
+    nat = summary.get("native") or {}
+    print(f"    Citations (article, native): precision={_fmt_opt(nat.get('precision'))} "
+          f"vs random={_fmt_opt(nat.get('random_precision'))}  "
+          f"recall={_fmt_opt(nat.get('recall'))}  presence={_fmt_opt(nat.get('presence_rate'))}")
 
 
-def build_per_query(
-    all_predictions: list[dict],
-    metric_input: list[dict],
-    hall: dict,
-    sem_per_sample: list[dict],
-    judge: dict,
-) -> list[dict]:
-    """One record per query merging retrieval, QA, similarity, NLI and judge
-    scores (None where a metric was not computed for that query)."""
-    from evaluation.qa_metrics import compute_per_query_qa_metrics
-
-    qa_rows = {r["query_id"]: r for r in compute_per_query_qa_metrics(all_predictions)}
-    ret_rows = _retrieval_per_query(metric_input)
-    sem = {str(r.get("query_id")): r.get("similarity") for r in sem_per_sample}
-    nli = {str(r.get("query_id")): r for r in hall.get("per_sample", [])}
-    judge_ps = judge.get("per_sample") or {}
-    judge_by = {
-        name: {str(r.get("query_id")): r.get("score") for r in rows}
-        for name, rows in judge_ps.items()
-    }
-
-    records = []
-    for p in all_predictions:
-        qid = str(p["query_id"])
-        q = qa_rows.get(p["query_id"], {})
-        n = nli.get(qid, {})
-        rec = {
-            "query_id": qid,
-            "generation_failed": not p.get("predicted"),
-            **ret_rows.get(qid, {}),
-            **{k: q.get(k) for k in ("em", "f1", "rouge_l", "bleu",
-                                      "answer_containment", "answer_len_words")},
-            "semantic_similarity": sem.get(qid),
-            "nli_context_grounding": n.get("context_grounding_score"),
-            "nli_gold_entailment": n.get("answer_faithfulness_score"),
-            "hallucination_category": n.get("category"),
-        }
-        for name, by in judge_by.items():
-            rec[f"judge_{name}"] = by.get(qid)
-        records.append(rec)
-    return records
-
-
-_CI_METRICS = (
-    "recall_at_5", "recall_at_10", "reciprocal_rank", "source_hit_at_5",
-    "f1", "rouge_l", "answer_containment", "em", "semantic_similarity",
-    "nli_context_grounding", "judge_answer", "judge_faithfulness",
-    "judge_relevancy", "judge_coherence",
-)
-
-
-def compute_confidence_intervals(per_query: list[dict]) -> dict[str, dict]:
-    """95% bootstrap CI of the mean for each per-query metric."""
-    from evaluation.stats import bootstrap_ci
-
-    return {
-        m: bootstrap_ci([r.get(m) for r in per_query])
-        for m in _CI_METRICS
-        if any(r.get(m) is not None for r in per_query)
-    }
-
-
-def _gold_info(qa_examples, retrieved_all, relevant_map):
+def _gold_info(qa_examples, retrieved_all, relevant_map, chunk_articles=None):
     """``(metric_input, gold_info)``; gold_info maps str(query_id) to the
     relevant/retrieved ids used to stratify hallucination by hit@k."""
-    metric_input, _ = prepare_metric_input(qa_examples, retrieved_all, relevant_map)
+    metric_input, _ = prepare_metric_input(
+        qa_examples, retrieved_all, relevant_map, chunk_articles)
     gold_info = {
         str(m["query_id"]): {"relevant": m["relevant"], "retrieved": m["retrieved"]}
         for m in metric_input
@@ -621,33 +536,21 @@ def _build_stage_components(
             reranker_cache["reranker"] = r
         reranker = reranker_cache["reranker"]
 
-    # Graph index — validate JSON before loading; rebuild if corrupt
+    # Graph index -- built in memory from this run's corpus (not from a saved
+    # graph.json / metadata.jsonl, whose chunk ids may belong to another
+    # chunking of the corpus).
     graph_index = None
     if stage.use_graph:
         if "graph_index" not in reranker_cache:
             from retrieval.graph_index import GraphIndex
 
-            graph_path = config.INDEX_DIR / config.GRAPH_FILE
-            meta_path = config.INDEX_DIR / config.METADATA_FILE
-            if not meta_path.exists():
-                meta_path = (
-                    config.BASE_DIR.parent / "results" / "index"
-                    / config.METADATA_FILE
-                )
-            if graph_path.exists() and meta_path.exists():
-                try:
-                    with open(graph_path, encoding="utf-8") as _gf:
-                        json.load(_gf)
-                except (json.JSONDecodeError, OSError):
-                    print(f"  WARNING: graph.json corrupt at {graph_path}; rebuilding …")
-                    from pipeline.retrieval import auto_build_graph
-                    auto_build_graph(graph_path)
-                if graph_path.exists():
-                    print(f"  Loading graph index: {graph_path}")
-                    reranker_cache["graph_index"] = GraphIndex(graph_path, meta_path)
-            else:
-                print(f"  WARNING: graph.json not found at {graph_path}")
-        graph_index = reranker_cache.get("graph_index")
+            print("  Building graph index from the corpus …")
+            reranker_cache["graph_index"] = GraphIndex.from_metadata([
+                {"chunk_id": c.chunk_id, "doc_id": c.doc_id, "text": c.text,
+                 "source": c.source, "madde_no": getattr(c, "madde_no", None)}
+                for c in corpus_chunks
+            ])
+        graph_index = reranker_cache["graph_index"]
 
     llm_model = (
         config.LLM_FINETUNED_MODEL
@@ -726,7 +629,9 @@ def _run_generation_and_qa(
         f"ROUGE-L={qa_metrics.get('rouge_l', 0):.4f}  "
         f"Cite(native)={_fmt_opt(qa_metrics.get('citation_accuracy_native'))}  "
         f"Cite(injected)={_fmt_opt(qa_metrics.get('citation_accuracy_injected'))}  "
-        f"AnsLen={qa_metrics.get('mean_answer_len_words', 0):.1f}w"
+        f"AnsLen={qa_metrics.get('mean_answer_len_words', 0):.1f}w  "
+        f"Truncated={_fmt_opt(qa_metrics.get('truncated_rate'))}  "
+        f"RunawayCut={_fmt_opt(qa_metrics.get('runaway_cut_rate'))}"
     )
     return (
         predictions, n_total, len(failed), n_errors, gen_failed, qa_metrics,
@@ -746,8 +651,12 @@ def _run_retrieval_phase(
     reranker,
     graph_index,
     relevant_map: dict,
+    chunk_articles: Optional[dict[str, str]] = None,
 ) -> tuple[list[list[dict]], dict, dict, dict[str, list]]:
     """Run retrieval and compute retrieval + source-hit metrics.
+
+    With *chunk_articles* ``retrieval_metrics["article_level"]`` holds the
+    article-level (chunker-independent) metrics.
 
     Returns
     -------
@@ -755,7 +664,9 @@ def _run_retrieval_phase(
         ``(retrieved_all, retrieval_metrics, source_metrics, full_retrieved)``
     """
     from pipeline.retrieval import retrieve
-    from evaluation.retrieval_metrics import compute_all_metrics, compute_source_hit_metrics
+    from evaluation.retrieval_metrics import (
+        compute_all_metrics, compute_article_metrics, compute_source_hit_metrics,
+    )
 
     print(
         f"  Retrieval ({stage.retrieval}, rerank={stage.use_rerank}, "
@@ -770,9 +681,17 @@ def _run_retrieval_phase(
     )
 
     metric_input, full_retrieved = prepare_metric_input(
-        qa_examples, retrieved_all, relevant_map,
+        qa_examples, retrieved_all, relevant_map, chunk_articles,
     )
     retrieval_metrics = compute_all_metrics(metric_input)
+    if chunk_articles is not None:
+        art = compute_article_metrics(metric_input)
+        retrieval_metrics["article_level"] = art
+        print(
+            f"    [article-level n={art['num_queries']}]  "
+            f"Hit@5={_fmt_opt(art['hit_at_5'])}  Hit@10={_fmt_opt(art['hit_at_10'])}  "
+            f"MRR={_fmt_opt(art['mrr'])}  nDCG@10={_fmt_opt(art['ndcg_at_10'])}"
+        )
     source_metrics = compute_source_hit_metrics(metric_input)
 
     _n_src = source_metrics.get("source_labeled_queries", 0)
@@ -786,10 +705,10 @@ def _run_retrieval_phase(
     )
     print(
         f"    [chunk-level, gold-labeled subset n={_n_gold}]  "
-        f"R@5={retrieval_metrics.get('recall_at_5', 0):.4f}  "
-        f"R@10={retrieval_metrics.get('recall_at_10', 0):.4f}  "
-        f"MRR={retrieval_metrics.get('mrr', 0):.4f}  "
-        f"nDCG@10={retrieval_metrics.get('ndcg_at_10', 0):.4f}"
+        f"R@5={_fmt_opt(retrieval_metrics.get('recall_at_5'))}  "
+        f"R@10={_fmt_opt(retrieval_metrics.get('recall_at_10'))}  "
+        f"MRR={_fmt_opt(retrieval_metrics.get('mrr'))}  "
+        f"nDCG@10={_fmt_opt(retrieval_metrics.get('ndcg_at_10'))}"
     )
     return retrieved_all, retrieval_metrics, source_metrics, full_retrieved
 
@@ -797,8 +716,9 @@ def _run_retrieval_phase(
 def _run_supplemental_metrics(
     predictions: list[dict],
     llm_model: str,
+    short_answer_mode: bool = False,
 ) -> tuple[Optional[float], dict]:
-    """Compute perplexity and RAGAS scores.
+    """Compute perplexity (generator weights) and RAGAS scores (judge LLM).
 
     Returns
     -------
@@ -807,27 +727,30 @@ def _run_supplemental_metrics(
     """
     import config as _config
 
-    print("  Perplexity …")
     perplexity_score = None
-    try:
-        from evaluation.perplexity import compute_perplexity
-
-        perplexity_score = compute_perplexity(
-            predictions, model=llm_model,
-            hf_model_id=_config.HF_PERPLEXITY_MODEL,
-        )
-    except Exception as exc:
-        print(f"    Perplexity=N/A ({exc.__class__.__name__}: {exc})")
+    if not _config.PERPLEXITY_ENABLED:
+        print("  Perplexity skipped (config.PERPLEXITY_ENABLED=False)")
     else:
-        if perplexity_score is not None:
-            print(f"    Perplexity={perplexity_score:.2f}")
+        print("  Perplexity …")
+        try:
+            from evaluation.perplexity import compute_perplexity
+
+            perplexity_score = compute_perplexity(
+                predictions, model=llm_model,
+                hf_model_id=_config.HF_PERPLEXITY_MODEL,
+                sample_size=_config.PERPLEXITY_SAMPLE_SIZE,
+                max_tokens=_config.PERPLEXITY_MAX_TOKENS,
+                short_answer_mode=short_answer_mode,
+            )
+        except Exception as exc:
+            print(f"    Perplexity=N/A ({exc.__class__.__name__}: {exc})")
         else:
-            print("    Perplexity=N/A (logprobs not supported)")
+            print(f"    Perplexity={_fmt_opt(perplexity_score)}")
 
     print("  RAGAS metrics …")
     from evaluation.ragas_metrics import compute_ragas_metrics
 
-    ragas_scores = compute_ragas_metrics(predictions, llm_model=llm_model)
+    ragas_scores = compute_ragas_metrics(predictions, llm_model=_config.LLM_JUDGE_MODEL)
     if ragas_scores:
         print(
             f"    RAGAS faithfulness={ragas_scores.get('ragas_faithfulness', 'N/A')}  "
@@ -843,35 +766,43 @@ def _run_supplemental_metrics(
 
 def _run_hallucination_phase(
     predictions: list[dict],
-    full_retrieved: dict[str, list],
     llm_model: str,
     gold_info: Optional[dict[str, dict]] = None,
-) -> tuple[dict, float]:
+) -> tuple[dict, Optional[float]]:
     """Evict perplexity/RAGAS models, run hallucination analysis, update NLI cache.
+
+    Each prediction is scored against its own ``retrieved_chunks`` -- the
+    context the generator actually saw (after graph-slot selection and the
+    context-window cut), not the raw retrieval list.
 
     The NLI cross-encoder is stored in and retrieved from the module-level
     ``_model_cache`` so it is reused across consecutive stages.
 
     Returns
     -------
-    tuple[dict, float]
+    tuple[dict, Optional[float]]
         ``(hallucination_result, faithful_rate)``
     """
     import config as _config
 
-    # Evict perplexity/RAGAS models before loading the NLI cross-encoder.
+    # Evict perplexity/RAGAS models before loading the NLI cross-encoder,
+    # but keep the NLI model itself for reuse.
+    nli_model = _model_cache.get("nli")
     evict_model_cache()
 
     print("  Hallucination analysis …")
+    contexts = {p["query_id"]: p.get("retrieved_chunks", []) for p in predictions}
     hall, faithful_rate, nli_model = run_hallucination_eval(
-        predictions, full_retrieved,
+        predictions, contexts,
         _config.HALLUCINATION_SAMPLE_SIZE,
-        nli_model=_model_cache.get("nli"),
+        nli_model=nli_model,
         llm_model=llm_model,
         gold_info=gold_info,
     )
     _model_cache["nli"] = nli_model  # reuse across stages
-    print(f"    Faithfulness={faithful_rate:.4f}")
+    _claims = hall.get("summary", {}).get("gold_claim_recall")
+    print(f"    Faithfulness (supported sentences)={_fmt_opt(faithful_rate)}  "
+          f"GoldClaimRecall={_fmt_opt(_claims)}")
     return hall, faithful_rate
 
 
@@ -909,6 +840,7 @@ def _run_judge_phase(
     failure_count = 0
     call_count = 0
     crashed = False
+    extra: dict = {}
 
     try:
         j = run_llm_judge_eval(
@@ -925,6 +857,8 @@ def _run_judge_phase(
         coherence = j["coherence"]
         parse_failures = j["parse_failures"]
         per_sample = j.get("per_sample", {})
+        extra = {"call_failures": j.get("call_failures"),
+                 "score_failures_as_zero": j.get("score_failures_as_zero")}
         failure_count = j["failure_count"]
         call_count = j["call_count"]
     except Exception as exc:
@@ -950,6 +884,7 @@ def _run_judge_phase(
         "call_count": call_count,
         "crashed": crashed,
         "failed": failed,
+        **extra,
     }
 
 
@@ -967,11 +902,31 @@ def _run_semantic_sim_phase(
 
         sem_result = compute_semantic_similarity(predictions)
         sem_sim = sem_result["mean_similarity"]
-        print(f"    SemanticSim={sem_sim:.4f}")
+        print(f"    SemanticSim={_fmt_opt(sem_sim)}")
         return sem_sim, sem_result.get("per_sample", [])
     except Exception as exc:
         print(f"    WARNING: Semantic similarity failed (recorded as null): {exc}")
         return None, []
+
+
+def _skipped_judge() -> dict:
+    """Judge result for a stage where the judge phase did not run."""
+    return {
+        "score": None, "faithfulness": None, "relevancy": None, "coherence": None,
+        "parse_failures": None, "per_sample": {}, "failure_count": 0,
+        "call_count": 0, "crashed": False, "failed": False, "skipped": True,
+    }
+
+
+def _portable_path(value: str) -> str:
+    """Model path relative to the project root when it lives inside it, so
+    results carry no machine-specific absolute paths."""
+    import config as _config
+
+    try:
+        return Path(value).resolve().relative_to(_config.BASE_DIR.resolve()).as_posix()
+    except (ValueError, OSError):
+        return value
 
 
 def _assemble_final_result(
@@ -985,7 +940,7 @@ def _assemble_final_result(
     source_metrics: dict,
     qa_metrics: dict,
     hall: dict,
-    faithful_rate: float,
+    faithful_rate: Optional[float],
     judge: dict,
     sem_sim: Optional[float],
     perplexity_score: Optional[float],
@@ -998,6 +953,13 @@ def _assemble_final_result(
 ) -> dict:
     """Build the final results dict and print scenario scores.
 
+    Scenario 1 uses chunk-level MRR only when the gold-labeled fraction
+    reaches ``config.HEADLINE_CHUNK_MIN_LABELED_FRACTION`` (an MRR over a
+    handful of labeled queries is not a stage-level number); otherwise MRR is
+    recorded as a missing component.  Each scenario's used/missing components,
+    effective weights and per-component n are saved under
+    ``scenario_components``.
+
     Returns
     -------
     dict
@@ -1006,25 +968,33 @@ def _assemble_final_result(
     import config as _config
     from evaluation.final_score import compute_all_scenario_scores
 
-    llm_scores_dict: dict = {}
-    if judge["faithfulness"] is not None:
-        llm_scores_dict["faithfulness"] = judge["faithfulness"]
-    if judge["relevancy"] is not None:
-        llm_scores_dict["relevancy"] = judge["relevancy"]
-    if judge["coherence"] is not None:
-        llm_scores_dict["coherence"] = judge["coherence"]
-
+    llm_scores_dict = {
+        k: judge[k] for k in ("faithfulness", "relevancy", "coherence")
+        if judge[k] is not None
+    }
+    n_gold = retrieval_metrics.get("num_queries") or 0
+    mrr_ok = headline_mode(n_gold, retrieval_metrics.get("total_queries") or 0) == "chunk"
+    judge_n = len((judge.get("per_sample") or {}).get("answer", []))
     scenario_scores = compute_all_scenario_scores(
-        retrieval_metrics=retrieval_metrics,
+        retrieval_metrics=retrieval_metrics if mrr_ok else {**retrieval_metrics, "mrr": None},
         qa_metrics=qa_metrics,
         faithfulness_score=faithful_rate,
         semantic_similarity=sem_sim,
-        llm_scores=llm_scores_dict if llm_scores_dict else None,
+        llm_scores=llm_scores_dict or None,
+        n_by_component={
+            "retrieval_mrr": n_gold,
+            "f1": qa_metrics.get("num_samples"),
+            "faithfulness": (hall.get("summary") or {}).get("total"),
+            "semantic_similarity": (
+                n_generated_total - n_generation_failed if sem_sim is not None else 0),
+            "relevancy": judge_n,
+            "coherence": judge_n,
+        },
     )
     print(
-        f"    Scenario1={scenario_scores['scenario1']:.4f}  "
-        f"Scenario2={scenario_scores['scenario2']:.4f}  "
-        f"Scenario3={scenario_scores['scenario3']:.4f}"
+        f"    Scenario1={_fmt_opt(scenario_scores['scenario1'])}  "
+        f"Scenario2={_fmt_opt(scenario_scores['scenario2'])}  "
+        f"Scenario3={_fmt_opt(scenario_scores['scenario3'])}"
     )
 
     return {
@@ -1033,10 +1003,12 @@ def _assemble_final_result(
             "generation_total": n_generated_total,
             "generation_failed": n_generation_failed,
             "generation_errors": n_generation_errors,
+            "llm_metrics_skipped": generation_failed,
             "judge_calls": judge["call_count"],
             "judge_failed": judge["failure_count"],
             "judge_crashed": judge["crashed"],
-            "semantic_similarity_failed": sem_sim is None,
+            "judge_skipped": judge.get("skipped", False),
+            "semantic_similarity_failed": sem_sim is None and not generation_failed,
             "max_failure_rate": max_rate,
         },
         "hyperparameters": {
@@ -1045,7 +1017,7 @@ def _assemble_final_result(
             "eval_set": eval_set_name,
             "eval_n": len(qa_examples),
             "embedding_model": (
-                _config.FINETUNED_EMBEDDING_MODEL
+                _portable_path(_config.FINETUNED_EMBEDDING_MODEL)
                 if stage.embedding == "finetuned"
                 else _config.EMBEDDING_MODEL
             ),
@@ -1053,18 +1025,24 @@ def _assemble_final_result(
                 stage.retrieval + ("_rerank" if stage.use_rerank else "")
             ),
             "llm_model": llm_model,
+            "llm_judge_model": _config.LLM_JUDGE_MODEL,
             "llm_max_tokens": _config.LLM_MAX_TOKENS,
             "llm_num_ctx": _config.LLM_NUM_CTX,
+            "llm_temperature": _config.LLM_TEMPERATURE,
             "llm_base_for_ablation": _config.LLM_BASE_FOR_ABLATION,
             "graph_context_reserve": (
                 _config.GRAPH_NEIGHBOR_BUDGET
                 if stage.use_graph and _config.GRAPH_CONTEXT_RESERVE else 0
             ),
             "inject_citations": stage.inject_citations,
+            "article_chunking": _config.ARTICLE_CHUNKING_ENABLED,
             "chunk_size": _config.CHUNK_SIZE,
             "chunk_overlap": _config.CHUNK_OVERLAP,
             "top_k_retrieval": _config.TOP_K_RETRIEVAL,
             "top_k_for_generation": _config.TOP_K_FOR_GENERATION,
+            "reranker_candidates": _config.RERANKER_CANDIDATES,
+            "nli_model": _config.NLI_MODEL,
+            "nli_support_threshold": _config.NLI_SUPPORT_THRESHOLD,
         },
         "headline_metrics": {
             "headline_mode": headline_mode(
@@ -1080,6 +1058,8 @@ def _assemble_final_result(
             "chunk_mrr_gold_only": retrieval_metrics.get("mrr"),
             "chunk_ndcg_at_10_gold_only": retrieval_metrics.get("ndcg_at_10"),
             "n_gold_labeled": retrieval_metrics.get("num_queries"),
+            "article_hit_at_5": (retrieval_metrics.get("article_level") or {}).get("hit_at_5"),
+            "article_mrr": (retrieval_metrics.get("article_level") or {}).get("mrr"),
         },
         "retrieval_metrics": retrieval_metrics,
         "source_hit_metrics": source_metrics,
@@ -1087,18 +1067,32 @@ def _assemble_final_result(
         "qa_metrics": qa_metrics,
         "hallucination_summary": hall.get("summary", {}),
         "faithfulness_rate": faithful_rate,
+        "gold_claim_recall": (hall.get("summary") or {}).get("gold_claim_recall"),
         "llm_judge_score": judge["score"],
         "llm_faithfulness_score": judge["faithfulness"],
         "llm_relevancy_score": judge["relevancy"],
         "llm_coherence_score": judge["coherence"],
         "llm_judge_parse_failures": judge["parse_failures"],
+        "llm_judge_call_failures": judge.get("call_failures"),
+        # sensitivity: judge means with every missing score counted as 0
+        "llm_judge_score_failures_as_zero": judge.get("score_failures_as_zero"),
         "semantic_similarity": sem_sim,
         "scenario1_score": scenario_scores["scenario1"],
         "scenario2_score": scenario_scores["scenario2"],
         "scenario3_score": scenario_scores["scenario3"],
+        "scenario_components": {
+            "faithfulness_source": scenario_scores["faithfulness_source"],
+            "mrr_used": mrr_ok,
+            **scenario_scores["components"],
+        },
         "perplexity": perplexity_score,
         "ragas_scores": ragas_scores or {},
     }
+
+
+def failed_results_dir(results_dir: Path) -> Path:
+    """Where a failed stage is written, so it never replaces a good run."""
+    return results_dir.with_name(results_dir.name + "_FAILED")
 
 
 # ---------------------------------------------------------------------------
@@ -1119,72 +1113,67 @@ def run_stage(
     short_answer_mode: bool,
     eval_set_name: str = "turkish_legal_rag",
     labeling_coverage: Optional[dict] = None,
+    run_judge: bool = True,
+    provenance: Optional[dict] = None,
 ) -> dict:
     """Run a single ablation stage end-to-end.
+
+    When more than ``config.MAX_FAILURE_RATE`` of the generations fail, the
+    LLM-based metrics (perplexity, RAGAS, NLI, judge, similarity) are skipped
+    and recorded as None.  A failed stage is written to
+    ``<results_dir>_FAILED`` instead of ``results_dir``.
 
     Returns the final_results dict (same JSON schema as run_baseline).
     """
     import config
     from utils import inject_citations as _inject_citations
 
-    print(f"\n{'━' * 66}")
-    print(f"  {stage.name}")
-    print(f"{'━' * 66}")
+    print(f"\n{'━' * 66}\n  {stage.name}\n{'━' * 66}")
 
-    # -- Infrastructure (embedder, FAISS, BM25, reranker, graph, LLM) ------
     _embedder, retriever, bm25, reranker, graph_index, llm_model = (
         _build_stage_components(
             stage, corpus_chunks,
             embedder_cache, retriever_cache, bm25_cache, reranker_cache,
         )
     )
-
-    # -- Retrieval + retrieval metrics -------------------------------------
-    retrieved_all, retrieval_metrics, source_metrics, full_retrieved = (
-        _run_retrieval_phase(
-            stage, qa_examples, retriever, bm25, reranker, graph_index,
-            relevant_map,
-        )
+    chunk_articles = chunk_article_map(corpus_chunks)
+    retrieved_all, retrieval_metrics, source_metrics, _ = _run_retrieval_phase(
+        stage, qa_examples, retriever, bm25, reranker, graph_index, relevant_map,
+        chunk_articles,
     )
 
-    # -- Generation + QA metrics -------------------------------------------
     print(f"  Generation with {llm_model} …")
     _inject_fn = _inject_citations if stage.inject_citations else None
     _max_rate = config.MAX_FAILURE_RATE
     (
-        predictions,
-        n_generated_total,
-        n_generation_failed,
-        n_generation_errors,
-        generation_failed,
-        qa_metrics,
-        all_predictions,
+        predictions, n_generated_total, n_generation_failed, n_generation_errors,
+        generation_failed, qa_metrics, all_predictions,
     ) = _run_generation_and_qa(
         stage_key, stage, qa_examples, retrieved_all,
-        retriever, llm_model, short_answer_mode,
-        _inject_fn, _max_rate,
+        retriever, llm_model, short_answer_mode, _inject_fn, _max_rate,
     )
+    metric_input, gold_info = _gold_info(
+        qa_examples, retrieved_all, relevant_map, chunk_articles)
+    _add_citation_metrics(qa_metrics, all_predictions, metric_input, chunk_articles)
 
-    # -- Perplexity + RAGAS ------------------------------------------------
-    perplexity_score, ragas_scores = _run_supplemental_metrics(
-        predictions, llm_model,
-    )
+    if generation_failed:
+        print("  Skipping LLM-based metrics: generation failure rate exceeded.")
+        perplexity_score, ragas_scores = None, {}
+        hall, faithful_rate = {}, None
+        judge, (sem_sim, sem_per_sample) = _skipped_judge(), (None, [])
+    else:
+        perplexity_score, ragas_scores = _run_supplemental_metrics(
+            predictions, llm_model, short_answer_mode,
+        )
+        hall, faithful_rate = _run_hallucination_phase(
+            predictions, llm_model, gold_info=gold_info,
+        )
+        judge = (
+            _run_judge_phase(predictions, qa_examples, stage, stage_key, _max_rate)
+            if run_judge else _skipped_judge()
+        )
+        sem_sim, sem_per_sample = _run_semantic_sim_phase(predictions)
 
-    # -- Hallucination -----------------------------------------------------
-    metric_input, gold_info = _gold_info(qa_examples, retrieved_all, relevant_map)
-    hall, faithful_rate = _run_hallucination_phase(
-        predictions, full_retrieved, llm_model, gold_info=gold_info,
-    )
-
-    # -- LLM Judge ---------------------------------------------------------
-    judge = _run_judge_phase(
-        predictions, qa_examples, stage, stage_key, _max_rate,
-    )
-
-    # -- Semantic Similarity -----------------------------------------------
-    sem_sim, sem_per_sample = _run_semantic_sim_phase(predictions)
-
-    # -- Assemble, score & save --------------------------------------------
     final = _assemble_final_result(
         stage_key, stage, eval_set_name, qa_examples, llm_model,
         labeling_coverage, retrieval_metrics, source_metrics, qa_metrics,
@@ -1193,176 +1182,15 @@ def run_stage(
         n_generated_total, n_generation_failed, n_generation_errors,
         generation_failed, _max_rate,
     )
+    if provenance:
+        final["provenance"] = provenance
 
+    out_dir = stage.results_dir
+    if final["status"] != "ok":
+        out_dir = failed_results_dir(out_dir)
+        print(f"  !!! Stage {stage_key} FAILED; results kept apart in {out_dir}")
     out_path = _persist_stage(
-        final, all_predictions, metric_input, hall, sem_per_sample, judge,
-        stage.results_dir,
+        final, all_predictions, metric_input, hall, sem_per_sample, judge, out_dir,
     )
     print(f"  ✓ Results → {out_path}")
     return final
-
-
-# ---------------------------------------------------------------------------
-# Ablation table
-# ---------------------------------------------------------------------------
-
-def headline_mode(n_labeled: int, n_total: int,
-                  min_fraction: Optional[float] = None) -> str:
-    """Pick the headline retrieval view from the gold-labeled fraction.
-
-    Returns ``"chunk"`` (recall/MRR/nDCG are the headline) when at least
-    ``min_fraction`` of the queries have gold chunk labels, else ``"source"``
-    (source-hit stays the headline).  Independent of the eval-set name.
-    """
-    from config import HEADLINE_CHUNK_MIN_LABELED_FRACTION
-    if min_fraction is None:
-        min_fraction = HEADLINE_CHUNK_MIN_LABELED_FRACTION
-    if not n_total:
-        return "source"
-    return "chunk" if n_labeled / n_total >= min_fraction else "source"
-
-
-def print_ablation_table(
-    results: dict[str, dict],
-    stage_order: Optional[list[str]] = None,
-) -> None:
-    """Print two markdown-style ablation tables to stdout.
-
-    The PRIMARY table leads with chunk-level recall/MRR/nDCG when at least
-    ``config.HEADLINE_CHUNK_MIN_LABELED_FRACTION`` of the queries have gold
-    chunk labels (see :func:`headline_mode`), otherwise with source-hit.
-    The SECONDARY table carries whichever retrieval view is not the headline.
-    """
-    if stage_order is None:
-        from pipeline.stages import DEFAULT_STAGE_ORDER
-        stage_order = DEFAULT_STAGE_ORDER
-
-    def _pct(v) -> str:
-        return f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "N/A"
-
-    def _f4(v) -> str:
-        return f"{v:.4f}" if isinstance(v, (int, float)) else "N/A"
-
-    def _src_cells(r) -> list:
-        sm = r.get("source_hit_metrics", r.get("headline_metrics", {}))
-        n = sm.get("source_labeled_queries", sm.get("n_source_queries", "?"))
-        return [
-            _f4(sm.get("source_hit_at_5_all", sm.get("source_hit_at_5"))),
-            _f4(sm.get("source_hit_at_10_all", sm.get("source_hit_at_10"))),
-            _f4(sm.get("source_mrr_all", sm.get("source_mrr"))),
-            _f4(sm.get("source_precision_at_5_all", sm.get("source_precision_at_5"))),
-            str(n),
-        ]
-
-    def _chunk_cells(r) -> list:
-        ret = r.get("retrieval_metrics", {})
-        return [
-            _f4(ret.get("recall_at_5")), _f4(ret.get("recall_at_10")),
-            _f4(ret.get("mrr")), _f4(ret.get("ndcg_at_10")),
-            str(ret.get("num_queries", "?")),
-        ]
-
-    def _ci(r, metric) -> str:
-        ci = (r.get("confidence_intervals") or {}).get(metric) or {}
-        lo, hi = ci.get("ci_low"), ci.get("ci_high")
-        if lo is None or hi is None:
-            return "N/A"
-        return f"[{lo * 100:.1f},{hi * 100:.1f}]"
-
-    def _len(v) -> str:
-        return f"{v:.1f}" if isinstance(v, (int, float)) else "N/A"
-
-    src_hdr = ["SrcHit@5", "SrcHit@10", "SrcMRR", "SrcPrec@5", "n_src"]
-    chunk_hdr = ["R@5", "R@10", "MRR", "nDCG@10", "n_gold"]
-
-    mode = "source"
-    for stage_key in stage_order:
-        cov = (results.get(stage_key) or {}).get("labeling_coverage")
-        if cov:
-            mode = headline_mode(cov.get("labeled", 0), cov.get("total", 0))
-            break
-    if mode == "chunk":
-        head_hdr, head_cells = chunk_hdr, _chunk_cells
-        side_hdr, side_cells = src_hdr, _src_cells
-        head_title = "chunk-level retrieval — gold-labeled queries"
-        side_title = "source-level — all queries with known law"
-    else:
-        head_hdr, head_cells = src_hdr, _src_cells
-        side_hdr, side_cells = chunk_hdr, _chunk_cells
-        head_title = "source-level retrieval — all queries with known law"
-        side_title = ("chunk-level — gold-labeled subset only; "
-                      "n_gold may be small for HMGS")
-
-    # -- Table 1: PRIMARY --------------------------------------------------
-    h1 = (
-        f"| {'Stage':<26} | "
-        + " | ".join(f"{h:>{w}}" for h, w in zip(head_hdr, [8, 9, 7, 9, 6]))
-        + f" | {'F1':>6} | {'F1 95% CI':>13} | {'Contain':>7} | {'ROUGE-L':>7} | "
-        f"{'Cite-nat':>8} | {'Cite-inj':>8} | {'Ctx-NLI':>7} | {'LLM-J':>6} | "
-        f"{'SemSim':>7} | {'AnsLen':>6} |"
-    )
-    sep1 = "|" + "|".join(
-        ["-" * w for w in [28, 10, 11, 9, 11, 8, 15, 9, 9, 10, 10, 9, 8, 9, 8]]
-    ) + "|"
-
-    print("\n\n" + "=" * 180)
-    print(f"  PRIMARY ABLATION TABLE  ({head_title})")
-    print("=" * 180)
-    print(h1)
-    print(sep1)
-
-    for stage_key in stage_order:
-        if stage_key not in results:
-            continue
-        r = results[stage_key]
-        qa = r.get("qa_metrics", {})
-        stage_name = r.get("hyperparameters", {}).get("stage_name", stage_key)
-        cells = " | ".join(
-            f"{c:>{w}}" for c, w in zip(head_cells(r), [8, 9, 7, 9, 6])
-        )
-        print(
-            f"| {stage_name:<26} | {cells} | "
-            f"{_pct(qa.get('f1')):>6} | "
-            f"{_ci(r, 'f1'):>13} | "
-            f"{_pct(qa.get('answer_containment')):>7} | "
-            f"{_pct(qa.get('rouge_l')):>7} | "
-            f"{_pct(qa.get('citation_accuracy_native')):>8} | "
-            f"{_pct(qa.get('citation_accuracy_injected', qa.get('citation_accuracy'))):>8} | "
-            f"{_pct(r.get('faithfulness_rate')):>7} | "
-            f"{_f4(r.get('llm_judge_score')):>6} | "
-            f"{_f4(r.get('semantic_similarity')):>7} | "
-            f"{_len(qa.get('mean_answer_len_words')):>6} |"
-        )
-    print("=" * 180 + "\n")
-
-    # -- Table 2: SECONDARY ------------------------------------------------
-    h2 = (
-        f"| {'Stage':<26} | "
-        + " | ".join(f"{h:>{w}}" for h, w in zip(side_hdr, [9, 9, 7, 9, 7]))
-        + f" | {'Scen1':>7} | {'Scen2':>7} | {'Scen3':>7} |"
-    )
-    sep2 = "|" + "|".join(
-        ["-" * w for w in [28, 11, 11, 9, 11, 9, 9, 9, 9]]
-    ) + "|"
-
-    print("=" * 100)
-    print(f"  SECONDARY TABLE  ({side_title})")
-    print("=" * 100)
-    print(h2)
-    print(sep2)
-
-    for stage_key in stage_order:
-        if stage_key not in results:
-            continue
-        r = results[stage_key]
-        stage_name = r.get("hyperparameters", {}).get("stage_name", stage_key)
-        cells = " | ".join(
-            f"{c:>{w}}" for c, w in zip(side_cells(r), [9, 9, 7, 9, 7])
-        )
-        print(
-            f"| {stage_name:<26} | {cells} | "
-            f"{_f4(r.get('scenario1_score')):>7} | "
-            f"{_f4(r.get('scenario2_score')):>7} | "
-            f"{_f4(r.get('scenario3_score')):>7} |"
-        )
-    print("=" * 100 + "\n")

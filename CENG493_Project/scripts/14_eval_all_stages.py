@@ -28,19 +28,26 @@ Available stages:
     hybrid       BGE-M3 base    + hybrid BM25    + qwen2.5:7b
     rrf          BGE-M3 base    + RRF            + qwen2.5:7b
     rrf_rerank   BGE-M3 base    + RRF+rerank     + qwen2.5:7b   <- best retrieval
-    graph        BGE-M3 base    + RRF+rerank+graph + qwen2.5:7b  <- requires graph.json
+    graph        BGE-M3 base    + RRF+rerank+graph + qwen2.5:7b  (graph built from the corpus)
     llm_ft       BGE-M3 base    + dense          + qwen25-legal-ft (fine-tuned)
     emb_ft       BGE-M3 ft*     + RRF+rerank     + qwen2.5:7b   <- requires emb training
     full         BGE-M3 ft*     + RRF+rerank     + qwen25-legal-ft  <- best overall
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
 from pathlib import Path
 
-os.environ.setdefault("PYTHONUTF8", "1")
+# PYTHONUTF8 only takes effect at interpreter start-up; reconfigure the
+# streams so Turkish text and symbols print on a cp125x Windows console too.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 if sys.platform == "darwin":
     os.environ.setdefault("OMP_NUM_THREADS", "1")
 
@@ -50,7 +57,6 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import config
 from pipeline.stages import STAGE_REGISTRY, DEFAULT_STAGE_ORDER
-from pipeline.retrieval import auto_build_graph
 
 
 def _parse_args(argv=None):
@@ -121,9 +127,57 @@ def _parse_args(argv=None):
             "Mutually exclusive with --corpus."
         ),
     )
+    parser.add_argument(
+        "--no-judge", action="store_true", dest="no_judge",
+        help="Skip the LLM-judge phase (judge scores and Scenario 3 become N/A).",
+    )
+    parser.add_argument(
+        "--results-root", type=Path, default=None, dest="results_root",
+        help=(
+            "Root directory for this run's outputs (default: config.RESULTS_ROOT). "
+            "Results go to <root>/<eval_set>[_limitN]/<stage>/."
+        ),
+    )
     args = parser.parse_args(argv)
     args.stages = ",".join(args.stages)
     return args
+
+
+def run_dir_name(eval_set: str, limit, eval_data=None) -> str:
+    """Directory name of one run: eval set (or external file stem) + limit."""
+    name = f"external_{Path(eval_data).stem}" if eval_data else eval_set
+    return f"{name}_limit{limit}" if limit else name
+
+
+def merge_summary(summary_path: Path, new_results: dict) -> dict:
+    """Stage results of this run merged over an existing summary, so a rerun
+    of some stages keeps the others; bookkeeping keys are rebuilt."""
+    merged: dict = {}
+    if summary_path.exists():
+        try:
+            with open(summary_path, encoding="utf-8") as f:
+                old = json.load(f)
+            merged = {k: v for k, v in old.get("stages", {}).items()}
+        except (json.JSONDecodeError, OSError):
+            print(f"  WARNING: unreadable {summary_path}; starting a new summary")
+    merged.update(new_results)
+    return merged
+
+
+def _bm25_info():
+    try:
+        from retrieval.bm25_retriever import tokenizer_info
+        return tokenizer_info()
+    except Exception as exc:  # rank_bm25 / nltk missing
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def load_per_query(stage_dir: Path):
+    path = stage_dir / "per_query.jsonl"
+    if not path.exists():
+        return None
+    from utils import read_jsonl
+    return list(read_jsonl(path))
 
 
 def main() -> None:
@@ -140,10 +194,12 @@ def main() -> None:
 
     from data.data_processor import DataProcessor
     from pipeline.data_loading import load_external_corpus, load_external_qa
-    from pipeline.evaluation import run_stage, print_ablation_table
-    from utils import check_ollama, set_seeds
+    from pipeline.evaluation import (
+        compare_stages, print_ablation_table, print_comparison_table, run_stage,
+    )
+    from utils import check_ollama, run_provenance, set_seeds
 
-    set_seeds(42)
+    set_seeds(config.SEED)
 
     # -- Validate requested stages -----------------------------------------
     requested = [s.strip() for s in args.stages.split(",") if s.strip()]
@@ -153,25 +209,6 @@ def main() -> None:
             print(f"WARNING: Unknown stage '{key}' -- skipping.")
             continue
         stage = STAGE_REGISTRY[key]
-        if stage.requires_graph:
-            graph_path = config.INDEX_DIR / config.GRAPH_FILE
-            if not graph_path.exists():
-                auto_build_graph(graph_path)
-            # Rebuild if the existing file is corrupt JSON.
-            if graph_path.exists():
-                try:
-                    with graph_path.open(encoding="utf-8") as _gf:
-                        json.load(_gf)
-                except json.JSONDecodeError:
-                    print(f"  graph.json is corrupt — rebuilding …")
-                    auto_build_graph(graph_path)
-            if not graph_path.exists():
-                print(
-                    f"INFO: Stage '{key}' skipped -- "
-                    f"graph.json not found at {graph_path}\n"
-                    f"  Run: python scripts/15_build_graph.py first."
-                )
-                continue
         if stage.requires_emb_ft:
             emb_dir = Path(config.FINETUNED_EMBEDDING_MODEL)
             if not emb_dir.exists() or not any(emb_dir.iterdir()):
@@ -181,44 +218,15 @@ def main() -> None:
                     f"  Run: python scripts/12_finetune_embeddings.py first."
                 )
                 continue
-        if stage.llm == "finetuned":
-            import subprocess
-            try:
-                _ollama_result = subprocess.run(
-                    ["ollama", "list"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-            except FileNotFoundError:
-                print(
-                    f"INFO: Stage '{key}' skipped -- "
-                    f"'ollama' executable not found in PATH."
-                )
-                continue
-            except subprocess.TimeoutExpired:
-                print(
-                    f"INFO: Stage '{key}' skipped -- "
-                    f"'ollama list' timed out."
-                )
-                continue
-            # Exact name match: compare first column, allowing ':latest' suffix.
-            _target = config.LLM_FINETUNED_MODEL
-            _found = any(
-                (parts := line.split()) and (
-                    parts[0] == _target
-                    or parts[0] == _target + ":latest"
-                )
-                for line in _ollama_result.stdout.splitlines()
-                if line.strip()
+        if stage.llm == "finetuned" and not check_ollama(
+            config.LLM_BASE_URL, config.LLM_FINETUNED_MODEL
+        ):
+            print(
+                f"INFO: Stage '{key}' skipped -- "
+                f"Ollama model '{config.LLM_FINETUNED_MODEL}' not available.\n"
+                f"  Run: python scripts/13_export_lora_to_ollama.py first."
             )
-            if not _found:
-                print(
-                    f"INFO: Stage '{key}' skipped -- "
-                    f"Ollama model '{config.LLM_FINETUNED_MODEL}' not found.\n"
-                    f"  Run: python scripts/13_export_lora_to_ollama.py first."
-                )
-                continue
+            continue
         valid.append(key)
 
     if not valid:
@@ -227,16 +235,36 @@ def main() -> None:
     print(f"\n\U0001f680  Stages to run: {', '.join(valid)}")
     print(f"   Eval set: {args.eval_set}\n")
 
-    # -- Check Ollama ------------------------------------------------------
-    if not check_ollama(config.LLM_BASE_URL, config.LLM_MODEL):
-        sys.exit(
-            f"ERROR: Ollama not reachable at {config.LLM_BASE_URL}.\n"
-            f"  Start with: ollama serve\n"
-            f"  Pull model: ollama pull {config.LLM_MODEL}"
-        )
+    # -- Check Ollama models up front -------------------------------------
+    # A missing judge would otherwise cost ~3 retries per call per metric and
+    # mark every stage failed only at the end.
+    needed = []
+    if any(STAGE_REGISTRY[k].llm == "base" for k in valid):
+        needed.append(config.LLM_MODEL)
+    if not args.no_judge:
+        needed.append(config.LLM_JUDGE_MODEL)
+    for model in needed:
+        if not check_ollama(config.LLM_BASE_URL, model):
+            sys.exit(
+                f"ERROR: Ollama not reachable at {config.LLM_BASE_URL} or model "
+                f"'{model}' not pulled.\n"
+                f"  Start with: ollama serve\n"
+                f"  Pull model: ollama pull {model}"
+                + ("\n  (or pass --no-judge to skip the judge)"
+                   if model == config.LLM_JUDGE_MODEL else "")
+            )
 
     # -- Load data ---------------------------------------------------------
     print("Loading data …")
+
+    processor = None
+
+    def _processor():
+        nonlocal processor
+        if processor is None:
+            processor = DataProcessor(config.RAW_DATA_PATH)
+            processor.load_and_validate()
+        return processor
 
     if args.corpus:
         print(f"  Corpus source : {args.corpus} (external evaluator format)")
@@ -247,30 +275,23 @@ def main() -> None:
         print(f"  Chunking/loading corpus from {args.docs_path} …")
         corpus_chunks = load_external_corpus(Path(corpus_path))
     else:
-        processor = DataProcessor(config.RAW_DATA_PATH)
-        processor.load_and_validate()
-        corpus_chunks = list(
-            # Hold the eval rows out of the index only for the Kaggle-split
-            # eval set; the other eval sets are not drawn from the corpus.
-            processor.build_corpus_chunks(holdout=args.eval_set == "kaggle")
-        )
+        corpus_chunks = list(_processor().build_corpus_chunks())
 
     if args.eval_data:
         print(f"  QA source     : {args.eval_data} (external evaluator format)")
         qa_examples, short_answer_mode = load_external_qa(Path(args.eval_data))
+        eval_file = Path(args.eval_data)
     else:
         short_answer_mode = args.eval_set == "hmgs"
         if args.eval_set == "hmgs":
             qa_examples = DataProcessor.build_gold_eval_set()
+            eval_file = config.HMGS_DATA_PATH
         elif args.eval_set == "turkish_legal_rag":
             qa_examples = DataProcessor.build_turkish_legal_rag_eval_set()
+            eval_file = config.TLR_DATA_PATH
         else:
-            if not args.corpus:
-                pass  # processor already initialised above
-            else:
-                processor = DataProcessor(config.RAW_DATA_PATH)
-                processor.load_and_validate()
-            qa_examples = processor.build_qa_eval_set()
+            qa_examples = _processor().build_qa_eval_set()
+            eval_file = config.RAW_DATA_PATH
 
     if args.limit:
         qa_examples = qa_examples[: args.limit]
@@ -311,6 +332,33 @@ def main() -> None:
                 f"re-run scripts/16_prepare_turkish_legal_rag.py."
             )
 
+    # The kaggle eval set is labeled from its own contexts; zero labels means
+    # the corpus does not hold them and retrieval metrics would be void.
+    if (not args.eval_data and args.eval_set == "kaggle"
+            and labeling_coverage["labeled"] == 0):
+        sys.exit(
+            "ERROR: no kaggle eval query has a gold chunk in the corpus -- the "
+            "held-out split removed every gold passage from the index."
+        )
+
+    # -- Output locations & provenance -----------------------------------------
+    eval_set_name = args.eval_set if not args.eval_data else "external"
+    run_dir = (args.results_root or config.RESULTS_ROOT) / run_dir_name(
+        args.eval_set, args.limit, args.eval_data)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  Run directory : {run_dir}")
+    provenance = run_provenance(
+        seed=config.SEED,
+        base_url=config.LLM_BASE_URL,
+        models=[config.LLM_MODEL, config.LLM_FINETUNED_MODEL, config.LLM_JUDGE_MODEL],
+        eval_file=eval_file,
+        corpus_chunks=corpus_chunks,
+        extra={"limit": args.limit, "eval_n": len(qa_examples),
+               "labeled_n": labeling_coverage["labeled"],
+               "bm25_tokenizer": _bm25_info(),
+               "tlr_label_fixes": config.TLR_USE_LABEL_FIXES},
+    )
+
     # -- Shared caches -----------------------------------------------------
     embedder_cache: dict = {}
     retriever_cache: dict = {}
@@ -321,7 +369,7 @@ def main() -> None:
     all_results: dict[str, dict] = {}
 
     for key in valid:
-        stage = STAGE_REGISTRY[key]
+        stage = dataclasses.replace(STAGE_REGISTRY[key], results_dir=run_dir / key)
         try:
             result = run_stage(
                 key, stage, qa_examples, corpus_chunks,
@@ -331,16 +379,16 @@ def main() -> None:
                 reranker_cache=reranker_cache,
                 relevant_map=relevant_map,
                 short_answer_mode=short_answer_mode,
-                eval_set_name=(
-                    args.eval_set if not args.eval_data else "external"
-                ),
+                eval_set_name=eval_set_name,
                 labeling_coverage=labeling_coverage,
+                run_judge=not args.no_judge,
+                provenance=provenance,
             )
             all_results[key] = result
         except KeyboardInterrupt:
             print(
-                f"\n  ⚠ Interrupted during stage '{key}'. "
-                f"Saving partial results …"
+                f"\n  ⚠ Interrupted during stage '{key}'; its results are "
+                f"discarded. Saving the completed stages …"
             )
             break
         except Exception as exc:
@@ -348,26 +396,39 @@ def main() -> None:
             import traceback
             traceback.print_exc()
             import gc
-            import torch as _torch
             gc.collect()
-            if _torch.cuda.is_available():
-                _torch.cuda.empty_cache()
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
             print("  Continuing with next stage …")
 
-    # -- Ablation table ----------------------------------------------------
-    if all_results:
-        print_ablation_table(all_results)
-
-        summary_path = config.BASE_DIR / "results" / "ablation_summary.json"
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        if args.limit:
-            all_results["limit_applied"] = True
-            all_results["limit_value"] = args.limit
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(all_results, f, ensure_ascii=False, indent=2)
-        print(f"Full results saved to: {summary_path}")
-    else:
+    # -- Ablation table + paired comparisons -------------------------------
+    if not all_results:
         print("No results to report.")
+        return
+
+    summary_path = run_dir / "ablation_summary.json"
+    stages = merge_summary(summary_path, all_results)
+    print_ablation_table(stages)
+
+    per_query = {
+        k: pq for k, r in stages.items()
+        if r.get("status", "ok") == "ok" and (pq := load_per_query(run_dir / k))
+    }
+    comparisons = compare_stages(per_query)
+    print_comparison_table(comparisons)
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "run": {"eval_set": eval_set_name, "limit": args.limit,
+                    "provenance": provenance},
+            "stages": stages,
+            "comparisons": comparisons,
+        }, f, ensure_ascii=False, indent=2)
+    print(f"Full results saved to: {summary_path}")
 
 
 if __name__ == "__main__":

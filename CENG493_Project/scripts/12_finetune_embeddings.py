@@ -44,11 +44,41 @@ TRAINING_CONFIG = {
     "gradient_checkpointing": True,
     "eval_split": 0.05,
     "loss": "MultipleNegativesRankingLoss",
+    "max_negatives": 7,
     "notes": (
-        "anchor+positive+ALL hard negatives; up to 7 hard negatives per triplet are passed as "
-        "negative, negative_1, ..., negative_6 columns. MNRL uses these plus in-batch negatives."
+        "anchor+positive+hard negatives from scripts/11 (pos/neg lists); every example "
+        "gets the same number of negatives (negative, negative_1, ...). MNRL uses these "
+        "plus in-batch negatives."
     ),
 }
+
+
+def build_records(raw: list[dict], max_negatives: int) -> tuple[list[dict], int]:
+    """MNRL rows (anchor, positive, negative, negative_1, ...) from scripts/11
+    triplets ({"query", "pos": [...], "neg": [...]}).
+
+    A HF Dataset needs the same columns on every row, so all rows get
+    ``n = min(max_negatives, fewest negatives in any row)`` negatives.
+    The older ``positive_passage`` / ``negative_passage`` keys are accepted.
+    """
+    rows = []
+    for t in raw:
+        pos = t.get("pos") or ([t["positive_passage"]] if t.get("positive_passage") else [])
+        negs = t.get("neg")
+        if negs is None:
+            negs = [t["negative_passage"]] if t.get("negative_passage") else []
+        if pos:
+            rows.append((t["query"], pos[0], list(negs)))
+    if not rows:
+        raise ValueError("no usable triplets (need 'query' and 'pos')")
+    n_neg = min(max_negatives, min(len(n) for _, _, n in rows))
+    records = []
+    for query, pos, negs in rows:
+        rec = {"anchor": query, "positive": pos}
+        for i, neg in enumerate(negs[:n_neg]):
+            rec["negative" if i == 0 else f"negative_{i}"] = neg
+        records.append(rec)
+    return records, n_neg
 
 
 def main() -> None:
@@ -77,25 +107,13 @@ def main() -> None:
     print(f"  {len(raw):,} triplets loaded.")
 
     # ── Build HuggingFace Dataset ────────────────────────────────────────────
-    # Build triplets: anchor + positive + ALL hard negatives.
-    # sentence-transformers v3+ MultipleNegativesRankingLoss supports multiple
-    # negative columns: "negative", "negative_1", "negative_2", ...
-    records = []
-    for t in raw:
-        record = {
-            "anchor": t["query"],
-            "positive": t["positive_passage"],
-        }
-        neg = t.get("negative_passage")
-        negs = [neg] if neg else []
-        for neg_i, neg_text in enumerate(negs):
-            col_name = "negative" if neg_i == 0 else f"negative_{neg_i}"
-            record[col_name] = neg_text
-        records.append(record)
+    records, n_neg = build_records(raw, TRAINING_CONFIG["max_negatives"])
+    TRAINING_CONFIG["negatives_per_example"] = n_neg
+    print(f"  {len(records):,} examples, {n_neg} hard negatives each")
 
     dataset = Dataset.from_list(records)
     split = dataset.train_test_split(
-        test_size=TRAINING_CONFIG["eval_split"], seed=42
+        test_size=TRAINING_CONFIG["eval_split"], seed=config.SEED
     )
     train_ds = split["train"]
     eval_ds = split["test"]
@@ -128,6 +146,8 @@ def main() -> None:
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
+        seed=config.SEED,
+        data_seed=config.SEED,
     )
 
     # ── Trainer ──────────────────────────────────────────────────────────────

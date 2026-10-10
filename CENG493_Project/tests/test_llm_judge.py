@@ -8,7 +8,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -76,6 +76,23 @@ class TestParseScore:
         # "2024" should not be parsed as a score
         result = _parse_score("Yıl 2024'te çıkarılan kanun.")
         assert result is None
+
+    @pytest.mark.parametrize("text,expected", [
+        ("Cevap 1. maddeye göre yanlış: 0", 0.0),   # ordinal "1." is not a score
+        ("TMK m. 5/1 uyarınca doğru", None),          # article ref, not 5/1
+        ("1/2", 0.5),
+        ("10", None),                                 # out of range, ambiguous
+        ("0,5", 0.5),
+        ("Puan: 0.5", 0.5),
+        ("0.5 çünkü 1 maddede eksik", 0.5),           # leading score wins
+        ("2. fıkraya göre puan 0.5", 0.5),
+    ])
+    def test_turkish_legal_responses(self, text, expected):
+        result = _parse_score(text)
+        if expected is None:
+            assert result is None
+        else:
+            assert result == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------
@@ -449,3 +466,16 @@ class TestJudgeDefaults:
             llm_judge_answer(_make_predictions(2), "http://x", "m",
                              results_dir=tmp, run_id="RID")
             assert (Path(tmp) / "judge_raw_answer_RID.jsonl").exists()
+
+
+def test_aggregate_separates_call_failures_and_reports_zero_sensitivity():
+    samples = [
+        {"score": 1.0, "parse_failed": False, "call_failed": False},
+        {"score": None, "parse_failed": True, "call_failed": True},
+        {"score": None, "parse_failed": True, "call_failed": False},
+        {"score": 0.5, "parse_failed": False, "call_failed": False},
+    ]
+    r = _aggregate(samples)
+    assert r["score"] == pytest.approx(0.75)
+    assert r["score_failures_as_zero"] == pytest.approx(1.5 / 4)
+    assert r["parse_fail_count"] == 2 and r["call_fail_count"] == 1

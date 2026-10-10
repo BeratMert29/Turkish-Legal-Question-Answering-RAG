@@ -10,7 +10,7 @@ import config
 from data.data_processor import DataProcessor
 from evaluation.qa_metrics import compute_all_qa_metrics_with_citation
 from evaluation.hallucination import stratified_sample, run_hallucination_analysis
-from sentence_transformers import CrossEncoder  # type: ignore[import-untyped]
+from evaluation.nli import load_nli_model
 
 
 def parse_args():
@@ -48,24 +48,26 @@ def main():
     errors = [p for p in predictions if "error" in p]
     valid = [p for p in predictions if "error" not in p]
     if errors:
-        print(f"WARNING: {len(errors)} predictions had errors and were excluded from metrics")
+        # Same rule as scripts/14: failed generations stay in the QA-metric
+        # denominator and score 0 (empty answer); only NLI skips them.
+        print(f"WARNING: {len(errors)} predictions had errors; scored 0 on QA metrics")
     print(f"Valid predictions: {len(valid)}")
 
     print("\nComputing QA metrics...")
     qa_input = [
         {
-            "predicted": p["predicted"],
+            "predicted": "" if "error" in p else p.get("predicted", ""),
             "expected": p["expected"],
             "retrieved_sources": p.get("retrieved_sources", []),
             "expected_source": p.get("expected_source", ""),
             "retrieved_chunks": p.get("retrieved_chunks", []),
         }
-        for p in valid
+        for p in predictions
     ]
     qa_metrics = compute_all_qa_metrics_with_citation(qa_input)
     qa_metrics["error_count"] = len(errors)
 
-    print(f"\n=== QA Metrics ===")
+    print("\n=== QA Metrics ===")
     for k, v in qa_metrics.items():
         print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
@@ -78,25 +80,25 @@ def main():
 
     retrieved_results = {p["query_id"]: p.get("retrieved_chunks", []) for p in valid}
 
-    print("Loading NLI model: cross-encoder/nli-deberta-v3-small (~180 MB, first run downloads)")
-    nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-small")
+    print(f"Loading NLI model: {config.NLI_MODEL}")
+    nli_model = load_nli_model(config.NLI_MODEL)
 
     sample = stratified_sample(valid, config.HALLUCINATION_SAMPLE_SIZE)
-    print(f"Stratified sample: hits={len(sample['hits'])}, partial={len(sample['partial'])}, misses={len(sample['misses'])}")
+    print("Strata: " + ", ".join(f"{k}={len(v)}" for k, v in sample.items()))
 
-    hall_results = run_hallucination_analysis(sample, retrieved_results, nli_model)
+    hall_results = run_hallucination_analysis(
+        sample, retrieved_results, nli_model, threshold=config.NLI_SUPPORT_THRESHOLD,
+    )
+
+    def _pct(v):
+        return f"{v:.2%}" if isinstance(v, float) else "N/A"
 
     summary = hall_results["summary"]
-    print(f"\n=== Hallucination Analysis ===")
+    print("\n=== Hallucination Analysis ===")
     print(f"  Total analyzed: {summary['total']}")
-    print(f"  Context grounding: {summary['context_grounding_count']} "
-          f"({summary['context_grounding_rate']:.2%})")
-    ans_f = summary.get("answer_faithfulness_rate")
-    if ans_f is not None:
-        print(f"  Answer faithfulness (vs gold): {summary['answer_faithfulness_count']} "
-              f"({ans_f:.2%})")
-    else:
-        print(f"  Answer faithfulness: N/A (no gold answers in sample)")
+    print(f"  Supported answer sentences: {_pct(summary['context_supported_sentence_rate'])}")
+    print(f"  Context grounding (mean >= threshold): {_pct(summary['context_grounding_rate'])}")
+    print(f"  Gold claim recall: {_pct(summary['gold_claim_recall'])}")
     print(f"  By category: {summary['by_category']}")
 
     hall_path = config.RESULTS_DIR / f"hallucination_results_{args.mode}{suffix}.json"

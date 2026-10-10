@@ -4,7 +4,9 @@ import pytest
 from evaluation.hallucination import (
     _classify_result, gold_rank, stratified_sample, run_hallucination_analysis,
 )
-from evaluation.nli import entailment_index, nli_context_faithfulness, split_sentences
+from evaluation.nli import (
+    entailment_index, nli_claim_recall, nli_context_faithfulness, split_sentences,
+)
 
 
 class _Cfg:
@@ -99,8 +101,53 @@ def test_stratified_sample_independent_of_scores():
     s = stratified_sample(rs, 9)
     assert len(s["hits"]) == len(s["partial"]) == len(s["misses"]) == 3
     assert all(_classify_result(r) == "miss" for r in s["misses"])
-    # unlabeled results excluded
+    # unlabeled results excluded when sampling
     assert sum(len(v) for v in stratified_sample([{"query_id": "u"}], 9).values()) == 0
+
+
+def test_stratified_sample_none_keeps_everything():
+    rs = [_res(f"q{i}", "TCK", ["TCK"] if i % 2 else ["x"]) for i in range(7)]
+    rs.append({"query_id": "u"})
+    s = stratified_sample(rs, None)
+    assert sum(len(v) for v in s.values()) == 8
+    assert [r["query_id"] for r in s["unlabeled"]] == ["u"]
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("TMK m. 23 uyarınca ergin olur. İkinci cümle.",
+     ["TMK m. 23 uyarınca ergin olur.", "İkinci cümle."]),
+    ("Maddenin 2. fıkrasına göre süre 5 gündür.",
+     ["Maddenin 2. fıkrasına göre süre 5 gündür."]),
+    ("4857 s. Kanun'un 25. maddesi vb. haller dahildir. Son.",
+     ["4857 s. Kanun'un 25. maddesi vb. haller dahildir.", "Son."]),
+    ("Satır bir\nSatır iki.", ["Satır bir", "Satır iki."]),
+])
+def test_split_sentences_keeps_legal_abbreviations(text, expected):
+    assert split_sentences(text) == expected
+
+
+@pytest.mark.parametrize("order", [ORDER_A, ORDER_B])
+def test_claim_recall_is_fraction_of_gold_sentences_in_answer(order):
+    m = FakeNLI(order)
+    preds = [
+        # answer states both gold claims (plus extra text): recall 1
+        {"query_id": "q1", "expected": "Süre beş gündür. İtiraz mümkündür.",
+         "predicted": "Süre beş gündür. İtiraz mümkündür. Ayrıca ek açıklama."},
+        # answer states one of two claims: recall 0.5
+        {"query_id": "q2", "expected": "Süre beş gündür. İtiraz mümkündür.",
+         "predicted": "Süre beş gündür."},
+        {"query_id": "q3", "expected": "", "predicted": "x."},
+        {"query_id": "q4", "expected": "Bir iddia.", "predicted": ""},
+    ]
+    r = nli_claim_recall(preds, m)
+    by = {s["query_id"]: s for s in r["per_sample"]}
+    assert by["q1"]["claim_recall"] == 1.0
+    assert by["q2"]["claim_recall"] == 0.5
+    assert by["q3"]["claim_recall"] is None
+    assert by["q4"]["claim_recall"] == 0.0
+    # premise is the answer, hypothesis the gold claim
+    assert all(hyp in ("Süre beş gündür.", "İtiraz mümkündür.", "Bir iddia.")
+               for _, hyp in m.calls[0])
 
 
 @pytest.mark.parametrize("order", [ORDER_A, ORDER_B])
@@ -112,3 +159,17 @@ def test_hallucination_analysis_uses_context(order):
     out = run_hallucination_analysis(sample, retrieved, m)
     assert out["per_sample"][0]["context_grounded"] is True
     assert out["summary"]["context_grounding_rate"] == 1.0
+    assert out["summary"]["context_supported_sentence_rate"] == 1.0
+
+
+@pytest.mark.parametrize("order", [ORDER_A, ORDER_B])
+def test_supported_rate_counts_unsupported_sentences(order):
+    m = FakeNLI(order)
+    sample = {"hits": [{"query_id": "q1", "expected": "Doğru cümle.",
+                        "predicted": "Doğru cümle. Uydurma cümle. Başka uydurma."}],
+              "partial": [], "misses": [], "unlabeled": []}
+    out = run_hallucination_analysis(sample, {"q1": [{"text": "Doğru cümle."}]}, m)
+    ps = out["per_sample"][0]
+    assert ps["context_supported_rate"] == pytest.approx(1 / 3)
+    assert ps["gold_claim_recall"] == 1.0
+    assert out["summary"]["by_category"]["hits"]["total"] == 1

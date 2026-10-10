@@ -53,3 +53,41 @@ def test_paired_dict_alignment_and_drop_none():
 def test_paired_length_mismatch_raises():
     with pytest.raises(ValueError):
         paired_bootstrap([1, 2], [1])
+
+
+def test_holm_adjust_matches_hand_calculation():
+    from evaluation.stats import holm_adjust
+    adj = holm_adjust({"a": 0.01, "b": 0.04, "c": 0.03, "d": None})
+    # sorted: a .01*3=.03, c .03*2=.06, b .04*1=.04 -> monotone max .06
+    assert adj["a"] == pytest.approx(0.03)
+    assert adj["c"] == pytest.approx(0.06)
+    assert adj["b"] == pytest.approx(0.06)
+    assert adj["d"] is None
+
+
+def test_compare_stages_aligns_by_query_id_and_skips_missing_pairs():
+    from pipeline.evaluation import compare_stages
+    base = [{"query_id": f"q{i}", "f1": 0.2} for i in range(30)]
+    # reversed order: alignment must use query_id, not position
+    llm = [{"query_id": f"q{i}", "f1": 0.5} for i in reversed(range(30))]
+    out = compare_stages({"base": base, "llm_ft": llm}, metrics=("f1", "judge_answer"))
+    r = out["f1"]["base->llm_ft"]
+    assert r["mean_diff"] == pytest.approx(0.3)
+    assert r["n"] == 30 and r["significant_holm"]
+    assert "judge_answer" not in out          # no values -> no comparison
+    assert set(out["f1"]) == {"base->llm_ft"}  # pairs with an absent stage skipped
+
+
+def test_cohen_kappa_known_values():
+    from evaluation.stats import cohen_kappa
+    assert cohen_kappa([1, 0, 1, 0], [1, 0, 1, 0]) == pytest.approx(1.0)
+    # po = 0.8, pe = 0.5*0.5 + 0.5*0.5 = 0.5 -> kappa 0.6
+    a = [1] * 5 + [0] * 5
+    b = [1, 1, 1, 1, 0, 1, 0, 0, 0, 0]
+    assert cohen_kappa(a, b) == pytest.approx(0.6)
+    # weighted: a near miss (0.5 vs 1) costs less than a far miss (0 vs 1)
+    labels = [0, 0.5, 1]
+    near = cohen_kappa([0, 0.5, 1, 1], [0, 0.5, 1, 0.5], labels, "linear")
+    far = cohen_kappa([0, 0.5, 1, 1], [0, 0.5, 1, 0], labels, "linear")
+    assert near > far
+    assert cohen_kappa([1, None], [1, 0]) is None

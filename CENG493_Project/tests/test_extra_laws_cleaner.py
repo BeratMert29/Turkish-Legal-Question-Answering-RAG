@@ -1,5 +1,4 @@
 """Tests for data.extra_laws_cleaner and unique chunk_ids in build_corpus_chunks."""
-import collections
 import json
 
 import pandas as pd
@@ -90,3 +89,19 @@ def test_build_corpus_chunk_ids_unique_when_chunk_ids_collide(tmp_path, monkeypa
     dp = _processor(tmp_path, monkeypatch, recs)
     ids = [c.chunk_id for c in dp.build_corpus_chunks()]
     assert len(ids) == len(set(ids)) == 2
+
+
+def test_stranded_titles_move_to_the_article_they_name():
+    recs = [
+        {"source": "HMK", "doc_id": "HMK_madde_4",
+         "text": "MADDE 4- (1) Sulh hukuk mahkemeleri\nbakar.\nİKİNCİ AYIRIM\nYetki\nGenel kural"},
+        {"source": "HMK", "doc_id": "HMK_madde_5",
+         "text": "MADDE 5- (1) Yetki kurallara tabidir.\nGenel yetkili mahkeme"},
+        {"source": "HMK", "doc_id": "HMK_madde_6", "text": "MADDE 6- (1) Yerleşim yeri mahkemesi."},
+    ]
+    out, stats = clean_extra_law_records(recs)
+    assert out[0]["text"].endswith("bakar.")
+    assert out[1]["text"].startswith("İKİNCİ AYIRIM\nYetki\nGenel kural\nMADDE 5-")
+    assert out[1]["text"].endswith("tabidir.")
+    assert out[2]["text"].startswith("Genel yetkili mahkeme\nMADDE 6-")
+    assert stats["moved_title_lines"] == 4

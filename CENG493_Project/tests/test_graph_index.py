@@ -14,7 +14,6 @@ from retrieval.graph_builder import (
     graph_stats,
     lookup_by_source_madde,
     _extract_madde_no,
-    _parse_chunk_suffix,
 )
 from retrieval.graph_index import GraphIndex
 
@@ -74,19 +73,19 @@ _META_LEGACY = [
         "chunk_id": "tck_5237_m12",
         "doc_id": "5237",
         "source": "Türk Ceza Kanunu",
-        "text": "Madde 12 metni. Madde 13'e bakınız.",
+        "text": "Madde 12 – metni. Madde 13'e bakınız.",
     },
     {
         "chunk_id": "tck_5237_m13",
         "doc_id": "5237",
         "source": "Türk Ceza Kanunu",
-        "text": "Madde 13 metni.",
+        "text": "Madde 13 – metni.",
     },
     {
         "chunk_id": "tck_5237_m14",
         "doc_id": "5237",
         "source": "Türk Ceza Kanunu",
-        "text": "Madde 14 metni.",
+        "text": "Madde 14 – metni.",
     },
 ]
 
@@ -253,7 +252,7 @@ class TestBuildGraph:
     def test_intra_reference(self):
         """A chunk mentioning 'Madde 13' links to the chunk with madde_no=13."""
         graph = build_graph_from_metadata(_META_LEGACY)
-        # _META_LEGACY[0] text: "Madde 12 metni. Madde 13'e bakınız."
+        # _META_LEGACY[0] text: "Madde 12 – metni. Madde 13'e bakınız."
         # → intra edge from m12 to m13
         cid_m12 = "tck_5237_m12"
         kinds = {kind for _, kind in graph.get(cid_m12, [])}
@@ -788,3 +787,16 @@ class TestCorruptGraphRecovery:
         # After rebuild the file on disk should be valid JSON
         reloaded = json.loads(g_path.read_text(encoding="utf-8"))
         assert "_source_madde_lookup" in reloaded
+
+
+def test_graph_index_from_metadata_builds_adjacency_in_memory():
+    from retrieval.graph_index import GraphIndex
+    meta = [
+        {"chunk_id": "a", "doc_id": "d", "source": "TCK", "text": "MADDE 1 - x", "madde_no": "1"},
+        {"chunk_id": "b", "doc_id": "d", "source": "TCK", "text": "MADDE 2 - y", "madde_no": "2"},
+        {"chunk_id": "c", "doc_id": "d", "source": "TCK", "text": "MADDE 9 - z", "madde_no": "9"},
+    ]
+    gi = GraphIndex.from_metadata(meta)
+    out = gi.expand([{"chunk_id": "a", "score": 1.0}], budget=3, kinds=("adj",))
+    assert [c["chunk_id"] for c in out] == ["a", "b"]
+    assert out[1]["text"] == "MADDE 2 - y"

@@ -20,8 +20,9 @@ Each function returns a dict with keys:
 Raw judge responses are saved per run to judge_raw_<metric>_<run_id>.jsonl via
 save_raw_responses() (one file per run, never appended across runs).
 
-Bug fix: _parse_score now returns None on failure instead of 0.5, so failed
-parses are excluded from the mean rather than biasing it toward 0.5.
+_parse_score returns None on failure (never 0.5), so failed parses are
+excluded from the mean; ``score_failures_as_zero`` reports the sensitivity
+variant and ``call_fail_count`` separates dead Ollama calls from bad parses.
 
 Identical-score investigation: base stage had judge==coherence==0.2675 exactly.
 Root cause: with temperature=0.0 the judge LLM is deterministic; _subsample
@@ -69,10 +70,42 @@ except Exception:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+_NUM = r"(?:\d+(?:\.\d+)?|\.\d+)"
+# A score candidate: a fraction N/D or a bare number, not glued to other digits,
+# a slash (article refs like "5/1") or a following ".digit".
+_FRACTION_RE = re.compile(r"(?<![\d./])(" + _NUM + r")\s*/\s*(\d+)(?![\d/])")
+_NUMBER_RE = re.compile(r"(?<![\d./])(" + _NUM + r")(?![\d/]|\.\d|\s*/)")
+_KEYWORD_RE = re.compile(r"(?:puan|skor|score|not)\w*\s*[:=]?\s*", re.IGNORECASE)
+_ORDINAL_AFTER = re.compile(r"\.\s*[a-zçğıöşü]")  # "1. maddeye", "2. fıkra"
+
+
+def _candidate(text: str, m: "re.Match", fraction: bool) -> Optional[float]:
+    """Score in [0, 1] for a matched number/fraction, or None if implausible."""
+    if fraction:
+        num, den = float(m.group(1)), float(m.group(2))
+        if den == 0 or den not in (1, 2, 4, 5, 10, 100):
+            return None
+        if den == 1 and num > 1:          # "m. 5/1" is an article, not a score
+            return None
+        return max(0.0, min(1.0, num / den))
+    if _ORDINAL_AFTER.match(text, m.end()):  # Turkish ordinal "1. madde"
+        return None
+    val = float(m.group(1))
+    return val if 0.0 <= val <= 1.0 else None
+
+
 def _parse_score(text: str) -> Optional[float]:
     """Extract a score in [0, 1] from LLM judge response text.
 
-    Handles N/10, N/5, and direct floats.
+    The rubric asks for 0 / 0.5 / 1; N/D fractions (N/10, N/5, 1/2) are also
+    accepted.  Order of preference:
+      1. a score at the very start of the response (optionally after
+         "Puan:"), unless it is an ordinal such as "1. maddeye";
+      2. a number after a "puan/skor/score" keyword;
+      3. the last plausible score in the text (explanations usually end with
+         the verdict).
+    Article references ("m. 5/1"), years and other out-of-range numbers are
+    never read as scores.
 
     Returns:
         Float score clamped to [0, 1], or **None** if the response cannot be
@@ -84,25 +117,30 @@ def _parse_score(text: str) -> Optional[float]:
     # Decimal comma ("0,8") -> decimal point
     text = re.sub(r'(?<=\d),(?=\d)', '.', text.strip())
 
-    # 1. Exact standalone float in [0,1] (e.g. "0.7", "1", "0.85")
-    m = re.match(r'^([01](?:\.\d+)?)\s*$', text)
-    if m:
-        return max(0.0, min(1.0, float(m.group(1))))
+    def _at(pos: int) -> Optional[float]:
+        for rx, frac in ((_FRACTION_RE, True), (_NUMBER_RE, False)):
+            m = rx.match(text, pos)
+            if m:
+                return _candidate(text, m, frac)
+        return None
 
-    # 2. N/D formats (N/10, N/5, N/1): the denominator is the scale
-    m = re.search(r'(?<![\d.])(\d+(?:\.\d+)?)\s*/\s*(10|5|1)(?!\d)', text)
-    if m:
-        return max(0.0, min(1.0, float(m.group(1)) / float(m.group(2))))
+    lead = re.match(r"\s*(?:(?:puan|skor|score)\w*\s*[:=]?\s*)?", text, re.IGNORECASE)
+    val = _at(lead.end())
+    if val is not None:
+        return val
+    for km in _KEYWORD_RE.finditer(text):
+        val = _at(km.end())
+        if val is not None:
+            return val
 
-    # 3. Standalone decimal in [0,1] anywhere in text
-    m = re.search(r'(?<![\d/.])([01]\.\d+)(?!\d)(?!\s*/)', text)
-    if m:
-        return max(0.0, min(1.0, float(m.group(1))))
-
-    # 4. Standalone "0" or "1" not part of a larger number
-    m = re.search(r'(?<![\d.])([01])(?![\d/]|\.\d)', text)
-    if m:
-        return float(m.group(1))
+    found: list[tuple[int, float]] = []
+    for rx, frac in ((_FRACTION_RE, True), (_NUMBER_RE, False)):
+        for m in rx.finditer(text):
+            v = _candidate(text, m, frac)
+            if v is not None:
+                found.append((m.start(), v))
+    if found:
+        return max(found)[1]
 
     logger.warning(
         "LLM judge _parse_score: could not parse score from response: %r",
@@ -210,14 +248,24 @@ def save_raw_responses(
 
 
 def _aggregate(per_sample: list[dict]) -> dict:
-    """Compute mean score excluding None/failed parses and return summary dict."""
+    """Compute mean score excluding None/failed parses and return summary dict.
+
+    ``parse_fail_count`` counts every sample without a score (kept for the
+    failure-rate check); ``call_fail_count`` is the subset where the Ollama
+    call itself failed, so a dead judge is not mistaken for parse noise.
+    ``score_failures_as_zero`` is the sensitivity variant that counts every
+    missing score as 0 instead of dropping it.
+    """
     valid = [s["score"] for s in per_sample if s["score"] is not None]
     fail_count = sum(1 for s in per_sample if s.get("parse_failed", False) or s["score"] is None)
+    call_fails = sum(1 for s in per_sample if s.get("call_failed", False))
     mean_score: Optional[float] = sum(valid) / len(valid) if valid else None
     return {
         "score": mean_score,
+        "score_failures_as_zero": sum(valid) / len(per_sample) if per_sample else None,
         "per_sample": per_sample,
         "parse_fail_count": fail_count,
+        "call_fail_count": call_fails,
         "sample_size": len(per_sample),
     }
 
@@ -310,6 +358,7 @@ def _run_metric(
             "score": score,
             "raw_response": raw,
             "parse_failed": score is None,
+            "call_failed": raw is None,
         })
     result = _aggregate(per_sample)
     if results_dir is not None:

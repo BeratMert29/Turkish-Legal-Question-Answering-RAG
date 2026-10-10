@@ -9,12 +9,16 @@ def compute_ragas_metrics(
     predictions: list[dict],
     llm_model: str,
     embedding_model: str = "nomic-embed-text",
-    ollama_base: str = "http://localhost:11434",
+    ollama_base: Optional[str] = None,
     sample_size: int = 50,
 ) -> Optional[dict]:
     """
     Compute RAGAS metrics: faithfulness, answer_relevancy,
     context_precision, context_recall.
+
+    ``llm_model`` is the evaluator LLM; callers pass the judge model
+    (config.LLM_JUDGE_MODEL), never the generator, so the same evaluator
+    scores every stage.  ``ollama_base`` defaults to config.LLM_BASE_URL.
 
     predictions: list of dicts with keys:
         question, predicted, expected, retrieved_chunks
@@ -65,6 +69,9 @@ def compute_ragas_metrics(
         return None
 
     dataset = Dataset.from_dict(data)
+    if ollama_base is None:
+        import config
+        ollama_base = config.LLM_BASE_URL.rstrip("/").removesuffix("/v1")
 
     try:
         llm = ChatOllama(model=llm_model, base_url=ollama_base, temperature=0)

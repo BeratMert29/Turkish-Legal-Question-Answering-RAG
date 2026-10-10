@@ -1,192 +1,178 @@
-"""Conditional perplexity computation via HuggingFace transformers.
+"""Conditional perplexity of generated answers via HuggingFace transformers.
 
-Computes PPL(answer | context, question) for each sample by masking the
-prefix tokens (context + question) with -100 and running a single forward
-pass through a causal LM loaded from HuggingFace Hub.
+PPL(answer | system prompt, context, question) under the generator's own
+weights: the HF base of the Ollama model plus, for the fine-tuned LLM, its
+LoRA adapter.  The input is built with the model's chat template, exactly as
+the generator was prompted, and only answer tokens are scored (the prompt is
+masked with -100).  When prompt + answer exceed ``max_tokens`` the prompt is
+cut from the left (oldest context first); the answer is never truncated.
 """
 import logging
 import math
+import random
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# Ollama model name -> HuggingFace model ID mapping
-_OLLAMA_TO_HF: dict[str, str] = {
-    "qwen2.5:7b": "Qwen/Qwen2.5-7B-Instruct",
-    "qwen25-legal-ft": "Qwen/Qwen2.5-7B-Instruct",
-    "qwen2.5:14b": "Qwen/Qwen2.5-14B-Instruct",
+# Ollama model name -> (HuggingFace base model ID, uses LoRA adapter)
+_OLLAMA_TO_HF: dict[str, tuple[str, bool]] = {
+    "qwen2.5:7b": ("Qwen/Qwen2.5-7B-Instruct", False),
+    "qwen2.5:14b": ("Qwen/Qwen2.5-14B-Instruct", False),
+    "qwen2.5:3b": ("Qwen/Qwen2.5-3B-Instruct", False),
 }
-_HF_DEFAULT = "Qwen/Qwen2.5-7B-Instruct"
 
 
-def _resolve_hf_model_id(ollama_model: str) -> str:
-    """Return HF model ID for the given Ollama model name."""
-    return _OLLAMA_TO_HF.get(ollama_model, _HF_DEFAULT)
+def resolve_generator_weights(ollama_model: str) -> tuple[str | None, Path | None]:
+    """``(hf_base_id, adapter_dir)`` matching an Ollama generator model.
+
+    The fine-tuned model maps to ``config.LORA_BASE_HF_MODEL`` plus the LoRA
+    adapter; unknown models map to ``(None, None)``.
+    """
+    import config
+
+    if ollama_model == config.LLM_FINETUNED_MODEL:
+        for d in (config.LORA_ADAPTER_DIR, config.LORA_ADAPTER_FALLBACK_DIR):
+            if (Path(d) / "adapter_config.json").exists():
+                return config.LORA_BASE_HF_MODEL, Path(d)
+        log.warning("LoRA adapter not found in %s or %s",
+                    config.LORA_ADAPTER_DIR, config.LORA_ADAPTER_FALLBACK_DIR)
+        return None, None
+    base, _ = _OLLAMA_TO_HF.get(ollama_model, (None, False))
+    return base, None
+
+
+def build_scoring_ids(tokenizer, system_prompt: str, user: str, answer: str,
+                      max_tokens: int) -> tuple[list[int], int] | None:
+    """Token ids of prompt + answer and the number of prompt tokens.
+
+    The prompt is the chat-templated system + user turn with the generation
+    prompt appended; when the total exceeds *max_tokens* prompt tokens are
+    dropped from the left.  Returns None when the answer alone does not fit.
+    """
+    messages = [{"role": "system", "content": system_prompt},
+                {"role": "user", "content": user}]
+    prompt_ids = list(tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True))
+    answer_ids = tokenizer.encode(answer, add_special_tokens=False)
+    if not answer_ids or len(answer_ids) >= max_tokens:
+        return None
+    keep = max_tokens - len(answer_ids)
+    if len(prompt_ids) > keep:
+        prompt_ids = prompt_ids[-keep:]
+    return prompt_ids + answer_ids, len(prompt_ids)
 
 
 def compute_perplexity(
     predictions: list[dict],
     model: str,
-    ollama_base: str = "http://localhost:11434",  # kept for signature compat, not used
-    sample_size: int = 50,
+    sample_size: int | None = 100,
     hf_model_id: str | None = None,
+    adapter_dir: "str | Path | None" = None,
     use_4bit: bool = True,
+    max_tokens: int = 4096,
+    short_answer_mode: bool = False,
+    seed: int = 42,
 ) -> float | None:
-    """Compute mean conditional perplexity of generated answers.
-
-    For each sample the loss is evaluated only over the answer tokens; the
-    prefix (context + question) tokens are masked with -100 so they do not
-    contribute to the cross-entropy loss.
+    """Geometric-mean conditional perplexity of generated answers.
 
     Parameters
     ----------
     predictions:
-        List of dicts, each containing:
-        - ``question``        (str)
-        - ``predicted``       (str) — the generated answer
-        - ``retrieved_chunks`` (list[dict]) — each with ``text`` and ``source``
+        Dicts with ``question``, ``predicted`` and ``retrieved_chunks`` (the
+        chunks the generator saw).
     model:
-        Ollama model name; used only to derive ``hf_model_id`` when that
-        argument is *None*.
-    ollama_base:
-        Ignored.  Kept so existing callers do not need to be updated.
+        Ollama generator name; resolves the HF base + adapter unless
+        *hf_model_id* is given.
     sample_size:
-        Maximum number of samples to evaluate.
-    hf_model_id:
-        Explicit HuggingFace model ID.  When *None* the ID is derived from
-        ``model`` via the built-in mapping.
-    use_4bit:
-        Load the model in 4-bit NF4 quantisation to reduce VRAM usage.
+        Random sample (seeded) of predictions; None scores all.
 
     Returns
     -------
     float or None
-        Mean perplexity across successful samples, or *None* if fewer than
-        3 samples could be evaluated.
+        None when weights cannot be resolved/loaded or fewer than 3 samples
+        succeed.
     """
-    # 1. Availability check — import lazily so the module is importable
-    #    even when torch / transformers are not installed.
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError:
-        log.warning(
-            "torch and/or transformers are not installed; "
-            "perplexity computation is unavailable."
-        )
+        log.warning("torch and/or transformers are not installed; perplexity unavailable.")
         return None
 
-    # 2. Resolve HuggingFace model ID and build quantisation config.
-    resolved_hf_id = hf_model_id if hf_model_id is not None else _resolve_hf_model_id(model)
-    log.info("Loading HuggingFace model '%s' for perplexity evaluation.", resolved_hf_id)
+    from generation.rag_pipeline import (
+        SHORT_ANSWER_PROMPT, TURKISH_PROMPT, format_source, user_message,
+    )
+
+    if hf_model_id is None:
+        hf_model_id, adapter_dir = resolve_generator_weights(model)
+    if hf_model_id is None:
+        log.warning("No HF weights known for generator %r; perplexity skipped.", model)
+        return None
+    log.info("Perplexity model: %s%s", hf_model_id,
+             f" + LoRA {adapter_dir}" if adapter_dir else "")
 
     model_kwargs: dict = {"device_map": "auto"}
-
     if use_4bit:
         try:
             from transformers import BitsAndBytesConfig
 
-            bnb_config = BitsAndBytesConfig(
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
-            model_kwargs["quantization_config"] = bnb_config
         except ImportError:
-            log.warning(
-                "bitsandbytes is not installed; loading model in full precision."
-            )
+            log.warning("bitsandbytes is not installed; loading model in full precision.")
 
-    # 3. Load tokenizer and model (lazy, inside the function).
-    tokenizer = AutoTokenizer.from_pretrained(resolved_hf_id, use_fast=True)
-    hf_model = AutoModelForCausalLM.from_pretrained(resolved_hf_id, **model_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_id, use_fast=True)
+    hf_model = AutoModelForCausalLM.from_pretrained(hf_model_id, **model_kwargs)
+    if adapter_dir is not None:
+        from peft import PeftModel
+        hf_model = PeftModel.from_pretrained(hf_model, str(adapter_dir))
     hf_model.eval()
-
-    # 4. Determine the device for tensor placement.
-    #    With device_map="auto" the model may be split; use the embedding
-    #    layer's device as the input device.
     try:
         input_device = next(hf_model.parameters()).device
     except StopIteration:
         input_device = torch.device("cpu")
 
-    # 5. Iterate over samples and compute per-sample perplexity.
-    sampled = predictions[:sample_size]
+    system_prompt = SHORT_ANSWER_PROMPT if short_answer_mode else TURKISH_PROMPT
+    pool = [p for p in predictions
+            if (p.get("predicted") or "").strip() and p.get("retrieved_chunks")]
+    if sample_size is not None and len(pool) > sample_size:
+        pool = random.Random(seed).sample(pool, sample_size)
+
     perplexities: list[float] = []
-
-    for pred in sampled:
-        question = pred.get("question", "")
-        answer = pred.get("predicted", "").strip()
-        chunks = pred.get("retrieved_chunks", [])
-
-        if not answer or not chunks:
+    for pred in pool:
+        # Native answer: injected [Kaynak N] tags were not generated by the model.
+        answer = (pred.get("predicted_native") or pred["predicted"]).strip()
+        context = "".join(format_source(i + 1, c.get("source", ""), c.get("text", ""))
+                          for i, c in enumerate(pred["retrieved_chunks"]))
+        built = build_scoring_ids(tokenizer, system_prompt,
+                                  user_message(pred.get("question", ""), context),
+                                  answer, max_tokens)
+        if built is None:
             continue
-
+        ids, n_prompt = built
         try:
-            # Build context block (same format as rag_pipeline.py).
-            context_parts = [
-                f"[Kaynak {i + 1}] ({c.get('source', '')}) {c.get('text', '')}"
-                for i, c in enumerate(chunks[:5])
-            ]
-            context_block = "\n\n".join(context_parts)
-
-            prefix = f"Bağlam:\n{context_block}\n\nSoru: {question}"
-            full_text = prefix + f"\n\nCevap: {answer}"
-
-            # Cap lengths to avoid OOM on very long inputs.
-            prefix = prefix[:3000]
-            full_text = full_text[:4000]
-
-            # Tokenise prefix and full text separately so we know the
-            # exact boundary between prefix and answer tokens.
-            prefix_ids = tokenizer.encode(prefix, add_special_tokens=True)
-            full_ids = tokenizer.encode(full_text, add_special_tokens=True)
-
-            # Ensure full_ids is at least as long as prefix_ids; if
-            # truncation made them equal no answer tokens remain.
-            if len(full_ids) <= len(prefix_ids):
-                log.debug("No answer tokens remain after tokenisation; skipping sample.")
-                continue
-
-            full_tensor = torch.tensor([full_ids], dtype=torch.long, device=input_device)
-
-            # Build labels: mask prefix tokens with -100.
-            labels = full_tensor.clone()
-            labels[0, : len(prefix_ids)] = -100
-
+            full = torch.tensor([ids], dtype=torch.long, device=input_device)
+            labels = full.clone()
+            labels[0, :n_prompt] = -100
             with torch.no_grad():
-                outputs = hf_model(input_ids=full_tensor, labels=labels)
-                loss: torch.Tensor = outputs.loss
-
+                loss = hf_model(input_ids=full, labels=labels).loss
             if torch.isfinite(loss):
                 perplexities.append(math.exp(loss.item()))
-
         except Exception as exc:
             log.debug("Perplexity computation failed for sample: %s", exc)
-            continue
 
-    # 6. Aggregate results.
-    if not perplexities:
-        log.warning(
-            "No perplexity values were computed (all samples failed or were skipped)."
-        )
-        return None
+    del hf_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if len(perplexities) < 3:
-        log.warning(
-            "Only %d sample(s) succeeded; result is not meaningful. Returning None.",
-            len(perplexities),
-        )
+        log.warning("Only %d perplexity sample(s) succeeded; returning None.", len(perplexities))
         return None
-
-    # Geometric mean of per-sample PPL values (equivalent to exp of mean loss),
-    # which avoids inflating the aggregate when any sample has unusually high loss.
-    valid_ppls = [p for p in perplexities if p > 0]
-    if not valid_ppls:
-        log.warning("All perplexity values are zero; cannot compute geometric mean.")
-        return None
-    mean_ppl = math.exp(sum(math.log(p) for p in valid_ppls) / len(valid_ppls))
-    log.info(
-        "Perplexity computed over %d samples (geometric mean): %.4f", len(valid_ppls), mean_ppl
-    )
+    # Geometric mean of per-sample PPL (exp of mean per-sample loss).
+    mean_ppl = math.exp(sum(math.log(p) for p in perplexities) / len(perplexities))
+    log.info("Perplexity over %d samples (geometric mean): %.4f", len(perplexities), mean_ppl)
     return round(mean_ppl, 4)

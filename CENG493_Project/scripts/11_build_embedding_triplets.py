@@ -2,12 +2,19 @@
 """scripts/11_build_embedding_triplets.py -- Build contrastive training triplets for BGE-M3 fine-tuning.
 
 For each question in qa_train.jsonl:
-  - positive: top-1 corpus chunk by cosine similarity (skipped if score < 0.3)
-  - hard negatives: ranks 5-30, filtered to exclude chunks from the same source document
+  - positive: when the question names a law article ("Anayasa madde 1",
+    "TCK 86. madde"), the best-scoring chunk of that law + article; otherwise
+    the top-1 corpus chunk by cosine similarity (skipped if score < 0.3).
+    The base model's own top-1 is right only ~1/3 of the time for questions
+    that cite an article, so article-matched positives are preferred.
+  - hard negatives: ranks 5-30, excluding the positive and every chunk of the
+    positive's own article (same law + madde_no); other articles of the same
+    law are kept, they are the confusions article-level retrieval must learn.
   - padded with random negatives to reach NUM_HARD_NEGATIVES total
 
 Output format (FlagEmbedding-compatible JSONL):
-  {"query": "...", "pos": ["positive chunk text"], "neg": ["neg1", ..., "neg7"]}
+  {"query": "...", "pos": ["positive chunk text"], "neg": ["neg1", ..., "neg7"],
+   "pos_chunk_id": "...", "pos_strategy": "article" | "dense_top1"}
 """
 import json
 import random
@@ -29,7 +36,7 @@ HARD_NEG_TOP_K = 30           # search pool size for hard negative mining
 MIN_POSITIVE_SCORE = 0.3      # skip query if best chunk similarity is below this
 HARD_NEG_START_RANK = 4       # skip ranks 0-3 (too close to positive) — 0-indexed
 MIN_GT_OVERLAP = 0.3          # minimum Jaccard overlap to accept a ground-truth positive
-RANDOM_SEED = 42
+RANDOM_SEED = config.SEED
 
 QA_PATH = config.PROCESSED_DIR / "qa_train.jsonl"
 CORPUS_PATH = config.PROCESSED_DIR / "corpus_chunks.jsonl"
@@ -59,6 +66,23 @@ def _find_gt_positive(context: str, chunk_texts: list[str]) -> tuple[int | None,
     return best_idx, best_score
 
 
+def explicit_article(question: str) -> tuple[str, str] | None:
+    """(corpus source, madde_no) named in the question via a law
+    abbreviation ("Anayasa madde 1", "TCK 86. madde"), else None."""
+    from retrieval.graph_index import _LAW_ABBREVS_NORM, find_abbrev_maddes
+
+    for abbrev, madde in find_abbrev_maddes(question):
+        source = _LAW_ABBREVS_NORM.get(abbrev)
+        if source:
+            return source, str(madde)
+    return None
+
+
+def article_key(chunk: dict) -> tuple[str, str] | None:
+    madde = chunk.get("madde_no")
+    return (chunk.get("source", ""), str(madde).lower()) if madde else None
+
+
 def main() -> None:
     random.seed(RANDOM_SEED)
 
@@ -66,6 +90,11 @@ def main() -> None:
     print(f"Loading QA pairs from {QA_PATH} ...")
     qa_pairs = list(read_jsonl(QA_PATH))
     print(f"  {len(qa_pairs)} QA pairs loaded.")
+    from data.data_processor import DataProcessor, normalize_question
+    eval_keys = DataProcessor.saved_eval_question_keys()
+    n_before = len(qa_pairs)
+    qa_pairs = [qa for qa in qa_pairs if normalize_question(qa["question"]) not in eval_keys]
+    print(f"  {n_before - len(qa_pairs)} dropped: question is in an eval set")
 
     print(f"Loading corpus chunks from {CORPUS_PATH} ...")
     corpus = list(read_jsonl(CORPUS_PATH))
@@ -100,43 +129,56 @@ def main() -> None:
 
     # ── Build triplets ───────────────────────────────────────────────────────
     all_indices = list(range(len(chunk_texts)))
+    by_article: dict[tuple[str, str], list[int]] = {}
+    for idx, c in enumerate(corpus):
+        key = article_key(c)
+        if key:
+            by_article.setdefault(key, []).append(idx)
     triplets: list[dict] = []
     skipped_low_score = 0
+    strategy_counts = {"article": 0, "context": 0, "dense_top1": 0}
 
     for i, qa in enumerate(qa_pairs):
-        # Try ground-truth context first (avoids self-distillation errors)
-        gt_context = qa.get("context", "")
         pos_idx = None
-        pos_text = None
-        if gt_context:
+        strategy = None
+
+        # 1. The article the question names (gold by construction).
+        art = explicit_article(qa["question"])
+        candidates = by_article.get((art[0], art[1].lower())) if art else None
+        if candidates:
+            sims = corpus_embs[candidates] @ q_embs[i]
+            pos_idx = candidates[int(np.argmax(sims))]
+            strategy = "article"
+
+        # 2. Ground-truth context, when the training row carries one.
+        gt_context = qa.get("context", "")
+        if pos_idx is None and gt_context:
             gt_idx, gt_overlap = _find_gt_positive(gt_context, chunk_texts)
             if gt_idx is not None and gt_overlap >= MIN_GT_OVERLAP:
-                pos_idx = gt_idx
-                pos_text = chunk_texts[pos_idx]
+                pos_idx, strategy = gt_idx, "context"
 
-        # Fall back to top-1 FAISS result
+        # 3. Fall back to top-1 FAISS result
         if pos_idx is None:
             pos_idx = int(indices_all[i][0])
             pos_score = float(scores_all[i][0])
             if pos_score < MIN_POSITIVE_SCORE:
                 skipped_low_score += 1
                 continue
-            pos_text = chunk_texts[pos_idx]
-
-        pos_source = corpus[pos_idx].get("source", "")
+            strategy = "dense_top1"
+        strategy_counts[strategy] += 1
+        pos_text = chunk_texts[pos_idx]
+        pos_article = article_key(corpus[pos_idx])
 
         # Hard negatives: ranks HARD_NEG_START_RANK to HARD_NEG_TOP_K-1
         hard_negs: list[str] = []
         for rank in range(HARD_NEG_START_RANK, HARD_NEG_TOP_K):
             neg_idx = int(indices_all[i][rank])
 
-            # Skip if this is the positive chunk itself
-            if neg_idx == pos_idx:
+            # Skip the positive itself and any other chunk of its article
+            # (a continuation of the same article is not a negative).
+            if neg_idx == pos_idx or chunk_texts[neg_idx] == pos_text:
                 continue
-
-            # Skip if the chunk comes from the same source document (too easy / near-duplicate)
-            neg_source = corpus[neg_idx].get("source", "")
-            if neg_source and neg_source == pos_source:
+            if pos_article and article_key(corpus[neg_idx]) == pos_article:
                 continue
 
             hard_negs.append(chunk_texts[neg_idx])
@@ -160,6 +202,8 @@ def main() -> None:
             "query": qa["question"],
             "pos": [pos_text],
             "neg": hard_negs,
+            "pos_chunk_id": chunk_ids[pos_idx],
+            "pos_strategy": strategy,
         })
 
     # ── Save output ───────────────────────────────────────────────────────────
@@ -168,9 +212,10 @@ def main() -> None:
         for t in triplets:
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
 
-    print(f"\nDone.")
+    print("\nDone.")
     print(f"  Triplets saved : {len(triplets):,}  ->  {OUTPUT_PATH}")
     print(f"  Skipped        : {skipped_low_score:,}  (positive score < {MIN_POSITIVE_SCORE})")
+    print(f"  Positives by   : {strategy_counts}")
     print(f"  Negatives/query: {NUM_HARD_NEGATIVES} (hard) + random padding as needed")
 
 

@@ -6,7 +6,6 @@ import json
 import pathlib
 import re
 
-import numpy as np
 import pandas as pd
 import config
 from utils import read_jsonl as _read_jsonl
@@ -19,9 +18,6 @@ _TEXT_SPLITTER = RecursiveCharacterTextSplitter(
     length_function=len,
     separators=["\n\n", "\n", ". ", " ", ""],
 )
-
-# Matches the start of a Turkish law article heading (e.g. "MADDE 1", "Madde 12").
-_ARTICLE_RE = re.compile(r"(?m)(?=^\s*MADDE\s+\d)", re.IGNORECASE)
 
 # Patterns for extracting a Turkish law article (madde) number from free text.
 _MADDE_PATTERNS = [
@@ -97,14 +93,14 @@ def _chunk_matches_madde_str(
     """Return True if *chunk* belongs to the article named by the normalised
     string *madde_no* (``"12"``, ``"183-a"``, ``"ek-3"``, ``"gecici-2"``).
 
-    *inherited* is the article carried forward from the preceding chunks of the
-    same document; it is used only when the chunk has no ``madde_no`` field."""
+    A chunk belongs to an article when its stored ``madde_no`` is that
+    article, when *inherited* (the article whose text continues into the
+    chunk, see :func:`_inherited_madde_nos`) is that article, or when the chunk
+    holds that article's line-anchored heading."""
     want = str(madde_no).strip().lower()
-    stored = getattr(chunk, "madde_no", None)
-    if stored is None:
-        stored = inherited  # continuation chunk of a legacy corpus without madde_no
-    if stored is not None and str(stored).strip().lower() == want:
-        return True
+    for cand in (getattr(chunk, "madde_no", None), inherited):
+        if cand is not None and str(cand).strip().lower() == want:
+            return True
     # The stored/leading article can differ from the one asked for when the
     # chunk opens with a section title or holds several articles, so also scan
     # every line-anchored article heading in the chunk text.
@@ -154,22 +150,84 @@ def _silver_lexical_score(query_tokens: "list[str]", chunk_text: str) -> float:
 
 
 # Anchored to line-start ((?m)^\s*) so mid-text references like
-# "Madde 5 uyarınca" are never mistaken for article headings.
-# Suffix "[/-][A-Za-z]" captures "183/A" or "183-A"; normalised to
-# "183-a" via _normalize_madde_suffix().
+# "Madde 5 uyarınca" are never mistaken for article headings, and followed by
+# a heading separator ("Madde 12 –", "MADDE 12. -", "Madde 12- (1)",
+# "MADDE 12 İşyeri…" or end of line), so amendment-table rows such as
+# "Madde 3 14/4/2011" or "Madde 9," are not headings either.
+# Suffix "[/-][A-Za-z]" captures "183/A" or "183-A" (only when no further
+# letter follows: "Madde 605-Yasal" is article 605); normalised to "183-a"
+# via _normalize_madde_suffix().
 # ekg : ekgecici-N — "Ek Geçici Madde 2"
 # ek  : ek-N       — "Ek Madde 3", "EK MADDE 3"
 # gec : gecici-N   — "Geçici Madde 7", "GEÇİCİ MADDE 4"
+# muk : mukerrer-N — "Mükerrer Madde 5"
 # reg : N          — "MADDE 86", "MADDE 183/A"
-_NUM = r"\d+(?:[/-][A-Za-zÇĞİÖŞÜçğıöşü])?"
+_TR_LETTERS = "A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû"
+_NUM = r"\d+(?:[/-][" + _TR_LETTERS + r"](?![" + _TR_LETTERS + r"]))?"
+_HEADING_SEP = r"(?=[ \t]*(?:\.[ \t]*)?[-–—(]|[ \t]*\.?[ \t]*$|[ \t]+[A-ZÇĞİÖŞÜ])"
 _MADDE_HEADING_RE = re.compile(
     r"(?m)^\s*(?:"
     r"(?:Ek|EK)\s+(?:[Gg]eçici|GEÇİCİ)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<ekg>" + _NUM + r")"
     r"|(?:Ek|EK)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<ek>" + _NUM + r")"
     r"|(?:[Gg]eçici|GEÇİCİ)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<gec>" + _NUM + r")"
+    r"|(?:[Mm]ükerrer|MÜKERRER)\s+(?:[Mm][Aa][Dd][Dd][Ee])\s+(?P<muk>" + _NUM + r")"
     r"|(?:MADDE|Madde)\s+(?P<reg>" + _NUM + r")"
-    r")"
+    r")" + _HEADING_SEP
 )
+# Longest line (chars) still treated as an article title above a heading.
+_TITLE_MAX_CHARS = 200
+_TITLE_MAX_LINES = 8
+
+
+def _heading_line_start(text: str, m: "re.Match") -> int:
+    """Offset of the start of the line holding heading match *m*."""
+    pos = m.start() + (len(m.group(0)) - len(m.group(0).lstrip()))
+    return text.rfind("\n", 0, pos) + 1
+
+
+def _title_start(text: str, line_start: int, floor: int = 0) -> int:
+    """Move a split point back over the title lines above an article heading.
+
+    Turkish codes put the article title (and section headers such as
+    "İKİNCİ BÖLÜM") on the lines just above "Madde N –".  Up to
+    _TITLE_MAX_LINES short lines without sentence-final punctuation are
+    taken, blank lines skipped; another heading or a sentence stops the walk.
+    Never goes below *floor* (the line after the previous heading line).
+    """
+    start = i = line_start
+    taken = 0
+    while taken < _TITLE_MAX_LINES and i > floor:
+        j = text.rfind("\n", floor, i - 1) + 1
+        j = max(j, floor)
+        line = text[j:i].strip()
+        if line:
+            if (len(line) > _TITLE_MAX_CHARS or line[-1] in ".;:,!?"
+                    or _MADDE_HEADING_RE.match(line)):
+                break
+            start = j
+            taken += 1
+        i = j
+    return start
+
+
+def _article_parts(text: str) -> "list[str]":
+    """Split a law text into [preamble, article, article, ...]; each article
+    part starts with its title lines and heading."""
+    cuts: list[int] = []
+    floor = 0
+    for m in _MADDE_HEADING_RE.finditer(text):
+        line_start = _heading_line_start(text, m)
+        cut = _title_start(text, line_start, floor)
+        if cuts and cut <= cuts[-1]:
+            cut = line_start
+        if cuts and cut <= cuts[-1]:
+            continue
+        cuts.append(cut)
+        # Title lines of the next article must come after this heading line.
+        line_end = text.find("\n", m.end())
+        floor = len(text) if line_end == -1 else line_end + 1
+    bounds = [0, *cuts, len(text)]
+    return [text[a:b] for a, b in zip(bounds, bounds[1:])]
 
 
 def _normalize_madde_suffix(raw: str) -> str:
@@ -189,6 +247,8 @@ def _heading_key(m: "re.Match") -> str:
         return f"ek-{_normalize_madde_suffix(m.group('ek'))}"
     if m.group("gec"):
         return f"gecici-{_normalize_madde_suffix(m.group('gec'))}"
+    if m.group("muk"):
+        return f"mukerrer-{_normalize_madde_suffix(m.group('muk'))}"
     return _normalize_madde_suffix(m.group("reg"))
 
 
@@ -204,6 +264,7 @@ def _madde_no_from_text(text: str) -> "str | None":
         ``"ek-N"`` for supplementary articles (Ek Madde),
         ``"gecici-N"`` for transitory articles (Geçici Madde),
         ``"ekgecici-N"`` for Ek Geçici Madde,
+        ``"mukerrer-N"`` for Mükerrer Madde,
         or ``None`` when no heading is found.
     """
     m = _MADDE_HEADING_RE.search(text)
@@ -229,26 +290,49 @@ def _assign_madde_nos(texts: "list[str]", carry: "str | None" = None) -> "list[s
     return out
 
 
-def _inherited_madde_nos(corpus_chunks) -> "dict[str, str]":
-    """Carry the article number forward over continuation chunks.
+# Text before a chunk's first heading counts as the tail of the previous
+# article only when it reads like body text (a sentence end after a lowercase
+# letter / closing paren), not like a title block ("I. Devletin şekli").
+_TAIL_MIN_CHARS = 100
+_SENTENCE_END_RE = re.compile(r"[a-zçğıöşü)][.;:](?:\s|$)")
 
-    For corpora built before ``madde_no`` was stored (or by external tools)
-    a chunk in the middle of an article has no heading, so only the first
-    chunk of the article would be labelled gold.  Walk each document in order
-    and give heading-less chunks the last article seen in the same document.
+
+def _is_article_tail(lead: str) -> bool:
+    lead = lead.strip()
+    return len(lead) >= _TAIL_MIN_CHARS and bool(_SENTENCE_END_RE.search(lead))
+
+
+def _inherited_madde_nos(corpus_chunks) -> "dict[str, str]":
+    """Article whose text continues into each chunk, from the previous
+    chunks of the same document.
+
+    A chunk with no heading continues the last article seen; a chunk whose
+    text before its first heading is body text (the end of the previous
+    article, e.g. a character chunk "...fıkra (3) ... MADDE 95 –") also
+    continues it, so that article is labelled gold too.  Needed for corpora
+    built before ``madde_no`` was stored, by external tools, or by the
+    character chunker.
     """
     out: dict[str, str] = {}
     carry: dict[tuple, "str | None"] = {}
     for c in corpus_chunks:
         key = (c.source, c.doc_id)
-        keys = [_heading_key(m) for m in _MADDE_HEADING_RE.finditer(c.text)]
-        if getattr(c, "madde_no", None):
-            carry[key] = c.madde_no if not keys else keys[-1]
-        elif keys:
-            carry[key] = keys[-1]
-        elif carry.get(key):
-            out[c.chunk_id] = carry[key]
+        heads = list(_MADDE_HEADING_RE.finditer(c.text))
+        prev = carry.get(key)
+        if prev and (not heads or _is_article_tail(c.text[:heads[0].start()])):
+            out[c.chunk_id] = prev
+        if heads:
+            carry[key] = _heading_key(heads[-1])
+        elif getattr(c, "madde_no", None):
+            carry[key] = c.madde_no
     return out
+
+
+def normalize_question(text) -> str:
+    """Question key for leakage checks: Turkish-lowercased, punctuation and
+    whitespace runs collapsed."""
+    from utils import normalize_turkish
+    return re.sub(r"\W+", " ", normalize_turkish(str(text or ""))).strip()
 
 
 @dataclass
@@ -271,6 +355,114 @@ class QAExample:
     data_type: str
     madde_no: "str | None" = None   # explicit gold article (turkish_legal_rag)
     hf_row_id: "str | None" = None
+
+
+# ---------------------------------------------------------------------------
+# Gold-label strategies used by DataProcessor.build_relevant_chunk_map
+# ---------------------------------------------------------------------------
+
+class _LabelIndex:
+    """Lookup structures over the corpus, built once per labeling call."""
+
+    def __init__(self, corpus_chunks) -> None:
+        self.chunks = list(corpus_chunks)
+        self.hash_to_ids: dict[str, list[str]] = {}
+        self.by_source: dict[str, list] = {}
+        for chunk in self.chunks:
+            h = hashlib.md5(chunk.text.encode()).hexdigest()
+            self.hash_to_ids.setdefault(h, []).append(chunk.chunk_id)
+            self.by_source.setdefault(chunk.source, []).append(chunk)
+        self.valid_ids = {c.chunk_id for c in self.chunks}
+        self.inherited = _inherited_madde_nos(self.chunks)
+
+
+@dataclass
+class _QAFields:
+    """The QA fields labeling needs, from a QAExample or a plain dict."""
+    query_id: str
+    question: str
+    answer: str
+    context: str
+    source: str
+    madde_no: "str | None"
+    gold_ids: list
+
+    @classmethod
+    def of(cls, qa) -> "_QAFields":
+        get = qa.get if isinstance(qa, dict) else (lambda k, d=None: getattr(qa, k, d))
+        return cls(
+            query_id=get("query_id"),
+            question=get("question", "") or "",
+            answer=get("answer", "") or "",
+            context=get("context", "") or "",
+            source=get("source", "") or "",
+            madde_no=get("madde_no"),
+            gold_ids=list(get("gold_source_ids") or []),
+        )
+
+
+def _label_gold_ids(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """0: chunk ids supplied by an evaluator benchmark (those in the corpus)."""
+    return [gid for gid in q.gold_ids if gid in idx.valid_ids]
+
+
+def _label_explicit_madde(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """0.5: the explicit (source, madde_no) of the row (turkish_legal_rag)."""
+    if not (q.madde_no and q.source):
+        return []
+    return [c.chunk_id for c in idx.by_source.get(q.source, [])
+            if _chunk_matches_madde_str(c, q.madde_no, idx.inherited.get(c.chunk_id))]
+
+
+def _label_context_hash(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """1: re-chunk the row's context with the corpus chunker, match by hash."""
+    if not q.context:
+        return []
+    found: list[str] = []
+    for chunk in DataProcessor.chunk_text(q.context, q.query_id, q.source):
+        found.extend(idx.hash_to_ids.get(hashlib.md5(chunk.text.encode()).hexdigest(), []))
+    return list(dict.fromkeys(found))
+
+
+def _label_doc_id(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """2: chunks of the document whose id is the query id."""
+    return [c.chunk_id for c in idx.chunks if c.doc_id == q.query_id]
+
+
+def _label_answer_substring(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """2.5: chunks containing the first 80 characters of a long answer."""
+    if len(q.answer) < 40:
+        return []
+    needle = q.answer.lower().strip()[:80]
+    pool = idx.by_source.get(q.source, idx.chunks) if q.source else idx.chunks
+    return [c.chunk_id for c in pool if needle in c.text.lower()]
+
+
+def _label_article_mention(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """3: the article number named in the question/answer, in the gold law.
+
+    Queries naming no article stay unlabeled rather than labelling a whole law.
+    """
+    if not q.source:
+        return []
+    madde_no = _extract_madde_no(q.question, q.answer)
+    if madde_no is None:
+        return []
+    return [c.chunk_id for c in idx.by_source.get(q.source, [])
+            if _chunk_matches_article(c, madde_no)]
+
+
+def _label_silver_lexical(q: _QAFields, idx: _LabelIndex) -> list[str]:
+    """3.5 (optional): top-m chunks of the gold law by token overlap with
+    question+answer, above config.SILVER_THRESHOLD -- silver, not gold."""
+    source_chunks = idx.by_source.get(q.source, []) if q.source else []
+    if not source_chunks:
+        return []
+    q_tokens = _turkish_tokenize(f"{q.question} {q.answer}")
+    scored = sorted(((c, _silver_lexical_score(q_tokens, c.text)) for c in source_chunks),
+                    key=lambda x: -x[1])
+    return [c.chunk_id for c, score in scored[:config.SILVER_TOP_M]
+            if score >= config.SILVER_THRESHOLD]
 
 
 class DataProcessor:
@@ -319,64 +511,69 @@ class DataProcessor:
         self._ensure_loaded()
         return self._df[self._df["split"] == split].reset_index(drop=True)
 
-    def _get_kaggle_corpus_eval_split(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Split kaggle rows into (corpus_df, eval_df) holding eval rows out of corpus.
+    def kaggle_eval_df(self) -> pd.DataFrame:
+        """The kaggle rows used as the ``kaggle`` eval set.
 
-        Uses an article-hash split to prevent data leakage: rows sharing the same
-        context text (same article) are always kept together on the same side of the
-        split.  A plain row-level sample would allow the same article to appear in
-        both the FAISS corpus and the eval set under different doc_ids, leaking the
-        gold context into the retrieval index.
+        Up to ``config.QA_EVAL_EXPECTED`` rows, taken round-robin over the
+        distinct contexts (one question per context first, then a second,
+        ...), each in a fixed hash order, so the questions are as independent
+        as the data allows and the set is deterministic.  Questions that also
+        occur in the ``train`` split are left out (train/eval leakage).
 
-        Algorithm:
-        1. Compute MD5 of each row's context text (NaN/empty → treated as "" so
-           all context-less rows stay in the corpus, not the eval set).
-        2. Build a sorted, deduplicated list of unique non-empty context hashes.
-        3. Assign the last N unique hashes to the eval set (deterministic, no shuffle
-           needed because the list is sorted — equivalent to random_state=42 row
-           sampling for uniformly-distributed hashes).
-        4. Eval rows = all rows whose context hash is in the eval hash set.
-        5. Corpus rows = everything else (including all NaN-context rows).
-
-        Returns:
-            corpus_df: rows NOT sampled for eval — used for FAISS index construction.
-            eval_df:   rows sampled for eval — used to build the QA eval set.
-
-        Result is cached on the instance so the expensive split is computed only once
-        per pipeline run even when both build_corpus_chunks() and build_qa_eval_set()
-        call this method.
+        The contexts stay in the index: a retrieval eval needs its gold
+        passages in the corpus, so leakage control happens on the training
+        data (:meth:`build_qa_train_set`, :meth:`build_kaggle_train_set`),
+        not by removing passages from the index.
         """
-        if hasattr(self, "_split_cache"):
-            return self._split_cache
+        if hasattr(self, "_kaggle_eval_cache"):
+            return self._kaggle_eval_cache
+
+        def _md5(val) -> str:
+            return hashlib.md5(str(val).encode("utf-8")).hexdigest()
 
         df = self.get_corpus_rows()
+        df = df[df["context"].notna() & (df["context"].astype(str) != "")]
+        train_keys = {normalize_question(q) for q in self.get_qa_split("train")["question"].dropna()}
+        df = df[~df["question"].fillna("").map(normalize_question).isin(train_keys)]
+        groups = [
+            sorted(g.index, key=lambda i: _md5(df.at[i, "id"]))
+            for _, g in sorted(df.groupby(df["context"].map(_md5)), key=lambda kv: kv[0])
+        ]
+        picked: list[int] = []
+        depth = 0
+        while len(picked) < config.QA_EVAL_EXPECTED and any(len(g) > depth for g in groups):
+            for g in groups:
+                if depth < len(g) and len(picked) < config.QA_EVAL_EXPECTED:
+                    picked.append(g[depth])
+            depth += 1
+        self._kaggle_eval_cache = df.loc[picked].reset_index(drop=True)
+        return self._kaggle_eval_cache
 
-        # Step 1 — compute per-row context hash (empty string for NaN).
-        def _ctx_hash(val):
-            text = "" if (val is None or (isinstance(val, float) and pd.isna(val))) else str(val)
-            return hashlib.md5(text.encode()).hexdigest() if text else ""
+    def eval_question_keys(self) -> set[str]:
+        """Normalised questions of every eval set (kaggle, turkish_legal_rag,
+        HMGS) -- to be kept out of any training data."""
+        keys = {normalize_question(q) for q in self.kaggle_eval_df()["question"].dropna()}
+        return keys | DataProcessor.saved_eval_question_keys()
 
-        ctx_hashes = [_ctx_hash(val) for val in df["context"]]
-
-        # Step 2 — unique non-empty hashes, sorted for determinism.
-        unique_hashes = sorted({h for h in ctx_hashes if h})
-        n = min(config.QA_EVAL_EXPECTED, len(unique_hashes))
-
-        # Step 3 — take the last N unique hashes as the eval set.
-        eval_hash_set = set(unique_hashes[-n:])
-
-        # Step 4 — partition rows via boolean mask.
-        eval_mask = np.array([h in eval_hash_set for h in ctx_hashes])
-        eval_df = df[eval_mask].reset_index(drop=True)
-        corpus_df = df[~eval_mask].reset_index(drop=True)
-
-        self._split_cache = (corpus_df, eval_df)
-        return corpus_df, eval_df
-
-    def get_eval_only_rows(self) -> pd.DataFrame:
-        """Return only the kaggle rows held out for eval (not in the FAISS corpus)."""
-        _, eval_df = self._get_kaggle_corpus_eval_split()
-        return eval_df
+    @staticmethod
+    def saved_eval_question_keys() -> set[str]:
+        """Normalised questions of the eval sets available without the raw
+        CSV: turkish_legal_rag (incl. label conflicts), HMGS and any saved
+        qa_eval.jsonl."""
+        keys: set[str] = set()
+        files = [
+            pathlib.Path(config.TLR_DATA_PATH),
+            pathlib.Path(config.TLR_PROCESSED_DIR) / "qa_turkish_legal_rag.label_conflicts.jsonl",
+            pathlib.Path(config.TLR_PROCESSED_DIR) / "qa_eval.jsonl",
+            pathlib.Path(config.PROCESSED_DIR) / "qa_eval.jsonl",
+        ]
+        for f in files:
+            if f.exists():
+                keys |= {normalize_question(r.get("question", "")) for r in _read_jsonl(f)}
+        if pathlib.Path(config.HMGS_DATA_PATH).exists():
+            keys |= {normalize_question(q.question) for q in DataProcessor.build_gold_eval_set()}
+        keys.discard("")
+        return keys
 
     # ------------------------------------------------------------------
     # Chunking
@@ -403,49 +600,57 @@ class DataProcessor:
 
     @staticmethod
     def _article_chunk(text: str, doc_id: str, source: str) -> list["CorpusChunk"]:
-        """Article-level chunking: split at MADDE boundaries, sub-split oversized articles."""
-        parts = _ARTICLE_RE.split(text)
-        chunks: list[CorpusChunk] = []
-        chunk_index = 0
-        for part in parts:
+        """Article-level chunking: one chunk per article (title + heading +
+        body), oversized articles sub-split with overlap.
+
+        Every article is kept whatever its length ("Türkiye Devleti bir
+        Cumhuriyettir." is a whole article); short heading-less text (a
+        section header, a preamble fragment) is merged into the next article,
+        and a short trailing sub-chunk of a long article into the one before.
+        """
+        texts: list[tuple[str, "str | None"]] = []
+        pending = ""
+        for part in _article_parts(text):
             part = part.strip()
-            if not part or len(part) < config.MIN_CHUNK_CHARS:
+            if not part:
                 continue
             madde_no = _madde_no_from_text(part)
+            if madde_no is None and len(part) < config.MIN_CHUNK_CHARS:
+                pending = f"{pending}\n\n{part}".strip()
+                continue
+            if pending:
+                part, pending = f"{pending}\n\n{part}", ""
             if len(part) <= config.CHUNK_SIZE:
-                chunks.append(CorpusChunk(
-                    chunk_id=f"{source}_{doc_id}_{chunk_index}",
-                    doc_id=doc_id,
-                    text=part,
-                    source=source,
-                    char_len=len(part),
-                    madde_no=madde_no,
-                ))
-                chunk_index += 1
+                texts.append((part, madde_no))
+                continue
+            # Article is larger than CHUNK_SIZE — sub-split it.
+            subs = _TEXT_SPLITTER.split_text(part)
+            merged: list[str] = []
+            for sub in subs:
+                if merged and len(sub) < config.MIN_CHUNK_CHARS:
+                    merged[-1] = f"{merged[-1]}\n{sub}"
+                else:
+                    merged.append(sub)
+            # Continuation chunks inherit the article of the heading chunk.
+            texts.extend(zip(merged, _assign_madde_nos(merged, carry=madde_no)))
+        if pending:
+            if texts:
+                last, no = texts[-1]
+                texts[-1] = (f"{last}\n\n{pending}", no)
             else:
-                # Article is larger than CHUNK_SIZE — sub-split it.
-                sub_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=config.CHUNK_SIZE,
-                    chunk_overlap=config.CHUNK_OVERLAP,
-                    length_function=len,
-                    separators=["\n\n", "\n", ". ", " ", ""],
-                )
-                subs = sub_splitter.split_text(part)
-                # Continuation chunks inherit the article of the heading chunk.
-                sub_nos = _assign_madde_nos(subs, carry=madde_no)
-                for sub_chunk, sub_no in zip(subs, sub_nos):
-                    if len(sub_chunk) < config.MIN_CHUNK_CHARS:
-                        continue
-                    chunks.append(CorpusChunk(
-                        chunk_id=f"{source}_{doc_id}_{chunk_index}",
-                        doc_id=doc_id,
-                        text=sub_chunk,
-                        source=source,
-                        char_len=len(sub_chunk),
-                        madde_no=sub_no,
-                    ))
-                    chunk_index += 1
-        return chunks
+                texts.append((pending, None))
+
+        return [
+            CorpusChunk(
+                chunk_id=f"{source}_{doc_id}_{i}",
+                doc_id=doc_id,
+                text=chunk_text,
+                source=source,
+                char_len=len(chunk_text),
+                madde_no=madde_no,
+            )
+            for i, (chunk_text, madde_no) in enumerate(texts)
+        ]
 
     @staticmethod
     def chunk_text(text: str, doc_id: str, source: str) -> list["CorpusChunk"]:
@@ -482,13 +687,16 @@ class DataProcessor:
         ``doc_id`` get a ``__dupN`` suffix so FAISS ids / metadata do not collide.
 
         Args:
-            holdout: When True, the kaggle rows held out for the legacy
-                ``kaggle`` eval set (see ``_get_kaggle_corpus_eval_split``)
-                are NOT indexed.  Leave False (default) for the
-                ``turkish_legal_rag`` / ``hmgs`` eval sets: they are labelled
-                against the full kaggle law texts, and holding out would drop
-                all eval laws from the corpus.
+            holdout: Deprecated and ignored.  It removed the kaggle eval
+                contexts from the index, which made their gold passages
+                unretrievable (with 240 distinct contexts every one was held
+                out); see :meth:`kaggle_eval_df` for the leakage control
+                that replaced it.
         """
+        if holdout:
+            import warnings
+            warnings.warn("build_corpus_chunks(holdout=True) is ignored: eval "
+                          "passages stay in the index", DeprecationWarning, stacklevel=2)
         seen_hashes: set[str] = set()
         seen_ids: set[str] = set()
         kept = 0
@@ -508,10 +716,7 @@ class DataProcessor:
             seen_ids.add(cid)
             return chunk
 
-        if holdout:
-            corpus_df, _ = self._get_kaggle_corpus_eval_split()
-        else:
-            corpus_df = self.get_corpus_rows()
+        corpus_df = self.get_corpus_rows()
 
         for row in corpus_df.itertuples(index=False):
             context = row.context if pd.notna(row.context) else ""
@@ -554,7 +759,7 @@ class DataProcessor:
                   f"(cleaning: {clean_stats})")
 
         print(f"[build_corpus_chunks] kept={kept}, skipped={skipped} duplicate chunks, "
-              f"renamed={renamed} colliding chunk_ids, holdout={holdout}")
+              f"renamed={renamed} colliding chunk_ids")
 
     # ------------------------------------------------------------------
     # QA set builders
@@ -590,19 +795,27 @@ class DataProcessor:
         return examples
 
     def build_qa_eval_set(self) -> list[QAExample]:
-        """Build QA eval set from the held-out kaggle split (data leakage fix).
+        """The ``kaggle`` eval set (see :meth:`kaggle_eval_df`)."""
+        return self._rows_to_qa_examples(self.kaggle_eval_df())
 
-        Eval rows are the same subset held out from the FAISS corpus by
-        _get_kaggle_corpus_eval_split(), so retrieval is always evaluated on
-        unseen queries.  Uses random_state=42 for reproducibility.
-        """
-        _, eval_df = self._get_kaggle_corpus_eval_split()
-        return self._rows_to_qa_examples(eval_df)
+    def _without_eval_questions(self, df: pd.DataFrame) -> pd.DataFrame:
+        keys = self.eval_question_keys()
+        mask = df["question"].fillna("").map(normalize_question).isin(keys)
+        if mask.any():
+            print(f"[train data] dropped {int(mask.sum())} rows whose question is in an eval set")
+        return df[~mask]
 
     def build_qa_train_set(self) -> list[QAExample]:
-        """Build QA train set (train split)."""
-        df = self.get_qa_split("train")
-        return self._rows_to_qa_examples(df)
+        """QA train set: the ``train`` split minus any question of an eval set."""
+        return self._rows_to_qa_examples(self._without_eval_questions(self.get_qa_split("train")))
+
+    def build_kaggle_train_set(self) -> list[QAExample]:
+        """Kaggle rows (with contexts) for supervised retrieval training: every
+        kaggle row except the eval rows and any question of an eval set."""
+        df = self.get_corpus_rows()
+        eval_ids = set(self.kaggle_eval_df()["id"])
+        df = df[df["context"].notna() & ~df["id"].isin(eval_ids)]
+        return self._rows_to_qa_examples(self._without_eval_questions(df))
 
     @staticmethod
     def build_gold_eval_set(hmgs_path=None) -> list[QAExample]:
@@ -651,8 +864,8 @@ class DataProcessor:
         skipped_mc = 0
         skipped_src = 0
 
-        for i, row in enumerate(df.itertuples(index=False)):
-            raw = row._asdict()
+        # to_dict keeps column names such as "veri türü" (itertuples renames them)
+        for i, raw in enumerate(df.to_dict("records")):
 
             def _str(val):
                 return "" if pd.isna(val) else str(val)
@@ -701,12 +914,22 @@ class DataProcessor:
 
     @staticmethod
     def build_turkish_legal_rag_eval_set(path=None) -> list[QAExample]:
-        """Load the committed turkish_legal_rag eval set (see scripts/16).
+        """Load the committed turkish_legal_rag eval set (see scripts/16, 17).
 
         Rows keep their explicit ``source`` and ``madde_no`` so that
         :meth:`build_relevant_chunk_map` can label gold chunks directly.
+        With ``config.TLR_USE_LABEL_FIXES`` the labels checked against the
+        law text by scripts/17 are used, otherwise the original HF labels.
         """
         p = pathlib.Path(path) if path else pathlib.Path(config.TLR_DATA_PATH)
+        fixed = config.TLR_USE_LABEL_FIXES
+        rows = list(_read_jsonl(p))
+        if not fixed:
+            # original HF labels and conflict exclusions (rows re-admitted by
+            # scripts/17 carry label_conflict_hf=True)
+            rows = [{**r, "madde_no": r.get("madde_no_hf", r.get("madde_no")),
+                     "label_conflict": r.get("label_conflict_hf", r.get("label_conflict"))}
+                    for r in rows]
         return [
             QAExample(
                 query_id=r["query_id"],
@@ -718,7 +941,7 @@ class DataProcessor:
                 madde_no=r.get("madde_no"),
                 hf_row_id=r.get("hf_row_id"),
             )
-            for r in _read_jsonl(p)
+            for r in rows
             if not r.get("label_conflict")
         ]
 
@@ -733,7 +956,8 @@ class DataProcessor:
         Build ground-truth relevance map using source/doc_id join.
         Model-independent: does NOT use embeddings to define relevance.
 
-        Strategy (in order):
+        Strategy (first one that yields chunks wins; see the ``_label_*``
+        functions):
         0. gold_source_ids: exact chunk IDs from evaluator benchmark
         0.5 explicit source + madde_no fields (turkish_legal_rag): chunks of that
            law whose article matches exactly
@@ -759,179 +983,50 @@ class DataProcessor:
         Returns:
             relevant_map: dict mapping query_id -> list of relevant chunk_ids.
             coverage_dict (only when return_coverage=True): dict with per-strategy
-                counts and label_strategy breakdown.
+                counts, label_strategy breakdown and the number of supplied gold
+                chunk ids missing from the corpus.
         """
         import logging
         log = logging.getLogger(__name__)
 
-        # Build lookup structures
-        hash_to_chunk_ids: dict[str, list[str]] = {}
-        by_source: dict[str, list] = {}
-        for chunk in corpus_chunks:
-            h = hashlib.md5(chunk.text.encode()).hexdigest()
-            hash_to_chunk_ids.setdefault(h, []).append(chunk.chunk_id)
-            by_source.setdefault(chunk.source, []).append(chunk)
-
-        # Issue 11 fix: build valid_ids once outside the per-query loop (O(N) not O(N*Q))
-        valid_ids = set(c.chunk_id for c in corpus_chunks)
-
-        inherited = _inherited_madde_nos(corpus_chunks)
+        index = _LabelIndex(corpus_chunks)
+        strategies = [
+            ("gold", _label_gold_ids),
+            ("explicit_madde", _label_explicit_madde),
+            ("context_hash", _label_context_hash),
+            ("doc_id", _label_doc_id),
+            ("answer_substr", _label_answer_substring),
+            ("article", _label_article_mention),
+        ]
+        if config.RELEVANCE_SILVER_LEXICAL:
+            strategies.append(("silver_lexical", _label_silver_lexical))
 
         relevant_map: dict[str, list[str]] = {}
-        # label_strategy tracks how each query was labeled (for coverage reporting)
         label_strategy_map: dict[str, str] = {}
-        # Coverage counters — one per labeling strategy
-        labeled_s0 = labeled_s05 = labeled_s1 = labeled_s2 = labeled_s25 = labeled_s3 = 0
-        labeled_silver = 0
-        unlabeled = 0
-        # Silver config (read once for performance)
-        silver_enabled = config.RELEVANCE_SILVER_LEXICAL
-        silver_top_m = config.SILVER_TOP_M
-        silver_threshold = config.SILVER_THRESHOLD
-
+        counts = collections.Counter({name: 0 for name in (
+            "gold", "explicit_madde", "context_hash", "doc_id",
+            "answer_substr", "article", "silver_lexical")})
+        missing_gold_ids = 0
         for qa in qa_examples:
+            q = _QAFields.of(qa)
+            missing_gold_ids += sum(1 for g in q.gold_ids if g not in index.valid_ids)
             relevant: list[str] = []
-
-            # Unified field accessors: support both QAExample dataclass and plain dict.
-            _is_dict = isinstance(qa, dict)
-            qa_query_id  = qa["query_id"]  if _is_dict else qa.query_id
-            qa_context   = qa.get("context", "") if _is_dict else qa.context
-            qa_answer    = qa.get("answer", "")  if _is_dict else qa.answer
-            qa_source    = qa.get("source", "")  if _is_dict else qa.source
-            qa_question  = qa.get("question", "") if _is_dict else getattr(qa, "question", "")
-
-            # Strategy 0: gold_source_ids — exact chunk IDs supplied by the
-            # evaluator's benchmark (gold_benchmark.json / rag_eval.json).
-            # These are chunk_ids that exist verbatim in the corpus, so we use
-            # them directly without any heuristic matching.
-            gold_ids = qa.get("gold_source_ids") if _is_dict else getattr(qa, "gold_source_ids", None)
-            if gold_ids:
-                relevant = [gid for gid in gold_ids if gid in valid_ids]
+            for name, label_fn in strategies:
+                relevant = label_fn(q, index)
                 if relevant:
-                    labeled_s0 += 1
-                    label_strategy_map[qa_query_id] = "gold"
-                    relevant_map[qa_query_id] = relevant
-                    continue  # Skip remaining strategies — ground truth is exact.
-
-            # Strategy 0.5: explicit source + madde_no fields (turkish_legal_rag).
-            # The gold article is given directly, so label the corpus chunks of
-            # that law and article without any text heuristics.
-            explicit_madde = qa.get("madde_no") if _is_dict else getattr(qa, "madde_no", None)
-            if explicit_madde and qa_source:
-                relevant = [
-                    c.chunk_id for c in by_source.get(qa_source, [])
-                    if _chunk_matches_madde_str(c, explicit_madde, inherited.get(c.chunk_id))
-                ]
-                if relevant:
-                    labeled_s05 += 1
-                    label_strategy_map[qa_query_id] = "explicit_madde"
-                    relevant_map[qa_query_id] = relevant
-                    continue
-
-            # Strategy 1: context-hash match — re-chunk qa.context using the same
-            # chunking path as the corpus index build (article or char chunking).
-            # This ensures hashes match exactly, regardless of ARTICLE_CHUNKING_ENABLED.
-            if qa_context:
-                for corpus_chunk in DataProcessor.chunk_text(qa_context, qa_query_id, qa_source or ""):
-                    h = hashlib.md5(corpus_chunk.text.encode()).hexdigest()
-                    relevant.extend(hash_to_chunk_ids.get(h, []))
-                # deduplicate while preserving order
-                seen: set[str] = set()
-                deduped = []
-                for cid in relevant:
-                    if cid not in seen:
-                        seen.add(cid)
-                        deduped.append(cid)
-                relevant = deduped
-            if relevant:
-                labeled_s1 += 1
-                label_strategy_map[qa_query_id] = "context_hash"
-
-            # Strategy 2: doc_id match — used when context is empty/missing
-            if not relevant:
-                relevant = [c.chunk_id for c in corpus_chunks if c.doc_id == qa_query_id]
-                if relevant:
-                    labeled_s2 += 1
-                    label_strategy_map[qa_query_id] = "doc_id"
-
-            # Strategy 2.5: answer substring match — for gold sets with known answers (e.g. HMGS)
-            # Find chunks that contain a significant portion of the answer text.
-            if not relevant and qa_answer and len(qa_answer) >= 40:
-                answer_lower = qa_answer.lower().strip()
-                search_str = answer_lower[:80] if len(answer_lower) >= 80 else answer_lower
-                candidate_chunks = by_source.get(qa_source, corpus_chunks) if qa_source else corpus_chunks
-                relevant = [c.chunk_id for c in candidate_chunks if search_str in c.text.lower()]
-                if relevant:
-                    labeled_s25 += 1
-                    label_strategy_map[qa_query_id] = "answer_substr"
-
-            # Strategy 3: article-level match — extract the madde (article) number from
-            # the question and answer text.  Match only corpus chunks that belong to that
-            # specific article in the correct source law.
-            #
-            # Design rationale: the previous strategy assigned the first N chunks of the
-            # entire source law as relevant, which is arbitrary and inflates
-            # Recall/MRR/nDCG for queries that do not cite a specific article.
-            # Article-level matching is precise but requires the query to reference an
-            # article number explicitly.  Queries where no article can be determined are
-            # left with an empty relevant set and are excluded from retrieval metrics by
-            # compute_all_metrics (queries with no ground-truth are always skipped).
-            # This is the correct behavior: we should not compute retrieval metrics for
-            # queries whose ground-truth relevance is unknown.
-            if not relevant and qa_source:
-                madde_no = _extract_madde_no(qa_question, qa_answer)
-                if madde_no is not None:
-                    source_chunks = by_source.get(qa_source, [])
-                    relevant = [
-                        c.chunk_id for c in source_chunks
-                        if _chunk_matches_article(c, madde_no)
-                    ]
-                    if relevant:
-                        labeled_s3 += 1
-                        label_strategy_map[qa_query_id] = "article"
-                # If madde_no is None: leave relevant=[] → query will be unlabeled
-                # and excluded from retrieval metrics.
-
-            # Strategy 3.5: silver lexical labeling — optional, off by default.
-            # Within the gold source law only, rank chunks by normalized token overlap
-            # with (question + answer) and label the top-m above threshold.
-            # Uses Turkish-aware case folding (İ→i, I→ı).
-            # This is a HEURISTIC: labels are "silver" quality, not gold.
-            # Do NOT use silver labels when precise article-level labels are available.
-            if not relevant and qa_source and silver_enabled:
-                source_chunks = by_source.get(qa_source, [])
-                if source_chunks:
-                    q_tokens = _turkish_tokenize(f"{qa_question} {qa_answer}")
-                    scored = [
-                        (c, _silver_lexical_score(q_tokens, c.text))
-                        for c in source_chunks
-                    ]
-                    scored.sort(key=lambda x: -x[1])
-                    relevant = [
-                        c.chunk_id for c, score in scored[:silver_top_m]
-                        if score >= silver_threshold
-                    ]
-                    if relevant:
-                        labeled_silver += 1
-                        label_strategy_map[qa_query_id] = "silver_lexical"
-
-            if not relevant:
-                unlabeled += 1
-                # Keep the key with empty list — retrieval_metrics.py already
-                # excludes queries with no ground-truth from metric computation.
-
-            relevant_map[qa_query_id] = relevant
+                    counts[name] += 1
+                    label_strategy_map[q.query_id] = name
+                    break
+            relevant_map[q.query_id] = relevant
 
         n_total = len(qa_examples)
+        unlabeled = sum(1 for v in relevant_map.values() if not v)
         labeled = n_total - unlabeled
         log.info(
-            "build_relevant_chunk_map coverage: "
-            "total=%d  labeled=%d (%.0f%%)  unlabeled=%d  "
-            "[s0(gold)=%d s0.5(explicit_madde)=%d s1(ctx_hash)=%d s2(doc_id)=%d s2.5(ans_substr)=%d "
-            "s3(article)=%d s3.5(silver_lexical)=%d]",
+            "build_relevant_chunk_map coverage: total=%d  labeled=%d (%.0f%%)  "
+            "unlabeled=%d  by_strategy=%s",
             n_total, labeled, 100 * labeled / n_total if n_total else 0,
-            unlabeled, labeled_s0, labeled_s05, labeled_s1, labeled_s2, labeled_s25,
-            labeled_s3, labeled_silver,
+            unlabeled, dict(counts),
         )
         if unlabeled:
             log.warning(
@@ -939,6 +1034,13 @@ class DataProcessor:
                 "number found, no context/answer match, silver disabled or below "
                 "threshold).  These queries are excluded from retrieval metrics.",
                 unlabeled, n_total,
+            )
+        if missing_gold_ids:
+            # A missing gold id is unreachable gold, not a smaller gold set: the
+            # supplied ids do not match this corpus (stale ids / other chunking).
+            log.warning(
+                "build_relevant_chunk_map: %d supplied gold chunk ids are not in the "
+                "corpus; recall over the remaining ids is optimistic.", missing_gold_ids,
             )
 
         if not return_coverage:
@@ -948,15 +1050,8 @@ class DataProcessor:
             "total": n_total,
             "labeled": labeled,
             "unlabeled": unlabeled,
-            "by_strategy": {
-                "gold":          labeled_s0,
-                "explicit_madde": labeled_s05,
-                "context_hash":  labeled_s1,
-                "doc_id":        labeled_s2,
-                "answer_substr": labeled_s25,
-                "article":       labeled_s3,
-                "silver_lexical": labeled_silver,
-            },
+            "by_strategy": dict(counts),
+            "missing_gold_ids": missing_gold_ids,
             "label_strategy_per_query": label_strategy_map,
         }
         return relevant_map, coverage

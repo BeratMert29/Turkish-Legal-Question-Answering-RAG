@@ -3,10 +3,13 @@ tests/test_turkish_legal_rag.py — turkish_legal_rag adapter, gold labeling,
 eval-set default, and headline-metric switch.  Offline: no network, no models.
 """
 
+import collections
 import importlib.util
 import json
 import sys
 from pathlib import Path
+
+import pytest
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -97,6 +100,10 @@ class TestAdapterFilters:
         assert n("Geçici 2-") == "gecici-2"
         assert n(None) is None
         assert n("abc") is None
+        # upper-case Turkish İ must not turn GEÇİCİ into something else
+        assert n("GEÇİCİ MADDE 5") == "gecici-5"
+        assert n("EK GEÇİCİ MADDE 1") == "ekgecici-1"
+        assert adapter.refine_madde_no("5", "GEÇİCİ MADDE 5 nedir?", "") == "gecici-5"
 
 
 def _chunk(cid, source, text, madde_no=None):
@@ -169,10 +176,11 @@ class TestCorpusHoldout:
         sources = {c.source for c in dp.build_corpus_chunks()}
         assert sources == set(self.LAWS)
 
-    def test_holdout_true_is_legacy_kaggle_only(self, tmp_path, monkeypatch):
+    def test_holdout_is_ignored_eval_passages_stay_indexed(self, tmp_path, monkeypatch):
         dp = self._processor(tmp_path, monkeypatch)
-        # fewer unique contexts than QA_EVAL_EXPECTED -> everything is held out
-        assert list(dp.build_corpus_chunks(holdout=True)) == []
+        with pytest.warns(DeprecationWarning):
+            held = list(dp.build_corpus_chunks(holdout=True))
+        assert {c.source for c in held} == set(self.LAWS)
 
     def test_gold_labels_found_for_every_eval_law(self, tmp_path, monkeypatch):
         dp = self._processor(tmp_path, monkeypatch)
@@ -226,3 +234,56 @@ class TestEvalSetDefaultAndHeadline:
         print_ablation_table({"base": res(2)}, stage_order=["base"])
         out = capsys.readouterr().out
         assert "PRIMARY ABLATION TABLE  (source-level" in out
+
+
+class TestKaggleEvalSplit:
+    """kaggle eval rows: round-robin over contexts, no train questions; the
+    train sets never contain an eval question."""
+
+    def _processor(self, tmp_path, monkeypatch, n_ctx=3, per_ctx=3):
+        import pandas as pd
+        rows = []
+        for c in range(n_ctx):
+            for j in range(per_ctx):
+                rows.append({"id": f"k{c}_{j}", "question": f"Soru {c}-{j}?", "answer": "a",
+                             "context": f"MADDE {c + 1}- bağlam {c} " + "metin " * 40,
+                             "source": "L", "data_type": "", "score": 1, "split": "kaggle"})
+        rows.append({"id": "t1", "question": "SORU 0-0", "answer": "a", "context": None,
+                     "source": "", "data_type": "", "score": 1, "split": "train"})
+        rows.append({"id": "t2", "question": "Başka soru", "answer": "a", "context": None,
+                     "source": "", "data_type": "", "score": 1, "split": "train"})
+        csv = tmp_path / "d.csv"
+        pd.DataFrame(rows).to_csv(csv, index=False)
+        monkeypatch.setattr(config, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(config, "TLR_PROCESSED_DIR", tmp_path)
+        monkeypatch.setattr(config, "TLR_DATA_PATH", tmp_path / "none.jsonl")
+        monkeypatch.setattr(config, "PROCESSED_DIR", tmp_path)
+        monkeypatch.setattr(config, "HMGS_DATA_PATH", tmp_path / "none.csv")
+        return DataProcessor(csv)
+
+    def test_one_question_per_context_first(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "QA_EVAL_EXPECTED", 3)
+        dp = self._processor(tmp_path, monkeypatch)
+        ev = dp.build_qa_eval_set()
+        assert len(ev) == 3 and len({e.context for e in ev}) == 3
+
+    def test_round_robin_fills_up_to_the_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "QA_EVAL_EXPECTED", 5)
+        dp = self._processor(tmp_path, monkeypatch)
+        ev = dp.build_qa_eval_set()
+        per_ctx = sorted(collections.Counter(e.context for e in ev).values())
+        assert len(ev) == 5 and per_ctx == [1, 2, 2]
+        assert [e.query_id for e in ev] == [e.query_id for e in dp.build_qa_eval_set()]
+
+    def test_question_also_in_train_split_is_not_an_eval_question(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "QA_EVAL_EXPECTED", 100)
+        dp = self._processor(tmp_path, monkeypatch)
+        assert "k0_0" not in {e.query_id for e in dp.build_qa_eval_set()}
+
+    def test_training_sets_exclude_eval_questions(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "QA_EVAL_EXPECTED", 3)
+        dp = self._processor(tmp_path, monkeypatch)
+        eval_q = {e.question for e in dp.build_qa_eval_set()}
+        kt = dp.build_kaggle_train_set()
+        assert kt and not ({q.question for q in kt} & eval_q)
+        assert {q.query_id for q in dp.build_qa_train_set()} == {"t1", "t2"}

@@ -18,7 +18,9 @@ def load_external_corpus(path: Path) -> list:
     raw_chunks = load_corpus_jsonl(path)
     return [
         CorpusChunk(
-            **{k: r[k] for k in ("chunk_id", "doc_id", "text", "source", "char_len")}
+            **{k: r[k] for k in ("chunk_id", "doc_id", "text", "source", "char_len")},
+            # keep the article label when the corpus file carries one
+            madde_no=r.get("madde_no") or (r.get("metadata") or {}).get("madde_no"),
         )
         for r in raw_chunks
     ]

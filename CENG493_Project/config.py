@@ -2,6 +2,9 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 
+# Global RNG seed (python/numpy/torch, sampling of judge/NLI/perplexity subsets)
+SEED = 42
+
 # Chunking
 CHUNK_SIZE = 1400
 CHUNK_OVERLAP = 180
@@ -18,6 +21,10 @@ PROCESSED_DIR = BASE_DIR / "data/processed"
 INDEX_DIR = BASE_DIR / "index"
 INDEX_FILE = "faiss.index"
 METADATA_FILE = "metadata.jsonl"
+# Root for scripts/14 runs: results/<eval_set>[_limitN]/<stage>/ plus an
+# ablation_summary.json per run directory, so runs on different eval sets or
+# quick --limit runs never overwrite each other.
+RESULTS_ROOT = BASE_DIR / "results"
 RESULTS_DIR = BASE_DIR / "results/stage1"
 RESULTS_DIR_BASE     = BASE_DIR / "results" / "stage_base"
 RESULTS_DIR_EMB_FT   = BASE_DIR / "results" / "stage_emb_finetuned"
@@ -63,6 +70,10 @@ TLR_PROCESSED_DIR = BASE_DIR.parent / "results" / "processed_data"
 TLR_METADATA_PATH = BASE_DIR.parent / "results" / "index" / "metadata.jsonl"
 TLR_GOLD_FILE = "qa_turkish_legal_rag.jsonl"
 TLR_DATA_PATH = TLR_PROCESSED_DIR / TLR_GOLD_FILE
+# Use the gold article labels checked against the law text by
+# scripts/17_check_tlr_labels.py (data/tlr_labels.py).  False = the original
+# HF labels (madde_no_hf) and the original conflict exclusions.
+TLR_USE_LABEL_FIXES = True
 # HF ``kaynak`` spellings that differ from corpus source names
 TLR_SOURCE_ALIASES = {
     "Bilgi Edinme Hakkı Kanunu": "Bilgi Edinme Kanunu",
@@ -78,7 +89,14 @@ HEADLINE_CHUNK_MIN_LABELED_FRACTION = 0.5
 # Embedding
 EMBEDDING_MODEL = "BAAI/bge-m3"
 FINETUNED_EMBEDDING_MODEL = str(BASE_DIR / "models" / "bge-m3-turkish-legal")
-HF_PERPLEXITY_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+# Perplexity is computed with the generator's own weights: the HF base of the
+# Ollama model (LORA_BASE_HF_MODEL) plus, for the fine-tuned stages, the LoRA
+# adapter.  Set a model id here only to override that (not comparable across
+# stages then).  PERPLEXITY_ENABLED=False skips the phase (it loads a 7B model).
+HF_PERPLEXITY_MODEL = None
+PERPLEXITY_ENABLED = True
+PERPLEXITY_SAMPLE_SIZE = 100
+PERPLEXITY_MAX_TOKENS = 4096   # prefix is cut from the left, never the answer
 EMBEDDING_DIM = 1024
 EMBEDDING_BATCH_SIZE = 8  # lower = less VRAM; increase to 32 if you have 12GB+ VRAM
 
@@ -119,14 +137,23 @@ LLM_BASE_FOR_ABLATION = "qwen2.5:7b"
 LORA_BASE_HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 LLM_MODEL = LLM_BASE_FOR_ABLATION
 LLM_FINETUNED_MODEL = "qwen25-legal-ft"   # created by scripts/13_export_lora_to_ollama.py
+# LoRA adapter written by scripts/08 (a copy is committed under
+# results/model_configs/qwen25_lora).
+LORA_ADAPTER_DIR = BASE_DIR / "models" / "qwen25_lora"
+LORA_ADAPTER_FALLBACK_DIR = BASE_DIR.parent / "results" / "model_configs" / "qwen25_lora"
 LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_API_KEY = "ollama"
 LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 512
-# Context window for BOTH LLMs.  Baked into the fine-tuned Modelfile; for the
-# base model start Ollama with OLLAMA_CONTEXT_LENGTH=8192 (the OpenAI-compatible
-# endpoint cannot set num_ctx per request).
+# Context window for BOTH LLMs, sent as options.num_ctx on every native
+# /api/chat request (and baked into the fine-tuned Modelfile), so it no longer
+# depends on the server's OLLAMA_CONTEXT_LENGTH.
 LLM_NUM_CTX = 8192
+LLM_TIMEOUT_S = 300   # per generation request
+# Stop sequences sent with every request to BOTH LLMs (request options override
+# Modelfile parameters, so the base and fine-tuned model stop identically).
+LLM_STOP = ["<|im_end|>", "<|endoftext|>", "\nSoru:", "\nBağlam:"]
+LLM_MAX_RETRIES = 3   # on connection errors / timeouts
 # Stage is marked failed when more than this fraction of generations / judge calls fail
 MAX_FAILURE_RATE = 0.2
 # trust_remote_code executes code shipped with a model repo.  Qwen2.5 and
@@ -138,7 +165,12 @@ TRUST_REMOTE_CODE = False
 LLM_JUDGE_MODEL = "llama3.1:8b"
 
 # Evaluation
-HALLUCINATION_SAMPLE_SIZE = 150
+# NLI faithfulness sample per stage; None = every successful prediction, so all
+# stages are scored on the same queries (NLI is cheap next to generation).
+HALLUCINATION_SAMPLE_SIZE = None
+# Entailment probability at/above which an answer sentence (or gold claim) is
+# counted as supported.
+NLI_SUPPORT_THRESHOLD = 0.5
 
 # NLI model for hallucination analysis (multilingual, covers Turkish).
 NLI_MODEL = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
@@ -148,10 +180,6 @@ SEMANTIC_SIM_MAX_SEQ_LEN = 512  # encoder window; longer answers are chunked
 # Number of predictions sampled for each LLM-judge metric call.  None = judge
 # every prediction (needed for tight CIs); an int caps cost (Ollama calls).
 LLM_JUDGE_SAMPLE_SIZE = None
-
-# Hallucination stratification thresholds (applied to top-1 retrieval score)
-HALLUCINATION_HIT_THRESHOLD = 0.7
-HALLUCINATION_PARTIAL_THRESHOLD = 0.4
 
 # BM25 tokenization
 BM25_MIN_TOKEN_LENGTH = 2

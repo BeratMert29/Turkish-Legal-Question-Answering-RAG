@@ -208,7 +208,7 @@ class TestRetrievalMetricsExclusion:
         # With 1 query and perfect retrieval, recall@1 should be 1.0
         assert metrics["recall_at_5"] == pytest.approx(1.0)
 
-    def test_all_unlabeled_returns_zeros(self):
+    def test_all_unlabeled_returns_none(self):
         try:
             from evaluation.retrieval_metrics import compute_all_metrics
         except ImportError:
@@ -220,4 +220,4 @@ class TestRetrievalMetricsExclusion:
         ]
         metrics = compute_all_metrics(results)
         assert metrics["num_queries"] == 0
-        assert metrics["recall_at_5"] == 0.0
+        assert metrics["recall_at_5"] is None  # unknown, not zero
