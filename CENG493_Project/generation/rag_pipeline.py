@@ -227,6 +227,12 @@ class RAGPipeline:
                                      timeout=config.LLM_TIMEOUT_S)
                 resp.raise_for_status()
                 return resp.json()
+            except requests.HTTPError as exc:
+                # 4xx → caller bug; never retry.
+                if exc.response is not None and exc.response.status_code < 500:
+                    raise
+                last_exc = exc
+                time.sleep(2.0 * (attempt + 1))
             except (requests.ConnectionError, requests.Timeout) as exc:
                 last_exc = exc
                 time.sleep(2.0 * (attempt + 1))
