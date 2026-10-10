@@ -9,7 +9,8 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import config
-from generation.rag_pipeline import TURKISH_PROMPT, SHORT_ANSWER_PROMPT
+from generation.rag_pipeline import RAGPipeline, TURKISH_PROMPT, SHORT_ANSWER_PROMPT
+from utils import inject_citations
 
 HF_MODEL_ID = config.LORA_BASE_HF_MODEL
 DEFAULT_ADAPTER_DIR = config.BASE_DIR / "models" / "qwen25_lora"
@@ -105,6 +106,8 @@ class FinetunedRAGPipeline:
         )
         self.top_k_for_generation = config.TOP_K_FOR_GENERATION
         self.context_window_chars = config.CONTEXT_WINDOW_CHARS
+        self._chunk_expander = None
+        self.graph_neighbor_budget = 0
         self.model = None
         self.tokenizer = None
 
@@ -168,97 +171,17 @@ class FinetunedRAGPipeline:
         torch.cuda.empty_cache()
         return result
 
-    def _inject_citations(self, answer: str, chunks: list) -> str:
-        """Append [Kaynak N] markers to sentences that have significant token overlap
-        with the corresponding retrieved chunk.
-
-        Strategy:
-        - Split answer into sentences on common sentence-ending punctuation.
-        - For each sentence, compute the overlap coefficient against each chunk's text.
-        - Attach [Kaynak N] to the sentence that has the highest overlap for that chunk,
-          but only when the score exceeds CITATION_THRESHOLD.
-        - Each chunk is cited at most once (the best-matching sentence wins).
-        """
-        import re
-
-        CITATION_THRESHOLD = 0.15
-
-        def tokenize(text: str) -> set:
-            # Lowercase, split on whitespace and punctuation, discard empty tokens
-            return set(t.lower() for t in re.split(r"[\s\.,;:!?()\[\]{}'\"]+", text) if t)
-
-        def overlap_coefficient(set_a: set, set_b: set) -> float:
-            if not set_a or not set_b:
-                return 0.0
-            return len(set_a & set_b) / min(len(set_a), len(set_b))
-
-        # Split into sentences while keeping the delimiter attached
-        sentence_pattern = re.compile(r"(?<=[.!?])\s+")
-        raw_sentences = sentence_pattern.split(answer)
-        # Filter out empty entries that can arise from edge cases
-        sentences = [s for s in raw_sentences if s.strip()]
-
-        if not sentences or not chunks:
-            return answer
-
-        # Tokenise every sentence once
-        sent_tokens = [tokenize(s) for s in sentences]
-
-        # For each chunk, find the best-scoring sentence index and score
-        # pending_citations: list of (sentence_index, chunk_1based_label, score)
-        pending_citations = []
-        for chunk_idx, chunk in enumerate(chunks):
-            chunk_tokens = tokenize(chunk.get("text", ""))
-            best_score = 0.0
-            best_sent_idx = -1
-            for sent_idx, stoks in enumerate(sent_tokens):
-                score = overlap_coefficient(stoks, chunk_tokens)
-                if score > best_score:
-                    best_score = score
-                    best_sent_idx = sent_idx
-            if best_score >= CITATION_THRESHOLD and best_sent_idx >= 0:
-                pending_citations.append((best_sent_idx, chunk_idx + 1, best_score))
-
-        if not pending_citations:
-            return answer
-
-        # Group by sentence; for each sentence collect the citation labels to append
-        from collections import defaultdict
-        sent_to_labels: dict = defaultdict(list)
-        for sent_idx, label, _score in pending_citations:
-            sent_to_labels[sent_idx].append(label)
-
-        # Rebuild the answer, appending citation tags after their target sentence
-        result_parts = []
-        for i, sentence in enumerate(sentences):
-            if i in sent_to_labels:
-                tags = " ".join(f"[Kaynak {lbl}]" for lbl in sorted(sent_to_labels[i]))
-                result_parts.append(f"{sentence} {tags}")
-            else:
-                result_parts.append(sentence)
-
-        return " ".join(result_parts)
-
-    def assemble_context(self, chunks: list) -> tuple:
-        selected = chunks[:self.top_k_for_generation]
-        parts = []
-        included = []
-        running_len = 0
-        for i, chunk in enumerate(selected):
-            part = f"[Kaynak {i+1}] ({chunk['source']})\n{chunk['text']}\n\n"
-            if running_len + len(part) > self.context_window_chars:
-                break
-            parts.append(part)
-            included.append(chunk)
-            running_len += len(part)
-        context = "".join(parts)
-        return context, included
+    # assemble_context and _select_for_generation are reused from RAGPipeline
+    # so that fine-tuned inference uses exactly the same context assembly logic
+    # as the baseline evaluation pipeline.
+    assemble_context = RAGPipeline.assemble_context
+    _select_for_generation = RAGPipeline._select_for_generation
 
     def run(self, question: str, top_k_retrieval: int = config.TOP_K_RETRIEVAL) -> dict:
         retrieved_chunks = self.retriever.retrieve(question, top_k=top_k_retrieval)
         context_used, context_chunks = self.assemble_context(retrieved_chunks)
         answer = self.generate(question, context_used)
-        answer = self._inject_citations(answer, context_chunks)
+        answer = inject_citations(answer, context_chunks)
         return {
             "question": question,
             "answer": answer,
