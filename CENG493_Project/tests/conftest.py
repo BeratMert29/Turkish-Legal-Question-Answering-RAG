@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.machinery
 import pathlib
 import sys
+import warnings
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,60 +55,70 @@ def _module_stub(name: str) -> MagicMock:
 def _stub_if_missing(name: str) -> None:
     """Insert a MagicMock into sys.modules for *name* only if unimportable.
 
-    Any exception counts as unimportable: a partly installed package (e.g.
-    ``datasets`` present while ``torch`` is stubbed) can fail with more than
-    ImportError at import time.
+    Only ``ImportError`` (including ``ModuleNotFoundError``) and ``OSError``
+    (e.g. torch DLL load failures on Windows) are treated as "not importable".
+    Any other exception propagates so real bugs are not silently swallowed.
+    A ``warnings.warn`` is emitted for ``OSError`` stubs so they are visible
+    in CI logs without causing a hard failure.
     """
     if name in sys.modules:
         return
     try:
         __import__(name)
-    except Exception:
-        for mod in [m for m in sys.modules if m == name or m.startswith(name + ".")]:
-            sys.modules.pop(mod, None)
-        mock = _module_stub(name)
-        sys.modules[name] = mock
+    except ImportError:
+        pass
+    except OSError as exc:
+        warnings.warn(
+            f"Stubbing '{name}' due to OSError at import time: {exc}",
+            stacklevel=2,
+        )
+    else:
+        return  # import succeeded — nothing to stub
+    for mod in [m for m in sys.modules if m == name or m.startswith(name + ".")]:
+        sys.modules.pop(mod, None)
+    mock = _module_stub(name)
+    sys.modules[name] = mock
 
-        # Populate common sub-module paths that source code accesses via
-        # attribute chains so that e.g. `torch.cuda.is_available()` works.
-        if name == "evaluate":
-            # Force qa_metrics onto its pure-Python BLEU/ROUGE fallback:
-            # a bare MagicMock would make hf_evaluate.load() succeed and
-            # BLEU would come back as a MagicMock/1.0.
-            mock.load.side_effect = RuntimeError("evaluate stub: load unavailable")
-        if name == "torch":
-            # scipy (installed as a ranx dep) checks:
-            #   issubclass(cls, torch.Tensor)
-            # issubclass() requires its second arg to be a real class, not a
-            # MagicMock.  Give Tensor a real stub class so scipy won't raise
-            # TypeError at import time.
-            class _FakeTorchTensor:
-                pass
-            mock.Tensor = _FakeTorchTensor
+    # Populate common sub-module paths that source code accesses via
+    # attribute chains so that e.g. `torch.cuda.is_available()` works.
+    if name == "evaluate":
+        # Force qa_metrics onto its pure-Python BLEU/ROUGE fallback:
+        # a bare MagicMock would make hf_evaluate.load() succeed and
+        # BLEU would come back as a MagicMock/1.0.
+        mock.load.side_effect = RuntimeError("evaluate stub: load unavailable")
+    if name == "torch":
+        # scipy (installed as a ranx dep) checks:
+        #   issubclass(cls, torch.Tensor)
+        # issubclass() requires its second arg to be a real class, not a
+        # MagicMock.  Give Tensor a real stub class so scipy won't raise
+        # TypeError at import time.
+        class _FakeTorchTensor:
+            pass
+        mock.Tensor = _FakeTorchTensor
 
-            for sub in (
-                "torch.cuda",
-                "torch.backends",
-                "torch.backends.mps",
-                "torch.nn",
-                "torch.nn.functional",
-                "torch.utils",
-                "torch.utils.data",
-            ):
-                if sub not in sys.modules:
-                    sys.modules[sub] = _module_stub(sub)
-        elif name == "transformers":
-            for sub in (
-                "transformers.AutoTokenizer",
-                "transformers.AutoModelForCausalLM",
-                "transformers.TrainingArguments",
-            ):
-                if sub not in sys.modules:
-                    sys.modules[sub] = _module_stub(sub)
-        elif name == "nltk":
-            for sub in ("nltk.corpus", "nltk.corpus.stopwords"):
-                if sub not in sys.modules:
-                    sys.modules[sub] = _module_stub(sub)
+        for sub in (
+            "torch.cuda",
+            "torch.backends",
+            "torch.backends.mps",
+            "torch.nn",
+            "torch.nn.functional",
+            "torch.utils",
+            "torch.utils.data",
+        ):
+            if sub not in sys.modules:
+                sys.modules[sub] = _module_stub(sub)
+    elif name == "transformers":
+        for sub in (
+            "transformers.AutoTokenizer",
+            "transformers.AutoModelForCausalLM",
+            "transformers.TrainingArguments",
+        ):
+            if sub not in sys.modules:
+                sys.modules[sub] = _module_stub(sub)
+    elif name == "nltk":
+        for sub in ("nltk.corpus", "nltk.corpus.stopwords"):
+            if sub not in sys.modules:
+                sys.modules[sub] = _module_stub(sub)
 
 
 for _mod in _HEAVY:

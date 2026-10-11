@@ -455,7 +455,7 @@ class TestEvalHelpers:
         from unittest.mock import patch, MagicMock
         from pipeline import evaluation as _eval
 
-        fake_hall = {"summary": {"context_grounding_rate": 0.9}}
+        fake_hall = {"summary": {"context_supported_sentence_rate": 0.9}}
         fake_nli = MagicMock()
 
         with patch.object(_eval, "evict_model_cache") as mock_evict, \

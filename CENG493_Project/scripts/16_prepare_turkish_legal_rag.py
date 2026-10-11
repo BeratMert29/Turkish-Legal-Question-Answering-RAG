@@ -51,7 +51,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import config
-from data.data_processor import DataProcessor
+from data.data_processor import DataProcessor, normalize_question
 from utils import read_jsonl
 
 HF_DATASET = "mtntasci/turkish-legal-rag"
@@ -62,10 +62,6 @@ KEEP_ORIGIN = "kaggle_batuhankalem"
 _ROWS_API = "https://datasets-server.huggingface.co/rows"
 _PAGE = 100
 
-
-def normalize_question(text: str) -> str:
-    """Lowercase, collapse non-word runs to one space, strip."""
-    return re.sub(r"\W+", " ", (text or "").lower()).strip()
 
 
 def normalize_madde_no(raw) -> "str | None":

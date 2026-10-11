@@ -22,10 +22,6 @@ else:
     _DEVICE = "cpu"
 
 
-_DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-_DEFAULT_MAX_SEQ = 512
-
-
 def _chunk_words(text: str, max_words: int) -> list[str]:
     """Split text into consecutive chunks of at most max_words words."""
     words = (text or "").split()
@@ -87,12 +83,9 @@ def compute_semantic_similarity(
         # Unknown, not zero: a 0.0 here would be scored as a real similarity.
         return {"mean_similarity": None, "per_sample": []}
 
-    try:
-        import config as _cfg
-    except Exception:
-        _cfg = None
-    model_name = model_name or getattr(_cfg, "SEMANTIC_SIM_MODEL", _DEFAULT_MODEL)
-    max_seq_length = int(max_seq_length or getattr(_cfg, "SEMANTIC_SIM_MAX_SEQ_LEN", _DEFAULT_MAX_SEQ))
+    import config as _cfg
+    model_name = model_name or _cfg.SEMANTIC_SIM_MODEL
+    max_seq_length = int(max_seq_length or _cfg.SEMANTIC_SIM_MAX_SEQ_LEN)
 
     model = SentenceTransformer(model_name, device=_DEVICE)
     limit = getattr(model, "max_seq_length", None)

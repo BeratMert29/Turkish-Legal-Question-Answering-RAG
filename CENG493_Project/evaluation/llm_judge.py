@@ -61,7 +61,7 @@ _DEFAULT_NUM_CTX: int = 8192
 try:
     import config as _cfg
     _DEFAULT_SAMPLE_SIZE = getattr(_cfg, "LLM_JUDGE_SAMPLE_SIZE", None)
-    _DEFAULT_NUM_CTX = getattr(_cfg, "LLM_JUDGE_NUM_CTX", 8192)
+    _DEFAULT_NUM_CTX = _cfg.LLM_NUM_CTX
 except Exception:
     pass
 

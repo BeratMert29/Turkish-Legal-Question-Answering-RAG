@@ -814,7 +814,7 @@ class DataProcessor:
         kaggle row except the eval rows and any question of an eval set."""
         df = self.get_corpus_rows()
         eval_ids = set(self.kaggle_eval_df()["id"])
-        df = df[df["context"].notna() & ~df["id"].isin(eval_ids)]
+        df = df[df["context"].notna() & (df["context"].astype(str) != "") & ~df["id"].isin(eval_ids)]
         return self._rows_to_qa_examples(self._without_eval_questions(df))
 
     @staticmethod
