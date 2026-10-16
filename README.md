@@ -71,23 +71,56 @@ only difference is the LoRA weights.
 
 ## Results
 
-> **Status: final clean run pending.** Earlier result files were removed from the repository:
-> they predated the 2026-10 evaluation fixes (gold-label audit, chunker, metric bugs) and mixed
-> different generators and eval sets, so they were not comparable. The table below is filled
-> from a single run of the current code.
+Eval set: `turkish_legal_rag`, 194 questions with law + article gold labels (label-audited).
+Generator Qwen2.5-7B, judge `llama3.1:8b`, seed 42, one run of commit `b4b5432` plus the
+local config change noted below. Per-stage JSON (with provenance) is written to
+`results/turkish_legal_rag/`; it is not committed.
 
-Eval set: `turkish_legal_rag` (194 questions with law + article gold labels, label-audited).
+| Stage | Article Hit@5 | Article MRR | Token F1 | Citation precision (model's own) | NLI faithfulness | Gold-claim recall | LLM judge |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `base` (dense) | 0.928 | 0.833 | 0.507 | 0.773 | 0.661 | 0.626 | 0.987 |
+| `hybrid` | 0.918 | 0.858 | 0.484 | 0.798 | 0.661 | 0.594 | 0.982 |
+| `rrf` | 0.923 | 0.844 | 0.485 | 0.786 | 0.638 | 0.599 | 0.985 |
+| `rrf_rerank` | 0.933 | 0.903 | 0.518 | 0.815 | 0.645 | 0.659 | 0.977 |
+| `graph` | 0.933 | 0.903 | 0.526 | 0.812 | 0.631 | 0.651 | 0.987 |
+| `emb_ft` | 0.933 | 0.904 | 0.498 | 0.774 | 0.667 | 0.649 | 0.985 |
+| `llm_ft` | 0.928 | 0.833 | 0.463 | 0.682 | 0.758 | 0.451 | 0.982 |
+| `full` | 0.933 | 0.904 | 0.473 | 0.786 | 0.760 | 0.444 | 0.990 |
 
-| Stage | Article Hit@5 | MRR | Faithfulness (NLI) | Citation precision | Judge score |
-|---|---:|---:|---:|---:|---:|
-| `base` | – | – | – | – | – |
-| `rrf_rerank` | – | – | – | – | – |
-| `emb_ft` | – | – | – | – | – |
-| `llm_ft` | – | – | – | – | – |
-| `full` | – | – | – | – | – |
+### What the paired comparisons say (95% bootstrap CI, Holm-corrected)
 
-Reproduce: see [Quick start](#quick-start). Paired stage differences with 95% CIs are written to
-`results/<eval_set>/ablation_summary.json`.
+- **Reranking is the only retrieval change that clearly helps:** article MRR +0.060
+  (CI +0.032 to +0.090, significant). BM25 fusion alone (`hybrid`, `rrf`) did not
+  significantly change anything.
+- **Embedding fine-tuning added nothing on top of the reranker** (`rrf_rerank` → `emb_ft`:
+  MRR +0.001). The reranker already removes most of what a better embedder would fix.
+- **Graph expansion did not change retrieval or answer quality** significantly.
+- **LLM fine-tuning is a trade-off, not a win:**
+  - NLI faithfulness +0.097 (significant): answers stay closer to the context.
+  - Gold-claim recall −0.174 (significant): answers cover less of the reference answer.
+  - Token F1 −0.044, not significant after Holm correction.
+  - The model's own `[Kaynak N]` citations dropped from 39% to 6% of answers, which is the
+    citation collapse described above; the pipeline's citation injection (≈99%) hides it
+    in the headline numbers, so read the "model's own" column.
+- Citation precision is computed only over answers that cite at all, so for `llm_ft` and
+  `full` (6–7% of answers cite) it rests on very few answers and is not comparable.
+- **The LLM judge scores everything ≈0.98–0.99** and does not separate stages. It is not
+  informative until calibrated against human labels (`scripts/18_judge_calibration.py`).
+
+### Caveats
+
+- **Quantization mismatch:** the base generator is `qwen2.5:7b` at Q4_K_M, the fine-tuned
+  model was exported at Q8_0. `base → llm_ft` therefore mixes LoRA and quantization effects.
+- `PERPLEXITY_ENABLED = False` for this run: the 4-bit HF perplexity pass does not fit next
+  to Ollama's resident models on a 12 GB GPU.
+- **The eval set is easy.** On average 83% of the gold-answer tokens appear verbatim in the
+  gold article (62% of questions: at least 80%), a third of the questions name the law, and
+  the corpus is built from the same data the questions come from. Absolute scores are
+  therefore high; the harder bar-exam style set (`--eval-set hmgs`) was not run here.
+- Single run, single seed; CIs reflect question sampling only.
+
+Reproduce: see [Quick start](#quick-start). Paired stage differences with CIs are in
+`results/turkish_legal_rag/ablation_summary.json`.
 
 ---
 
