@@ -5,7 +5,8 @@ Export fine-tuned Qwen2.5-7B LoRA adapter to Ollama.
 Steps:
   1. Merge LoRA adapter into base weights  (merge_and_unload)
   2. Save merged model to models/qwen25_merged/
-  3. Convert to GGUF (Q4_K_M) via llama.cpp  convert_hf_to_gguf.py
+  3. Convert to GGUF via llama.cpp  convert_hf_to_gguf.py
+     (default QUANT_TYPE is q8_0; change it if you prefer Q4_K_M etc.)
   4. Write Ollama Modelfile
   5. Register with Ollama: ollama create qwen25-legal-ft
 
@@ -31,6 +32,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import config
+from generation.rag_pipeline import TURKISH_PROMPT
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 ADAPTER_DIR    = config.LORA_ADAPTER_DIR
@@ -197,8 +199,8 @@ def write_modelfile() -> None:
         f"PARAMETER num_ctx {config.LLM_NUM_CTX}\n"
         f"PARAMETER num_gpu 999\n"
         + stops
-        + 'SYSTEM "Sen Türk hukuku alanında uzman bir hukuki asistansın. '
-        'Soruları yalnızca verilen bağlama dayanarak Türkçe yanıtla."\n'
+        + 'SYSTEM """\n'
+        + TURKISH_PROMPT + '\n"""\n'
     )
     MODELFILE_PATH.write_text(content, encoding="utf-8")
     print(f"  Written: {MODELFILE_PATH}")

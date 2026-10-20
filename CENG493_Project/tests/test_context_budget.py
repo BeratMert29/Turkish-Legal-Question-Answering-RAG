@@ -1,0 +1,100 @@
+"""Tests for assemble_context budget enforcement, including first-chunk truncation."""
+
+import pytest
+
+from generation.rag_pipeline import RAGPipeline, format_source
+
+
+def _pipe(budget: int = 200) -> RAGPipeline:
+    """Lightweight pipeline with no retriever and a tight char budget."""
+    p = RAGPipeline(retriever=None, model="m", context_window_chars=budget)
+    return p
+
+
+def _chunk(text: str, source: str = "src", chunk_id: str = "c_0") -> dict:
+    return {"text": text, "source": source, "chunk_id": chunk_id}
+
+
+# ── First chunk truncation ─────────────────────────────────────────────
+
+class TestFirstChunkTruncation:
+    def test_first_chunk_exceeding_budget_is_truncated(self):
+        """A single oversized first chunk must be truncated, not omitted."""
+        big = "kelime " * 500  # ~3500 chars
+        pipe = _pipe(budget=100)
+        ctx, included = pipe.assemble_context([_chunk(big)])
+        assert len(ctx) <= 100
+        assert len(included) == 1
+        # Header preserved
+        assert ctx.startswith("[Kaynak 1]")
+
+    def test_first_chunk_within_budget_unchanged(self):
+        """First chunk fitting the budget must not be altered."""
+        small_text = "Kisa metin."
+        pipe = _pipe(budget=5000)
+        ctx, included = pipe.assemble_context([_chunk(small_text)])
+        expected = format_source(1, "src", small_text)
+        assert ctx == expected
+        assert len(included) == 1
+
+    def test_truncation_preserves_header(self):
+        """After truncation the [Kaynak 1] (source) header line must survive."""
+        big = "a " * 1000
+        pipe = _pipe(budget=80)
+        ctx, _ = pipe.assemble_context([_chunk(big, source="TMK m.1")])
+        first_line = ctx.split("\n")[0]
+        assert "[Kaynak 1]" in first_line
+        assert "TMK m.1" in first_line
+
+    def test_truncation_on_word_boundary(self):
+        """Truncated body must end at a word boundary (space), not mid-word."""
+        text = "alfa beta gamma delta epsilon zeta eta theta iota kappa"
+        pipe = _pipe(budget=60)
+        ctx, _ = pipe.assemble_context([_chunk(text)])
+        # Should not end in a broken word (no partial tokens)
+        body = ctx.split("\n", 1)[1] if "\n" in ctx else ctx
+        assert body.rstrip().endswith("..."), "Truncated text should end with ellipsis"
+
+
+# ── Multi-chunk budget behaviour ────────────────────────────────────────
+
+class TestMultiChunkBudget:
+    def test_second_chunk_excluded_when_budget_exhausted(self):
+        pipe = _pipe(budget=100)
+        c1 = _chunk("Kisa.", chunk_id="c_0")
+        c2 = _chunk("x " * 500, chunk_id="c_1")  # huge
+        ctx, included = pipe.assemble_context([c1, c2])
+        assert len(included) == 1
+        assert included[0]["chunk_id"] == "c_0"
+
+    def test_multiple_chunks_fit_within_budget(self):
+        pipe = _pipe(budget=5000)
+        chunks = [_chunk(f"Metin {i}", chunk_id=f"c_{i}") for i in range(3)]
+        ctx, included = pipe.assemble_context(chunks)
+        assert len(included) == 3
+        for i in range(3):
+            assert f"[Kaynak {i+1}]" in ctx
+
+    def test_empty_chunks_list(self):
+        pipe = _pipe(budget=100)
+        ctx, included = pipe.assemble_context([])
+        assert ctx == ""
+        assert included == []
+
+
+# ── _truncate_part unit tests ───────────────────────────────────────────
+
+class TestTruncatePart:
+    def test_short_part_unchanged(self):
+        part = "[Kaynak 1] (src)\nKisa metin.\n\n"
+        assert RAGPipeline._truncate_part(part, 500) == part
+
+    def test_truncation_output_within_limit(self):
+        part = format_source(1, "src", "kelime " * 300)
+        result = RAGPipeline._truncate_part(part, 80)
+        assert len(result) <= 80
+
+    def test_header_preserved_after_truncation(self):
+        part = format_source(1, "TMK", "genis " * 200)
+        result = RAGPipeline._truncate_part(part, 60)
+        assert result.startswith("[Kaynak 1] (TMK)\n")

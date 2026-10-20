@@ -181,6 +181,37 @@ class RAGPipeline:
         keep_ids = {id(c) for c in keep_regular} | {id(c) for c in chosen}
         return [c for c in chunks if id(c) in keep_ids]
 
+    @staticmethod
+    def _truncate_part(part: str, max_chars: int) -> str:
+        """Truncate *part* to at most *max_chars* on a word boundary.
+
+        Preserves the ``[Kaynak N] (source)`` header line that starts every
+        formatted source block.  Returns *part* unchanged when it already fits.
+        """
+        if len(part) <= max_chars:
+            return part
+        # Keep the header line(s) before the body text.
+        newline_idx = part.find("\n")
+        if newline_idx == -1 or newline_idx >= max_chars:
+            # Edge case: header alone already exceeds budget — hard-cut.
+            return part[:max_chars]
+        header = part[: newline_idx + 1]  # includes the newline
+        remaining = max_chars - len(header)
+        if remaining <= 0:
+            return header.rstrip("\n") + "\n"
+        body = part[newline_idx + 1:]
+        # Word-boundary truncation: find the last space within budget.
+        ellipsis = " ..."
+        if len(body) > remaining:
+            usable = remaining - len(ellipsis)
+            if usable <= 0:
+                return header.rstrip("\n") + "\n"
+            cut = body.rfind(" ", 0, usable)
+            if cut <= 0:
+                cut = usable
+            body = body[:cut] + ellipsis
+        return header + body
+
     def assemble_context(self, chunks: list) -> tuple[str, list]:
         """Numbered sources string and chunks included (respects context_window_chars)."""
         selected = self._select_for_generation(chunks)
@@ -194,8 +225,12 @@ class RAGPipeline:
                 else chunk["text"]
             )
             part = format_source(i + 1, chunk['source'], text)
-            if i > 0 and running_len + len(part) > self.context_window_chars:
-                break
+            if running_len + len(part) > self.context_window_chars:
+                if i == 0:
+                    # First chunk still must appear — truncate to fit.
+                    part = self._truncate_part(part, self.context_window_chars)
+                else:
+                    break
             parts.append(part)
             included.append(chunk)
             running_len += len(part)
