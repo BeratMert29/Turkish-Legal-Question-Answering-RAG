@@ -10,7 +10,7 @@ _project_root = str(Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from utils import read_jsonl
+from utils import read_jsonl, inject_citations
 import config
 from retrieval.embedder import Embedder
 from retrieval.retriever import Retriever
@@ -95,7 +95,13 @@ def main() -> None:
 
     with open(out_path, "w", encoding="utf-8") as fout:
         for record, chunks in tqdm(zip(records, all_chunks), total=len(records), desc="Assembling"):
-            ctx_str, _ = rag_pipeline.assemble_context(chunks)
+            ctx_str, included = rag_pipeline.assemble_context(chunks)
+
+            # Inject [Kaynak N] citations into the gold answer using the same
+            # heuristic that inference uses (utils.inject_citations).  The chunk
+            # order in `included` matches the [Kaynak 1], [Kaynak 2], ... labels
+            # written into ctx_str by assemble_context, so numbering is consistent.
+            cited_answer = inject_citations(record["answer"], included)
 
             # detect if we hit the char limit (last chunk was not fully included)
             if len(chunks) > 0:
@@ -111,7 +117,7 @@ def main() -> None:
             out_record = {
                 "query_id": record.get("query_id", record.get("id", "")),
                 "question": record["question"],
-                "answer": record["answer"],
+                "answer": cited_answer,
                 "context_str": ctx_str,
                 "source": record.get("source", ""),
             }

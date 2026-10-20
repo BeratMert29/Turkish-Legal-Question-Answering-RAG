@@ -17,7 +17,7 @@ if _project_root not in sys.path:
 
 from utils import read_jsonl
 import config
-from generation.rag_pipeline import TURKISH_PROMPT
+from generation.rag_pipeline import TURKISH_PROMPT, user_message as rag_user_message
 
 HF_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 QLORA_MODEL_ID = config.LORA_BASE_HF_MODEL  # 7B; matches config.LLM_BASE_FOR_ABLATION
@@ -85,8 +85,11 @@ def format_as_chat(example: dict, tokenizer) -> str:
     ctx = example.get("context_str", "") or example.get("context", "")
     context = ctx
     if context and context.strip():
+        # NOTE: 4000-char truncation is a training-time budget; inference uses
+        # config.CONTEXT_WINDOW_CHARS (default 6000).  Kept intentionally for
+        # now — see final report recommendations.
         ctx_truncated = context.strip()[:4000]
-        user_content = f"Bağlam:\n{ctx_truncated}\n\nSoru: {question}"
+        user_content = rag_user_message(question, ctx_truncated)
     else:
         user_content = question
     messages = [
