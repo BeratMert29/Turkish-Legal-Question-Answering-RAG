@@ -12,6 +12,43 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+def resolve_processed_file(name: str, *, required: bool = True) -> pathlib.Path:
+    """Return config.PROCESSED_DIR / name — the canonical location for all
+    processed-data files.
+
+    Single source of truth: no silent fallback to any other directory.  When
+    *required* is True (default) and the resolved path does not exist, a
+    ``FileNotFoundError`` is raised immediately with a message that names the
+    missing path and reminds the caller to run the appropriate upstream
+    pipeline script first.  When *required* is False the path is returned
+    unconditionally; the caller is responsible for checking existence via
+    ``path.exists()``.
+
+    Args:
+        name:     Filename (or relative sub-path) inside
+                  ``config.PROCESSED_DIR``.
+        required: Raise ``FileNotFoundError`` when the path is absent
+                  (default ``True``).  Pass ``False`` for output files that
+                  do not yet exist.
+
+    Returns:
+        ``pathlib.Path``: ``config.PROCESSED_DIR / name``.
+
+    Raises:
+        FileNotFoundError: When *required* is ``True`` and the path does
+                           not exist.
+    """
+    import config as _cfg
+    path = _cfg.PROCESSED_DIR / name
+    if required and not path.exists():
+        raise FileNotFoundError(
+            f"Required processed file not found: {path}\n"
+            f"Run the appropriate upstream pipeline script to generate "
+            f"'{name}' in {_cfg.PROCESSED_DIR} before running this script."
+        )
+    return path
+
+
 def read_jsonl(
     path: "str | pathlib.Path",
     *,

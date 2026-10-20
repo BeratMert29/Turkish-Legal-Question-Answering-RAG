@@ -9,17 +9,9 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import config
-
-# The canonical processed-data directory.  config.PROCESSED_DIR is preferred
-# when it already exists (normal fresh-setup); otherwise fall back to
-# config.TLR_PROCESSED_DIR which holds the live run artifacts committed to
-# results/processed_data/.
-_PDIR = config.PROCESSED_DIR if config.PROCESSED_DIR.exists() else config.TLR_PROCESSED_DIR
+from utils import resolve_processed_file
 
 IPPROO_SOURCE = "ipproo/Turkish-law"
-OUTPUT_FILE = _PDIR / "qa_train_merged.jsonl"
-MERGE_CONFIG_FILE = _PDIR / "merge_config.json"
-QA_TRAIN_FILE = _PDIR / "qa_train.jsonl"
 
 
 def _normalize_q(text: str) -> str:
@@ -78,25 +70,84 @@ def load_existing(path: Path) -> tuple[list[dict], set[str]]:
     return records, seen_questions
 
 
-def main() -> None:
+def main(argv=None) -> None:
+    import argparse
     from datasets import load_dataset  # local import — heavy dependency
     from data.data_processor import DataProcessor
 
-    print(f"Loading existing training data from {QA_TRAIN_FILE} ...")
-    existing_records, seen_questions = load_existing(QA_TRAIN_FILE)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--allow-missing-eval",
+        action="store_true",
+        help=(
+            "Bypass the leakage check when no eval files exist.  "
+            "Records leakage_checked=False in merge_config.json."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    # Resolve file paths via the canonical helper.  required=True raises
+    # FileNotFoundError immediately if the input is absent — no silent fallback
+    # to any other directory.  Output files use required=False (don't exist yet).
+    qa_train_file = resolve_processed_file("qa_train.jsonl", required=True)
+    output_file = resolve_processed_file("qa_train_merged.jsonl", required=False)
+    merge_config_file = resolve_processed_file("merge_config.json", required=False)
+
+    print(f"Loading existing training data from {qa_train_file} ...")
+    existing_records, seen_questions = load_existing(qa_train_file)
     original_count = len(existing_records)
     print(f"  Loaded {original_count} existing examples.")
 
     # --- Eval-set deduplication -------------------------------------------
-    # Remove any train record whose (normalized) question also appears in an
-    # eval set.  Uses DataProcessor.saved_eval_question_keys() which covers
-    # qa_eval, qa_hmgs, qa_turkish_legal_rag (and label-conflict rows).
-    # This guards against the Kaggle train split containing questions that
-    # DataProcessor assigned to the eval split, and against any future overlap
-    # between qa_train.jsonl and the saved eval JSONLs.
+    # Exclude any train record whose (normalised) question also appears in an
+    # eval set.  eval_keys comes from DataProcessor.saved_eval_question_keys()
+    # which covers qa_eval, qa_hmgs, qa_turkish_legal_rag (and label-conflict
+    # rows).  An empty result means the eval files haven't been built yet; that
+    # would make this check a silent no-op — so we hard-fail unless the caller
+    # explicitly passes --allow-missing-eval.
     print("\nLoading eval-set question keys for leakage check ...")
+
+    # Track which expected eval files are present (reported in metadata).
+    # TLR eval file lives in config.TLR_PROCESSED_DIR (a separate committed
+    # directory), read explicitly from config — no fallback logic.
+    _expected_eval_files: dict[str, Path] = {
+        "qa_eval": config.PROCESSED_DIR / config.QA_GOLD_FILE,
+        "qa_hmgs": config.PROCESSED_DIR / config.HMGS_GOLD_FILE,
+        "qa_turkish_legal_rag": config.TLR_PROCESSED_DIR / config.TLR_GOLD_FILE,
+    }
+    found_eval_files = {k: str(v) for k, v in _expected_eval_files.items() if v.exists()}
+    missing_eval_files = [k for k, v in _expected_eval_files.items() if not v.exists()]
+
     eval_keys = DataProcessor.saved_eval_question_keys()
-    print(f"  {len(eval_keys)} unique eval questions loaded.")
+    eval_keys_count = len(eval_keys)
+    print(f"  {eval_keys_count} unique eval questions loaded.")
+
+    leakage_checked: bool
+    leakage_skip_reason: str | None = None
+
+    if not eval_keys:
+        if args.allow_missing_eval:
+            leakage_skip_reason = (
+                f"--allow-missing-eval: eval_keys is empty; "
+                f"missing files: {missing_eval_files}"
+            )
+            print(f"  WARNING: {leakage_skip_reason}")
+            leakage_checked = False
+        else:
+            missing_str = (
+                ", ".join(missing_eval_files) if missing_eval_files
+                else "(all expected files present but returned no keys)"
+            )
+            raise SystemExit(
+                f"\nERROR: Leakage check cannot proceed — no eval questions were loaded.\n"
+                f"  Missing eval files: {missing_str}\n"
+                f"  Run the appropriate upstream scripts to build eval sets first,\n"
+                f"  or pass --allow-missing-eval to bypass (leakage_checked will be False).\n"
+                f"  Expected locations:\n"
+                + "".join(f"    {k}: {v}\n" for k, v in _expected_eval_files.items())
+            )
+    else:
+        leakage_checked = True
 
     clean_existing: list[dict] = []
     leaked_existing = 0
@@ -104,7 +155,9 @@ def main() -> None:
         key = _normalize_q(rec["question"])
         if key in eval_keys:
             leaked_existing += 1
-            seen_questions.discard(key)  # allow re-adding from ipproo? No — skip entirely.
+            # Record excluded from training entirely.  The eval_keys check in
+            # the ipproo loop below also prevents re-adding this question from
+            # the HuggingFace dataset.
             print(f"  [LEAKAGE] Removed from existing: {rec.get('question','')[:100]!r}")
         else:
             clean_existing.append(rec)
@@ -143,14 +196,21 @@ def main() -> None:
 
     final_count = len(merged)
 
-    _PDIR.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
         for rec in merged:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     merge_config = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "source_datasets": [str(QA_TRAIN_FILE), IPPROO_SOURCE],
+        "source_datasets": [str(qa_train_file), IPPROO_SOURCE],
+        "leakage_check": {
+            "leakage_checked": leakage_checked,
+            "eval_keys_loaded": eval_keys_count if leakage_checked else 0,
+            "eval_files_found": found_eval_files,
+            "eval_files_missing": missing_eval_files,
+            "skip_reason": leakage_skip_reason,
+        },
         "counts": {
             "original_qa_train": original_count,
             "existing_leaked_removed": leaked_existing,
@@ -160,10 +220,10 @@ def main() -> None:
             "duplicates_removed": duplicates,
             "final_merged": final_count,
         },
-        "output_file": str(OUTPUT_FILE),
+        "output_file": str(output_file),
         "dedup_method": "normalize_question_turkish_aware",
     }
-    with open(MERGE_CONFIG_FILE, "w", encoding="utf-8") as f:
+    with open(merge_config_file, "w", encoding="utf-8") as f:
         json.dump(merge_config, f, ensure_ascii=False, indent=2)
 
     print("\n--- Merge Stats ---")
@@ -174,8 +234,8 @@ def main() -> None:
     print(f"  ipproo rows added                : {added}")
     print(f"  Duplicates removed               : {duplicates}")
     print(f"  Final merged count               : {final_count}")
-    print(f"\nSaved merged dataset to  : {OUTPUT_FILE}")
-    print(f"Saved merge config to    : {MERGE_CONFIG_FILE}")
+    print(f"\nSaved merged dataset to  : {output_file}")
+    print(f"Saved merge config to    : {merge_config_file}")
 
 
 if __name__ == "__main__":

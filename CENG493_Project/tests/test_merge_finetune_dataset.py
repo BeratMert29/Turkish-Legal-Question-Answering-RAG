@@ -283,6 +283,26 @@ class TestMergeFinetuneDedup:
         assert stats["leaked_removed"] == 1
         assert merged == []
 
+    def test_leaked_question_not_readded_from_ipproo(self, tmp_data_dir):
+        """Task (9): removing seen_questions.discard(key) has no effect.
+        The eval_keys check in the ipproo loop prevents re-adding a question
+        that was removed from the train set due to eval leakage."""
+        leaked_q = "Ceza nedir?"
+        train = [{"question": leaked_q, "answer": "Hapis."}]
+        eval_ = [{"question": leaked_q, "answer": "Hapis."}]
+        # Same question also present in ipproo — must be blocked by eval_keys check.
+        ipproo = [{"question": leaked_q, "answer": "Özgürlükten yoksun bırakma."}]
+
+        merged, stats = self._run_dedup(train, eval_, ipproo, tmp_data_dir)
+
+        assert stats["leaked_removed"] == 1, "Leaked train record must be removed"
+        assert stats["ipproo_eval_skipped"] == 1, "Ipproo record must be skipped via eval_keys"
+        assert stats["final"] == 0, "No records should survive"
+        assert all(
+            normalize_question(r["question"]) != normalize_question(leaked_q)
+            for r in merged
+        ), "Leaked question must not appear in merged output"
+
 
 # ---------------------------------------------------------------------------
 # Regression test: actual results/processed_data/qa_train_merged.jsonl
@@ -293,8 +313,11 @@ class TestActualMergedFileClean:
     (post-fix state).  Skipped when the file is absent."""
 
     @pytest.fixture(scope="class")
-    def merged_path(self, repo_root):
-        p = repo_root / "results" / "processed_data" / "qa_train_merged.jsonl"
+    def merged_path(self):
+        # After the _PDIR fallback was removed, script 07 writes to
+        # config.PROCESSED_DIR (the canonical processed-data directory).
+        import config
+        p = config.PROCESSED_DIR / "qa_train_merged.jsonl"
         if not p.exists():
             pytest.skip(f"qa_train_merged.jsonl not found at {p}")
         return p
@@ -320,3 +343,117 @@ class TestActualMergedFileClean:
             f"qa_train_merged.jsonl contains {len(leaked)} eval-set question(s):\n"
             + "\n".join(f"  {q!r}" for q in leaked[:10])
         )
+
+
+# ---------------------------------------------------------------------------
+# Task (4): Eval leakage enforcement — main() must hard-fail when eval is absent
+# ---------------------------------------------------------------------------
+
+import importlib.util as _ilu
+
+
+def _load_script07():
+    """Import script 07 as a fresh module (leading digit blocks normal import)."""
+    _spec = _ilu.spec_from_file_location(
+        "_script07",
+        pathlib.Path(__file__).parent.parent / "scripts" / "07_merge_finetune_dataset.py",
+    )
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    return _mod
+
+
+class TestEvalLeakageEnforcement:
+    """Task (4): empty eval_keys → SystemExit; --allow-missing-eval → bypass + metadata."""
+
+    @pytest.fixture
+    def pdir(self, tmp_path, monkeypatch):
+        """Write a minimal qa_train.jsonl and redirect config to tmp_path."""
+        import config
+        (tmp_path / "qa_train.jsonl").write_text(
+            json.dumps({"question": "Soru?", "answer": "Cevap."}) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "PROCESSED_DIR", tmp_path)
+        monkeypatch.setattr(config, "TLR_PROCESSED_DIR", tmp_path)
+        return tmp_path
+
+    def test_missing_eval_raises_systemexit(self, pdir):
+        """Empty eval_keys with no --allow-missing-eval → SystemExit."""
+        from data.data_processor import DataProcessor
+        mod = _load_script07()
+        with patch.object(DataProcessor, "saved_eval_question_keys", return_value=set()):
+            with pytest.raises(SystemExit) as exc_info:
+                mod.main(argv=[])
+        msg = str(exc_info.value).lower()
+        assert "leakage" in msg or "eval" in msg
+
+    def test_systemexit_message_names_missing_files(self, pdir):
+        """SystemExit message lists which eval files were not found."""
+        from data.data_processor import DataProcessor
+        mod = _load_script07()
+        with patch.object(DataProcessor, "saved_eval_question_keys", return_value=set()):
+            with pytest.raises(SystemExit) as exc_info:
+                mod.main(argv=[])
+        # All three expected files are absent in tmp_path → all listed
+        msg = str(exc_info.value)
+        assert "qa_eval" in msg or "qa_hmgs" in msg or "qa_turkish_legal_rag" in msg
+
+    def test_allow_missing_eval_no_systemexit(self, pdir):
+        """--allow-missing-eval: completes without raising when eval absent."""
+        from data.data_processor import DataProcessor
+        mod = _load_script07()
+        with patch.object(DataProcessor, "saved_eval_question_keys", return_value=set()):
+            mod.main(argv=["--allow-missing-eval"])  # must not raise
+
+    def test_allow_missing_eval_leakage_checked_false(self, pdir):
+        """--allow-missing-eval: metadata records leakage_checked=False."""
+        from data.data_processor import DataProcessor
+        mod = _load_script07()
+        with patch.object(DataProcessor, "saved_eval_question_keys", return_value=set()):
+            mod.main(argv=["--allow-missing-eval"])
+        meta = json.loads((pdir / "merge_config.json").read_text(encoding="utf-8"))
+        lc = meta["leakage_check"]
+        assert lc["leakage_checked"] is False
+
+    def test_allow_missing_eval_skip_reason_recorded(self, pdir):
+        """--allow-missing-eval: skip_reason is a non-empty string in metadata."""
+        from data.data_processor import DataProcessor
+        mod = _load_script07()
+        with patch.object(DataProcessor, "saved_eval_question_keys", return_value=set()):
+            mod.main(argv=["--allow-missing-eval"])
+        meta = json.loads((pdir / "merge_config.json").read_text(encoding="utf-8"))
+        lc = meta["leakage_check"]
+        assert isinstance(lc["skip_reason"], str) and lc["skip_reason"]
+
+    def test_eval_present_leakage_checked_true(self, pdir):
+        """Non-empty eval_keys → leakage_checked=True and count matches."""
+        from data.data_processor import DataProcessor
+        eval_keys = {"soru bir", "soru iki"}
+        mod = _load_script07()
+        with patch.object(DataProcessor, "saved_eval_question_keys", return_value=eval_keys):
+            mod.main(argv=[])
+        meta = json.loads((pdir / "merge_config.json").read_text(encoding="utf-8"))
+        lc = meta["leakage_check"]
+        assert lc["leakage_checked"] is True
+        assert lc["eval_keys_loaded"] == 2
+
+    def test_metadata_includes_eval_file_lists(self, pdir):
+        """merge_config.json always records eval_files_found and eval_files_missing."""
+        from data.data_processor import DataProcessor
+        mod = _load_script07()
+        with patch.object(DataProcessor, "saved_eval_question_keys", return_value={"k1"}):
+            mod.main(argv=[])
+        meta = json.loads((pdir / "merge_config.json").read_text(encoding="utf-8"))
+        lc = meta["leakage_check"]
+        assert "eval_files_found" in lc
+        assert "eval_files_missing" in lc
+
+    def test_bypass_eval_keys_loaded_zero(self, pdir):
+        """When bypassed, eval_keys_loaded=0 in metadata (no eval questions processed)."""
+        from data.data_processor import DataProcessor
+        mod = _load_script07()
+        with patch.object(DataProcessor, "saved_eval_question_keys", return_value=set()):
+            mod.main(argv=["--allow-missing-eval"])
+        meta = json.loads((pdir / "merge_config.json").read_text(encoding="utf-8"))
+        assert meta["leakage_check"]["eval_keys_loaded"] == 0
