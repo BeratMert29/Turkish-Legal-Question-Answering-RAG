@@ -172,7 +172,7 @@ class Retriever:
         top = sorted(candidates, key=lambda i: -fused[i])[:top_k]
         return [self._chunk(i, fused[i]) for i in top]
 
-    def hybrid_retrieve(self, query: str, bm25_index, alpha: float = 0.5,
+    def hybrid_retrieve(self, query: str, bm25_index, alpha: float = None,
                         top_k: int = None,
                         candidate_pool: int = None) -> list[RetrievedChunk]:
         """Hybrid dense+sparse retrieval for a single query.
@@ -183,11 +183,13 @@ class Retriever:
                                           candidate_pool=candidate_pool)[0]
 
     def batch_hybrid_retrieve(self, queries: list[str], bm25_index,
-                              alpha: float = 0.5,
+                              alpha: float = None,
                               top_k: int = None,
                               candidate_pool: int = None) -> list[list[RetrievedChunk]]:
         """Hybrid dense+sparse retrieval for a batch of queries (see _hybrid_one)."""
         self._check_bm25(bm25_index)
+        if alpha is None:
+            alpha = config.HYBRID_ALPHA
         if top_k is None:
             top_k = config.TOP_K_RETRIEVAL
         if candidate_pool is None:

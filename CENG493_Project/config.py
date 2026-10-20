@@ -104,6 +104,12 @@ EMBEDDING_BATCH_SIZE = 8  # lower = less VRAM; increase to 32 if you have 12GB+ 
 TOP_K_RETRIEVAL = 10
 TOP_K_FOR_GENERATION = 5
 CONTEXT_WINDOW_CHARS = 14000
+# Linear interpolation weight for hybrid (dense+BM25) retrieval:
+#   score = HYBRID_ALPHA * dense_norm + (1 - HYBRID_ALPHA) * bm25_norm
+# Production default 0.5 (equal weight).  scripts/03 originally used 0.7 in a
+# one-off evaluation, but no alpha-sweep results exist to justify it; keeping
+# 0.5 as the single source of truth.  Change here to propagate everywhere.
+HYBRID_ALPHA = 0.5
 
 # Re-ranker (Stage 2 retrieval)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -113,6 +119,10 @@ RRF_K = 60                 # RRF smoothing constant
 GRAPH_FILE = "graph.json"
 GRAPH_HOPS = 1
 GRAPH_NEIGHBOR_BUDGET = 3
+# Edge types used by graph expansion at retrieval time.  Only "adj" (article
+# adjacency) by default; adding "intra" and/or "cross" widens recall but
+# needs an eval run to verify.  See graph_builder.py for all edge types.
+GRAPH_EXPANSION_KINDS: tuple[str, ...] = ("adj",)
 # When True, up to GRAPH_NEIGHBOR_BUDGET of the TOP_K_FOR_GENERATION context
 # slots are reserved for graph neighbours of the top-ranked chunks, so graph
 # expansion can change generation.  Retrieval metrics (recall/MRR/nDCG/source

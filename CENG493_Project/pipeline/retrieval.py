@@ -93,7 +93,9 @@ def retrieve(
     if retrieval_mode == "rrf" and bm25 is not None:
         chunks = retriever.batch_rrf_retrieve(questions, bm25, top_k=initial_k)
     elif retrieval_mode == "hybrid" and bm25 is not None:
-        chunks = retriever.batch_hybrid_retrieve(questions, bm25, top_k=initial_k)
+        chunks = retriever.batch_hybrid_retrieve(
+            questions, bm25, alpha=config.HYBRID_ALPHA, top_k=initial_k,
+        )
     else:
         chunks = retriever.batch_retrieve(questions, top_k=initial_k)
 
@@ -107,7 +109,7 @@ def retrieve(
             chunks,
             hops=_hops,
             budget=_budget,
-            kinds=("adj",),  # adjacency edges only (safest)
+            kinds=config.GRAPH_EXPANSION_KINDS,
             queries=questions,
         )
 

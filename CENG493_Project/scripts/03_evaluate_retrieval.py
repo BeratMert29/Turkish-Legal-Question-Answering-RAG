@@ -175,10 +175,10 @@ def main():
     bm25_index.build([{"text": c.text, "chunk_id": c.chunk_id} for c in corpus_chunks])
     print(f"  Done in {time.time()-t0:.1f}s")
 
-    print(f"\nHybrid retrieval for {len(qa_examples)} queries (alpha=0.7)...")
+    print(f"\nHybrid retrieval for {len(qa_examples)} queries (alpha={config.HYBRID_ALPHA})...")
     t0 = time.time()
     all_hybrid = retriever.batch_hybrid_retrieve(
-        questions, bm25_index, alpha=0.7, top_k=config.TOP_K_RETRIEVAL
+        questions, bm25_index, alpha=config.HYBRID_ALPHA, top_k=config.TOP_K_RETRIEVAL
     )
     print(f"  Done in {time.time()-t0:.1f}s")
 
@@ -199,7 +199,7 @@ def main():
 
     print(f"\nHybrid+Rerank retrieval for {len(qa_examples)} queries...")
     t0 = time.time()
-    hybrid_cands = retriever.batch_hybrid_retrieve(questions, bm25_index, top_k=config.RERANKER_CANDIDATES)
+    hybrid_cands = retriever.batch_hybrid_retrieve(questions, bm25_index, alpha=config.HYBRID_ALPHA, top_k=config.RERANKER_CANDIDATES)
     all_hybrid_rerank = reranker.batch_rerank(questions, hybrid_cands, top_k=config.TOP_K_RETRIEVAL)
     print(f"  Done in {time.time()-t0:.1f}s")
 
