@@ -110,6 +110,13 @@ CONTEXT_WINDOW_CHARS = 14000
 # one-off evaluation, but no alpha-sweep results exist to justify it; keeping
 # 0.5 as the single source of truth.  Change here to propagate everywhere.
 HYBRID_ALPHA = 0.5
+# Version tag embedded in every retrieval result JSON/CSV so old outputs can be
+# distinguished from current ones.  Bump this string whenever a retrieval
+# hyper-parameter changes (e.g. HYBRID_ALPHA) to avoid silently mixing results
+# from different configurations in downstream comparisons.
+# v2_alpha0.5: changed from the one-off alpha=0.7 used in initial scripts/03
+# runs to the production default 0.5; all retrieval tables must be re-generated.
+RETRIEVAL_CONFIG_VERSION = "v2_alpha0.5"
 
 # Re-ranker (Stage 2 retrieval)
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"

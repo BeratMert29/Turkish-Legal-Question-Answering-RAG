@@ -263,7 +263,15 @@ def main():
               f"{_c(m.get('recall_at_10'))}  {_c(m.get('mrr'))}  "
               f"{_c(m.get('ndcg_at_10'))}")
 
+    # Embed retrieval configuration metadata so that result files produced with
+    # different alpha values (or other hyper-parameters) are self-describing.
+    # RETRIEVAL_CONFIG_VERSION bumps whenever a retrieval hyper-parameter changes;
+    # see config.py for the version history comment.
     out = {
+        "retrieval_config": {
+            "hybrid_alpha":        config.HYBRID_ALPHA,
+            "config_version":      config.RETRIEVAL_CONFIG_VERSION,
+        },
         "dense_metrics":          dense_metrics,
         "hybrid_metrics":         hybrid_metrics,
         "rrf_metrics":            rrf_metrics,

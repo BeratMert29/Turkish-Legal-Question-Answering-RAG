@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 _PROJECT = Path(__file__).resolve().parent.parent
@@ -219,7 +219,7 @@ class _FakeRetriever:
     def batch_rrf_retrieve(self, questions, bm25, top_k=10):
         return self.batch_retrieve(questions, top_k)
 
-    def batch_hybrid_retrieve(self, questions, bm25, top_k=10):
+    def batch_hybrid_retrieve(self, questions, bm25, alpha=None, top_k=10):
         return self.batch_retrieve(questions, top_k)
 
 
@@ -773,3 +773,45 @@ def test_per_query_records_and_ci():
     assert rows[1]["recall_at_5"] is None
     ci = compute_confidence_intervals(rows)
     assert ci["f1"]["n"] == 2 and "recall_at_5" in ci
+
+
+# ---------------------------------------------------------------------------
+# Hybrid alpha propagation behavioral tests
+# ---------------------------------------------------------------------------
+
+class TestHybridAlphaPropagation:
+    """pipeline.retrieval.retrieve must pass config.HYBRID_ALPHA to the retriever."""
+
+    def test_hybrid_mode_passes_config_alpha_to_retriever(self, monkeypatch):
+        """retrieve(..., retrieval_mode='hybrid') must call batch_hybrid_retrieve
+        with alpha=config.HYBRID_ALPHA, not a hard-coded value."""
+        import config
+        from pipeline.retrieval import retrieve
+
+        monkeypatch.setattr(config, "HYBRID_ALPHA", 0.37)
+
+        captured = {}
+
+        class _CapturingRetriever(_FakeRetriever):
+            def batch_hybrid_retrieve(self, questions, bm25, alpha=None, top_k=10):
+                captured["alpha"] = alpha
+                return super().batch_hybrid_retrieve(questions, bm25, alpha=alpha, top_k=top_k)
+
+        bm25 = MagicMock()
+        retrieve(
+            _CapturingRetriever(),
+            ["Q?"],
+            retrieval_mode="hybrid",
+            bm25=bm25,
+        )
+        assert captured.get("alpha") == 0.37, (
+            f"Expected alpha=0.37 (config.HYBRID_ALPHA), got {captured.get('alpha')}"
+        )
+
+    def test_fake_retriever_accepts_alpha_kwarg(self):
+        """_FakeRetriever.batch_hybrid_retrieve must accept the alpha parameter."""
+        import inspect
+        sig = inspect.signature(_FakeRetriever.batch_hybrid_retrieve)
+        assert "alpha" in sig.parameters, (
+            "_FakeRetriever.batch_hybrid_retrieve missing alpha parameter"
+        )

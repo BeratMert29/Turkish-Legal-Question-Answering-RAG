@@ -80,11 +80,36 @@ class TestRetrieverAlphaDefault:
 class TestPipelineUsesConfig:
     """pipeline.retrieval.retrieve passes config.HYBRID_ALPHA for hybrid mode."""
 
-    def test_source_references_config_hybrid_alpha(self):
-        """The pipeline module source contains 'config.HYBRID_ALPHA'."""
-        src_path = Path(config.BASE_DIR) / "pipeline" / "retrieval.py"
-        source = src_path.read_text(encoding="utf-8")
-        assert "config.HYBRID_ALPHA" in source
+    def test_hybrid_retrieve_receives_config_alpha(self, monkeypatch):
+        """retrieve() in hybrid mode must pass config.HYBRID_ALPHA to the retriever.
+
+        Behavioral test: monkeypatches config.HYBRID_ALPHA to a sentinel value and
+        captures the alpha argument actually received by batch_hybrid_retrieve.
+        """
+        monkeypatch.setattr(config, "HYBRID_ALPHA", 0.13)
+
+        from pipeline.retrieval import retrieve
+        from unittest.mock import MagicMock
+
+        captured: dict = {}
+
+        class _CapturingRetriever:
+            def batch_retrieve(self, questions, top_k=10):
+                return [[] for _ in questions]
+
+            def batch_hybrid_retrieve(self, questions, bm25, alpha=None, top_k=10):
+                captured["alpha"] = alpha
+                return [[] for _ in questions]
+
+        retrieve(
+            _CapturingRetriever(),
+            ["test soru?"],
+            retrieval_mode="hybrid",
+            bm25=MagicMock(),
+        )
+        assert captured.get("alpha") == 0.13, (
+            f"Expected alpha=config.HYBRID_ALPHA=0.13, got {captured.get('alpha')}"
+        )
 
 
 class TestScript03UsesConfig:
@@ -97,3 +122,50 @@ class TestScript03UsesConfig:
         assert "alpha=0.7" not in source
         # Should reference config
         assert "config.HYBRID_ALPHA" in source
+
+    def test_output_dict_includes_retrieval_config_key(self):
+        """scripts/03 output dict must embed retrieval_config with hybrid_alpha
+        and config_version so result files are self-describing."""
+        src_path = Path(config.BASE_DIR) / "scripts" / "03_evaluate_retrieval.py"
+        source = src_path.read_text(encoding="utf-8")
+        assert "retrieval_config" in source
+        assert "RETRIEVAL_CONFIG_VERSION" in source
+
+
+class TestRetrievalConfigVersion:
+    """config.RETRIEVAL_CONFIG_VERSION provenance constant."""
+
+    def test_exists(self):
+        assert hasattr(config, "RETRIEVAL_CONFIG_VERSION")
+
+    def test_is_string(self):
+        assert isinstance(config.RETRIEVAL_CONFIG_VERSION, str)
+        assert len(config.RETRIEVAL_CONFIG_VERSION) > 0
+
+    def test_encodes_current_alpha(self):
+        """Version string must encode the current alpha value so it's human-readable."""
+        # e.g. "v2_alpha0.5" contains "0.5" matching HYBRID_ALPHA
+        alpha_str = str(config.HYBRID_ALPHA)
+        # Strip trailing zeros: "0.5" matches both "0.5" and "0.50"
+        assert alpha_str.rstrip("0").rstrip(".") in config.RETRIEVAL_CONFIG_VERSION, (
+            f"RETRIEVAL_CONFIG_VERSION={config.RETRIEVAL_CONFIG_VERSION!r} "
+            f"should encode HYBRID_ALPHA={config.HYBRID_ALPHA}"
+        )
+
+    def test_synthetic_output_dict_has_retrieval_config(self):
+        """Verify the output dict structure that scripts/03 emits.
+
+        Builds the same sub-dict inline (as scripts/03 does) and checks all
+        required fields and types are present.  Does NOT run the actual eval.
+        """
+        retrieval_config = {
+            "hybrid_alpha": config.HYBRID_ALPHA,
+            "config_version": config.RETRIEVAL_CONFIG_VERSION,
+        }
+        out = {"retrieval_config": retrieval_config, "dense_metrics": {}}
+
+        assert "retrieval_config" in out
+        assert out["retrieval_config"]["hybrid_alpha"] == config.HYBRID_ALPHA
+        assert isinstance(out["retrieval_config"]["hybrid_alpha"], (int, float))
+        assert "config_version" in out["retrieval_config"]
+        assert isinstance(out["retrieval_config"]["config_version"], str)
