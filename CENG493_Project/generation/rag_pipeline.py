@@ -1,5 +1,7 @@
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import config
 
@@ -30,6 +32,27 @@ ZORUNLU KURALLAR:
 6. Yanıtının hemen ardına, kullandığın kaynağın numarasını şu formatta ekle: [Kaynak 1]
 
 Yanıtını yalnızca Türkçe ver."""
+
+@dataclass
+class AssembleResult:
+    """Return value of :meth:`RAGPipeline.assemble_context_ex`.
+
+    Attributes:
+        context: Assembled numbered-source string sent to the generator.
+        included: Chunks that appear in *context* (in order).
+        truncated_ids: chunk_ids whose body was shortened to fit the budget.
+        dropped_ids: chunk_ids that were omitted entirely (budget exhausted or
+            budget too small for a meaningful body).
+        hit_limit: True when at least one chunk was dropped; useful as a
+            quick hit_limit signal for statistics (e.g. scripts/10).
+    """
+
+    context: str
+    included: list
+    truncated_ids: list = field(default_factory=list)
+    dropped_ids: list = field(default_factory=list)
+    hit_limit: bool = False
+
 
 def format_source(i: int, source: str, text: str) -> str:
     """One numbered context block, exactly as the generator sees it."""
@@ -182,41 +205,76 @@ class RAGPipeline:
         return [c for c in chunks if id(c) in keep_ids]
 
     @staticmethod
-    def _truncate_part(part: str, max_chars: int) -> str:
+    def _truncate_part(part: str, max_chars: int) -> Optional[str]:
         """Truncate *part* to at most *max_chars* on a word boundary.
 
         Preserves the ``[Kaynak N] (source)`` header line that starts every
-        formatted source block.  Returns *part* unchanged when it already fits.
+        formatted source block and the trailing ``\\n\\n`` chunk separator.
+        Returns *part* unchanged when it already fits.
+
+        Returns ``None`` when the remaining budget after the header is too
+        small to include any body text (i.e. the result would be header-only).
+        Callers must drop such chunks from the context entirely.
         """
-        if len(part) <= max_chars:
-            return part
-        # Keep the header line(s) before the body text.
-        newline_idx = part.find("\n")
-        if newline_idx == -1 or newline_idx >= max_chars:
-            # Edge case: header alone already exceeds budget — hard-cut.
-            return part[:max_chars]
-        header = part[: newline_idx + 1]  # includes the newline
-        remaining = max_chars - len(header)
+        # format_source always ends with "\n\n"; strip and re-append so the
+        # separator survives truncation and budget maths are consistent.
+        _SEP = "\n\n"
+        if part.endswith(_SEP):
+            stripped = part[: -len(_SEP)]
+            suffix = _SEP
+        else:
+            stripped = part
+            suffix = ""
+
+        # Budget for header + body (separator re-appended unconditionally).
+        content_budget = max_chars - len(suffix)
+        if len(stripped) <= content_budget:
+            return stripped + suffix  # fits as-is
+
+        newline_idx = stripped.find("\n")
+        if newline_idx == -1 or newline_idx >= content_budget:
+            # Header alone already exceeds budget — no meaningful body possible.
+            return None
+        header = stripped[: newline_idx + 1]  # includes the newline
+        remaining = content_budget - len(header)
         if remaining <= 0:
-            return header.rstrip("\n") + "\n"
-        body = part[newline_idx + 1:]
+            # No room for any body text — drop the chunk.
+            return None
+        body = stripped[newline_idx + 1:]
         # Word-boundary truncation: find the last space within budget.
         ellipsis = " ..."
         if len(body) > remaining:
             usable = remaining - len(ellipsis)
             if usable <= 0:
-                return header.rstrip("\n") + "\n"
+                # Budget too tight for body fragment + ellipsis — drop.
+                return None
             cut = body.rfind(" ", 0, usable)
             if cut <= 0:
                 cut = usable
             body = body[:cut] + ellipsis
-        return header + body
+        return header + body + suffix
 
-    def assemble_context(self, chunks: list) -> tuple[str, list]:
-        """Numbered sources string and chunks included (respects context_window_chars)."""
+    def assemble_context_ex(self, chunks: list) -> AssembleResult:
+        """Extended assemble with per-chunk truncation and drop metadata.
+
+        Implements the full budget enforcement logic.  Use this when you need
+        to know which chunks were truncated or dropped (e.g. scripts/10 for
+        hit_limit statistics).  :meth:`assemble_context` is a thin wrapper
+        that returns the original ``(context, included)`` tuple for callers
+        that do not need the extra metadata.
+
+        Args:
+            chunks: Candidate chunks in retrieval-score order.
+
+        Returns:
+            :class:`AssembleResult` with context, included, truncated_ids,
+            dropped_ids, and hit_limit.
+        """
         selected = self._select_for_generation(chunks)
-        parts = []
-        included = []
+        parts: list[str] = []
+        included: list = []
+        truncated_ids: list = []
+        dropped_ids: list = []
         running_len = 0
         for i, chunk in enumerate(selected):
             text = (
@@ -224,18 +282,46 @@ class RAGPipeline:
                 if self._chunk_expander is not None
                 else chunk["text"]
             )
-            part = format_source(i + 1, chunk['source'], text)
+            part = format_source(i + 1, chunk["source"], text)
+            cid = chunk.get("chunk_id", "")
             if running_len + len(part) > self.context_window_chars:
                 if i == 0:
-                    # First chunk still must appear — truncate to fit.
-                    part = self._truncate_part(part, self.context_window_chars)
+                    # First chunk must appear — truncate to fit.
+                    truncated = self._truncate_part(part, self.context_window_chars)
+                    if truncated is None:
+                        # Budget too small for even a minimal body — drop.
+                        dropped_ids.append(cid)
+                        continue
+                    if truncated != part:
+                        truncated_ids.append(cid)
+                    part = truncated
                 else:
+                    # Current chunk and all remaining exceed budget.
+                    for rem in selected[i:]:
+                        dropped_ids.append(rem.get("chunk_id", ""))
                     break
             parts.append(part)
             included.append(chunk)
             running_len += len(part)
         context = "".join(parts)
-        return context, included
+        return AssembleResult(
+            context=context,
+            included=included,
+            truncated_ids=truncated_ids,
+            dropped_ids=dropped_ids,
+            hit_limit=bool(dropped_ids),
+        )
+
+    def assemble_context(self, chunks: list) -> tuple[str, list]:
+        """Numbered sources string and chunks included (respects context_window_chars).
+
+        Thin wrapper around :meth:`assemble_context_ex` that preserves the
+        original two-item return signature for backward compatibility.
+        All callers that need truncation / hit_limit metadata should switch to
+        :meth:`assemble_context_ex` directly.
+        """
+        result = self.assemble_context_ex(chunks)
+        return result.context, result.included
 
     def _options(self) -> dict:
         """Ollama options sent with every request.  num_ctx and the stop
