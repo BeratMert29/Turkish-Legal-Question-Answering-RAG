@@ -1,7 +1,6 @@
 """Merge ipproo/Turkish-law HuggingFace dataset with qa_train.jsonl."""
 import json
 import sys
-import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,16 +10,24 @@ if _project_root not in sys.path:
 
 import config
 
+# The canonical processed-data directory.  config.PROCESSED_DIR is preferred
+# when it already exists (normal fresh-setup); otherwise fall back to
+# config.TLR_PROCESSED_DIR which holds the live run artifacts committed to
+# results/processed_data/.
+_PDIR = config.PROCESSED_DIR if config.PROCESSED_DIR.exists() else config.TLR_PROCESSED_DIR
+
 IPPROO_SOURCE = "ipproo/Turkish-law"
-OUTPUT_FILE = config.PROCESSED_DIR / "qa_train_merged.jsonl"
-MERGE_CONFIG_FILE = config.PROCESSED_DIR / "merge_config.json"
-QA_TRAIN_FILE = config.PROCESSED_DIR / "qa_train.jsonl"
+OUTPUT_FILE = _PDIR / "qa_train_merged.jsonl"
+MERGE_CONFIG_FILE = _PDIR / "merge_config.json"
+QA_TRAIN_FILE = _PDIR / "qa_train.jsonl"
 
 
-def _normalize(text: str) -> str:
-    """Lowercase + strip + collapse whitespace + NFC for dedup."""
-    text = unicodedata.normalize("NFC", text)
-    return " ".join(text.lower().split())
+def _normalize_q(text: str) -> str:
+    """Canonical question key: delegate to data.data_processor.normalize_question
+    (Turkish-aware: İ→i, I→ı before lowercase, then collapse non-word chars).
+    Import is deferred so utils/ is on sys.path when called."""
+    from data.data_processor import normalize_question
+    return normalize_question(text)
 
 
 def _map_ipproo_row(row: dict, idx: int) -> dict:
@@ -67,17 +74,42 @@ def load_existing(path: Path) -> tuple[list[dict], set[str]]:
     seen_questions: set[str] = set()
     for rec in read_jsonl(path):
         records.append(rec)
-        seen_questions.add(_normalize(rec["question"]))
+        seen_questions.add(_normalize_q(rec["question"]))
     return records, seen_questions
 
 
 def main() -> None:
     from datasets import load_dataset  # local import — heavy dependency
+    from data.data_processor import DataProcessor
 
     print(f"Loading existing training data from {QA_TRAIN_FILE} ...")
     existing_records, seen_questions = load_existing(QA_TRAIN_FILE)
     original_count = len(existing_records)
     print(f"  Loaded {original_count} existing examples.")
+
+    # --- Eval-set deduplication -------------------------------------------
+    # Remove any train record whose (normalized) question also appears in an
+    # eval set.  Uses DataProcessor.saved_eval_question_keys() which covers
+    # qa_eval, qa_hmgs, qa_turkish_legal_rag (and label-conflict rows).
+    # This guards against the Kaggle train split containing questions that
+    # DataProcessor assigned to the eval split, and against any future overlap
+    # between qa_train.jsonl and the saved eval JSONLs.
+    print("\nLoading eval-set question keys for leakage check ...")
+    eval_keys = DataProcessor.saved_eval_question_keys()
+    print(f"  {len(eval_keys)} unique eval questions loaded.")
+
+    clean_existing: list[dict] = []
+    leaked_existing = 0
+    for rec in existing_records:
+        key = _normalize_q(rec["question"])
+        if key in eval_keys:
+            leaked_existing += 1
+            seen_questions.discard(key)  # allow re-adding from ipproo? No — skip entirely.
+            print(f"  [LEAKAGE] Removed from existing: {rec.get('question','')[:100]!r}")
+        else:
+            clean_existing.append(rec)
+
+    print(f"  Removed {leaked_existing} existing record(s) that matched eval questions.")
 
     print(f"\nDownloading {IPPROO_SOURCE} from HuggingFace ...")
     ds = load_dataset(IPPROO_SOURCE)
@@ -91,13 +123,17 @@ def main() -> None:
 
     added = 0
     duplicates = 0
-    merged = list(existing_records)
+    eval_skipped_ipproo = 0
+    merged = list(clean_existing)
 
     for idx, row in enumerate(all_ipproo_rows, start=1):
         mapped = _map_ipproo_row(row, idx)
         if not mapped["question"] or not mapped["answer"]:
             continue
-        key = _normalize(mapped["question"])
+        key = _normalize_q(mapped["question"])
+        if key in eval_keys:
+            eval_skipped_ipproo += 1
+            continue
         if key in seen_questions:
             duplicates += 1
             continue
@@ -107,7 +143,7 @@ def main() -> None:
 
     final_count = len(merged)
 
-    config.PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    _PDIR.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         for rec in merged:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -117,23 +153,27 @@ def main() -> None:
         "source_datasets": [str(QA_TRAIN_FILE), IPPROO_SOURCE],
         "counts": {
             "original_qa_train": original_count,
+            "existing_leaked_removed": leaked_existing,
             "ipproo_rows_fetched": len(all_ipproo_rows),
+            "ipproo_eval_skipped": eval_skipped_ipproo,
             "ipproo_added": added,
             "duplicates_removed": duplicates,
             "final_merged": final_count,
         },
         "output_file": str(OUTPUT_FILE),
-        "dedup_method": "normalized_question_text",
+        "dedup_method": "normalize_question_turkish_aware",
     }
     with open(MERGE_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(merge_config, f, ensure_ascii=False, indent=2)
 
     print("\n--- Merge Stats ---")
-    print(f"  Original qa_train examples : {original_count}")
-    print(f"  ipproo rows fetched        : {len(all_ipproo_rows)}")
-    print(f"  ipproo rows added          : {added}")
-    print(f"  Duplicates removed         : {duplicates}")
-    print(f"  Final merged count         : {final_count}")
+    print(f"  Original qa_train examples       : {original_count}")
+    print(f"  Existing records leaked (removed): {leaked_existing}")
+    print(f"  ipproo rows fetched              : {len(all_ipproo_rows)}")
+    print(f"  ipproo rows in eval (skipped)    : {eval_skipped_ipproo}")
+    print(f"  ipproo rows added                : {added}")
+    print(f"  Duplicates removed               : {duplicates}")
+    print(f"  Final merged count               : {final_count}")
     print(f"\nSaved merged dataset to  : {OUTPUT_FILE}")
     print(f"Saved merge config to    : {MERGE_CONFIG_FILE}")
 
