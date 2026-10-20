@@ -9,6 +9,7 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import config
+from generation.modelfile import build_system_block
 from generation.rag_pipeline import RAGPipeline, TURKISH_PROMPT, SHORT_ANSWER_PROMPT
 from utils import inject_citations
 
@@ -63,13 +64,14 @@ python llama.cpp/convert_hf_to_gguf.py \\
     print("=" * 70)
     print("ADIM 3 — Ollama Modelfile oluştur")
     print("=" * 70)
+    system_block = build_system_block()
     print(f"""
 # {modelfile_path} dosyasını oluştur:
 
 FROM {gguf_path}
 PARAMETER temperature 0.0
 PARAMETER num_predict {config.LLM_MAX_TOKENS}
-SYSTEM "Sen Türk hukuku alanında uzman bir hukuki asistansın."
+{system_block}
 """)
 
     print("=" * 70)

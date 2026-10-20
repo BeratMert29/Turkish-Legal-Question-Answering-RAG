@@ -32,6 +32,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import config
+from generation.modelfile import build_system_block
 from generation.rag_pipeline import TURKISH_PROMPT
 
 # ── Paths ──────────────────────────────────────────────────────────────────
@@ -199,8 +200,7 @@ def write_modelfile() -> None:
         f"PARAMETER num_ctx {config.LLM_NUM_CTX}\n"
         f"PARAMETER num_gpu 999\n"
         + stops
-        + 'SYSTEM """\n'
-        + TURKISH_PROMPT + '\n"""\n'
+        + build_system_block() + "\n"
     )
     MODELFILE_PATH.write_text(content, encoding="utf-8")
     print(f"  Written: {MODELFILE_PATH}")
