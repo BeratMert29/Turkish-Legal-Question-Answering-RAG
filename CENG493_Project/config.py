@@ -104,6 +104,12 @@ EMBEDDING_BATCH_SIZE = 8  # lower = less VRAM; increase to 32 if you have 12GB+ 
 TOP_K_RETRIEVAL = 10
 TOP_K_FOR_GENERATION = 5
 CONTEXT_WINDOW_CHARS = 14000
+# Maximum token length for SFTTrainer during QLoRA fine-tuning (scripts/08).
+# Measured on 1000 random qa_train_rag.jsonl samples (Qwen2.5-7B tokenizer,
+# full chat template, NO context truncation): max=3390, p99=3093, median=2513.
+# 4096 covers the observed max with ~20% headroom for variance across the full
+# 15k dataset.
+FINETUNE_MAX_SEQ_LEN = 4096
 # Linear interpolation weight for hybrid (dense+BM25) retrieval:
 #   score = HYBRID_ALPHA * dense_norm + (1 - HYBRID_ALPHA) * bm25_norm
 # Production default 0.5 (equal weight).  scripts/03 originally used 0.7 in a

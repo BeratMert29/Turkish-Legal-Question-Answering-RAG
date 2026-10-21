@@ -15,7 +15,7 @@ _project_root = str(Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from utils import read_jsonl
+from utils import read_jsonl, resolve_processed_file
 import config
 from generation.rag_pipeline import TURKISH_PROMPT, user_message as rag_user_message
 
@@ -23,9 +23,8 @@ HF_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 QLORA_MODEL_ID = config.LORA_BASE_HF_MODEL  # 7B; matches config.LLM_BASE_FOR_ABLATION
 ADAPTER_DIR = config.LORA_ADAPTER_DIR
 
-RAG_DATASET    = config.PROCESSED_DIR / "qa_train_rag.jsonl"
-MERGED_DATASET = config.PROCESSED_DIR / "qa_train_merged.jsonl"
-FALLBACK_DATASET = config.PROCESSED_DIR / "qa_train.jsonl"
+RAG_DATASET_NAME    = "qa_train_rag.jsonl"
+MERGED_DATASET_NAME = "qa_train_merged.jsonl"
 
 TRAINING_CONFIG = {
     "base_model": QLORA_MODEL_ID,
@@ -49,13 +48,17 @@ TRAINING_CONFIG = {
     },
     "training": {
         "num_train_epochs": 3,
-        "per_device_train_batch_size": 4,
-        "gradient_accumulation_steps": 2,
+        # Batch size reduced from 4 to 2 because max_length doubled (2048->4096).
+        # Peak activation memory scales linearly with seq_len; halving batch size
+        # keeps per-GPU activation footprint roughly constant (~same VRAM).
+        # gradient_accumulation_steps raised 2->4 to keep effective_batch_size=8.
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 4,
         "effective_batch_size": 8,
         "learning_rate": 5e-5,
         "warmup_ratio": 0.03,
         "lr_scheduler_type": "cosine",
-        "max_length": 2048,
+        "max_length": config.FINETUNE_MAX_SEQ_LEN,
         "dataset_text_field": "text",
         "logging_steps": 10,
         "save_strategy": "no",
@@ -68,6 +71,45 @@ TRAINING_CONFIG = {
     },
     "adapter_output_dir": str(ADAPTER_DIR),
 }
+
+
+def _safe_truncate_context(
+    context: str,
+    question: str,
+    answer: str,
+    tokenizer,
+    max_seq_len: int,
+) -> str:
+    """Truncate *context* from the END so the full sequence fits in max_seq_len.
+
+    The answer (assistant turn) is NEVER truncated — it is the training target.
+    If the sequence is already within budget, context is returned unchanged.
+
+    Strategy: tokenize everything except context, compute remaining budget for
+    context tokens, and decode back if truncation is needed.
+    """
+    # Build the non-context parts to measure their token cost.
+    user_no_ctx = rag_user_message(question, "")
+    shell_messages = [
+        {"role": "system", "content": TURKISH_PROMPT},
+        {"role": "user", "content": user_no_ctx},
+        {"role": "assistant", "content": answer},
+    ]
+    shell_text = tokenizer.apply_chat_template(
+        shell_messages, tokenize=False, add_generation_prompt=False,
+    )
+    shell_tokens = len(tokenizer.encode(shell_text))
+    ctx_budget = max_seq_len - shell_tokens
+    if ctx_budget <= 0:
+        # Even without context the sequence exceeds max_seq_len; return empty
+        # context — the example will be logged as dropped by the caller.
+        return ""
+    ctx_tokens = tokenizer.encode(context)
+    if len(ctx_tokens) <= ctx_budget:
+        return context
+    # Truncate context tokens from the end (preserves the first/most-relevant sources).
+    truncated_tokens = ctx_tokens[:ctx_budget]
+    return tokenizer.decode(truncated_tokens, skip_special_tokens=True)
 
 
 def format_as_chat(example: dict, tokenizer) -> str:
@@ -85,17 +127,24 @@ def format_as_chat(example: dict, tokenizer) -> str:
     ctx = example.get("context_str", "") or example.get("context", "")
     context = ctx
     if context and context.strip():
-        # NOTE: 4000-char truncation is a training-time budget; inference uses
-        # config.CONTEXT_WINDOW_CHARS (default 6000).  Kept intentionally for
-        # now — see final report recommendations.
-        ctx_truncated = context.strip()[:4000]
-        user_content = rag_user_message(question, ctx_truncated)
+        # Training context uses the SAME budget as inference
+        # (config.CONTEXT_WINDOW_CHARS = 14000).  The qa_train_rag.jsonl data is
+        # already assembled with that budget by scripts/10, so additional char
+        # truncation here is not needed.  Token-level safety truncation happens
+        # in _safe_truncate_context to guarantee the assistant answer is never
+        # clipped by SFTTrainer's right-side truncation.
+        ctx_clean = context.strip()
+        ctx_safe = _safe_truncate_context(
+            ctx_clean, question, example.get("answer", ""),
+            tokenizer, config.FINETUNE_MAX_SEQ_LEN,
+        )
+        user_content = rag_user_message(question, ctx_safe)
     else:
         user_content = question
     messages = [
         {"role": "system", "content": TURKISH_PROMPT},
         {"role": "user", "content": user_content},
-        {"role": "assistant", "content": example["answer"]},
+        {"role": "assistant", "content": example.get("answer", "")},
     ]
     # add_generation_prompt=False because the assistant turn is already included
     return tokenizer.apply_chat_template(
@@ -151,6 +200,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="qlora (default): Qwen2.5-7B 4-bit QLoRA, matches the ablation base; "
              "safe: Qwen2.5-3B fp16 LoRA (low-VRAM smoke runs only).",
     )
+    p.add_argument(
+        "--no-rag-context",
+        action="store_true",
+        help="Fall back to qa_train_merged.jsonl (no RAG context/citations). "
+             "Only use this for ablation experiments. Default requires "
+             "qa_train_rag.jsonl (run scripts/07 then scripts/10 first).",
+    )
     return p
 
 
@@ -181,10 +237,16 @@ def main() -> None:
     )
     from trl import SFTConfig, SFTTrainer
 
-    dataset_path = RAG_DATASET if RAG_DATASET.exists() else (MERGED_DATASET if MERGED_DATASET.exists() else FALLBACK_DATASET)
-    if not dataset_path.exists():
-        print(f"ERROR: dataset not found at {dataset_path}")
-        sys.exit(1)
+    # Dataset resolution — qa_train_rag.jsonl is REQUIRED by default (contains
+    # RAG context + citations, matching inference).  Falling back to the merged
+    # dataset (no context) silently would create a train/inference mismatch, so
+    # it requires the explicit --no-rag-context flag.
+    if args.no_rag_context:
+        print("WARNING: --no-rag-context flag set. Training WITHOUT RAG context "
+              "or citations.  Use only for ablation experiments.")
+        dataset_path = resolve_processed_file(MERGED_DATASET_NAME)
+    else:
+        dataset_path = resolve_processed_file(RAG_DATASET_NAME)
     print(f"Loading dataset from {dataset_path} ...")
     raw_records = list(read_jsonl(dataset_path))
     if args.sample_size is not None:
@@ -244,7 +306,32 @@ def main() -> None:
         return
 
     print("\nPreparing formatted dataset ...")
-    formatted_texts = [format_as_chat(r, tokenizer) for r in raw_records]
+    max_len = config.FINETUNE_MAX_SEQ_LEN
+    formatted_texts = []
+    n_ctx_truncated = 0
+    n_over_budget = 0
+    for r in raw_records:
+        text = format_as_chat(r, tokenizer)
+        tok_len = len(tokenizer.encode(text))
+        if tok_len > max_len:
+            # _safe_truncate_context already tried; this means even the
+            # answer alone (without context) exceeds the budget — log it.
+            n_over_budget += 1
+        # Check if context was truncated by comparing raw vs safe
+        ctx_raw = (r.get("context_str", "") or r.get("context", "")).strip()
+        if ctx_raw:
+            ctx_safe = _safe_truncate_context(
+                ctx_raw, r.get("question", ""), r.get("answer", ""),
+                tokenizer, max_len,
+            )
+            if len(ctx_safe) < len(ctx_raw):
+                n_ctx_truncated += 1
+        formatted_texts.append(text)
+    if n_ctx_truncated:
+        print(f"  {n_ctx_truncated} examples had context truncated to fit max_length={max_len}.")
+    if n_over_budget:
+        print(f"  WARNING: {n_over_budget} examples still exceed max_length={max_len} "
+              f"(answer too long; SFTTrainer will right-truncate them).")
     hf_dataset = Dataset.from_dict({"text": formatted_texts})
     print(f"  Train: {len(hf_dataset)}")
 
