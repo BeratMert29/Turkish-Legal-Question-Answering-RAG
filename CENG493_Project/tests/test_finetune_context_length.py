@@ -14,9 +14,7 @@ from __future__ import annotations
 
 import importlib
 import re
-import textwrap
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -250,7 +248,6 @@ class TestDatasetResolution:
         assert "RAG_DATASET_NAME" in src
         # The old try/except pattern that caught FileNotFoundError and fell
         # back to MERGED_DATASET_NAME must be gone from the default path.
-        import re
         # Find the dataset resolution block — should NOT have a bare
         # try: resolve(RAG) except: resolve(MERGED) pattern anymore.
         try_fallback = re.search(

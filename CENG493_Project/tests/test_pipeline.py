@@ -452,7 +452,7 @@ class TestEvalHelpers:
 
     def test_hallucination_phase_uses_model_cache(self):
         """_run_hallucination_phase must store nli_model in _model_cache['nli']."""
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import MagicMock
         from pipeline import evaluation as _eval
 
         fake_hall = {"summary": {"context_supported_sentence_rate": 0.9}}
@@ -472,7 +472,7 @@ class TestEvalHelpers:
     def test_hallucination_phase_scores_generation_context(self):
         """NLI premises are each prediction's own retrieved_chunks (the
         generator's context), and a cached NLI model survives eviction."""
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import MagicMock
         from pipeline import evaluation as _eval
 
         cached = MagicMock()
@@ -529,7 +529,6 @@ class TestEvalHelpers:
             for i in range(30)
         ]
 
-        from unittest.mock import patch
         with patch("evaluation.llm_judge.llm_judge_answer", side_effect=_fake_judge), \
              patch("evaluation.llm_judge.llm_judge_faithfulness", side_effect=_fake_judge), \
              patch("evaluation.llm_judge.llm_judge_relevancy", side_effect=_fake_judge), \
@@ -550,7 +549,7 @@ class TestEvalHelpers:
         """_run_judge_phase must call sample_judge_query_ids once and pass
         the returned IDs as query_ids= to run_llm_judge_eval."""
         from pipeline import evaluation as _eval
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import MagicMock
 
         sampled = [f"q{i}" for i in range(20)]
         fake_stage = MagicMock()
@@ -584,7 +583,6 @@ class TestEvalHelpers:
         """auto_build_graph must not leak a file handle (use with)."""
         # Smoke test: call with a non-existent candidate so it exits early.
         import config as _cfg
-        from unittest.mock import patch
         from pipeline.retrieval import auto_build_graph
 
         fake_path = tmp_path / "graph.json"
@@ -621,7 +619,6 @@ class TestEvalHelpers:
         sample_size is not supplied."""
         import config
         from pipeline.evaluation import run_llm_judge_eval
-        from unittest.mock import patch
 
         captured: list[int] = []
 
@@ -728,7 +725,7 @@ class TestGraphGenerationContext:
 
 
 def test_failed_generations_stay_in_qa_denominator():
-    from unittest.mock import patch, MagicMock
+    from unittest.mock import MagicMock
     from pipeline import evaluation as ev
     preds = [
         {"query_id": "a", "predicted": "ok", "expected": "ok", "retrieved_chunks": []},

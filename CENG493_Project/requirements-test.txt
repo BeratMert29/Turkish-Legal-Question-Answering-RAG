@@ -10,3 +10,4 @@ ranx>=0.3.5,<1
 langchain-text-splitters>=0.3.0,<1
 sacrebleu>=2.3,<3
 snowballstemmer>=2.2,<3
+rank_bm25>=0.2.2,<1       # retrieval/bm25_retriever.py (test_bm25_double_norm needs the real BM25Okapi)

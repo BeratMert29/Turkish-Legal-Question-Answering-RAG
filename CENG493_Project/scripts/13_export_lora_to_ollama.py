@@ -33,7 +33,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import config
 from generation.modelfile import build_system_block
-from generation.rag_pipeline import TURKISH_PROMPT
+from generation.rag_pipeline import TURKISH_PROMPT  # noqa: F401  (re-exported single source of truth; guarded by tests/test_modelfile_prompt.py)
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 ADAPTER_DIR    = config.LORA_ADAPTER_DIR

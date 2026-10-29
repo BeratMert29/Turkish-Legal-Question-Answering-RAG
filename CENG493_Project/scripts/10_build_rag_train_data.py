@@ -80,7 +80,6 @@ def main() -> None:
 
     questions = [r["question"] for r in records]
     top_k = config.TOP_K_FOR_GENERATION
-    ctx_chars = config.CONTEXT_WINDOW_CHARS
 
     print(f"\nRetrieving context for {len(records)} records "
           f"({'dense' if args.dense_only else 'RRF'}, top_k={top_k}) ...")

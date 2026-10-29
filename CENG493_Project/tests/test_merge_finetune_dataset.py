@@ -1,12 +1,10 @@
 """Tests for scripts/07_merge_finetune_dataset.py — leakage dedup logic."""
 from __future__ import annotations
 
-import importlib
 import json
 import sys
 import pathlib
-import tempfile
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 

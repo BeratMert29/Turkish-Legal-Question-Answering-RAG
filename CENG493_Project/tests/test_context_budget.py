@@ -1,6 +1,5 @@
 """Tests for assemble_context budget enforcement, including first-chunk truncation."""
 
-import pytest
 
 from generation.rag_pipeline import RAGPipeline, format_source
 

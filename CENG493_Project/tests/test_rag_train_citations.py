@@ -8,7 +8,6 @@ import re
 import sys
 from pathlib import Path
 
-import pytest
 
 # Ensure project root is importable
 _project_root = str(Path(__file__).resolve().parent.parent)

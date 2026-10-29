@@ -7,13 +7,10 @@ Verifies that:
 - scripts/03 references config.HYBRID_ALPHA (source-level check).
 """
 
-import ast
 import inspect
-import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 import config
 

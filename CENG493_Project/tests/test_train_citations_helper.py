@@ -12,12 +12,12 @@ Covers:
 import sys
 from pathlib import Path
 
-import pytest
 
 _project_root = str(Path(__file__).resolve().parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from generation import train_citations
 from generation.train_citations import (
     inject_citations_strict,
     CitationStats,
@@ -26,7 +26,6 @@ from generation.train_citations import (
     _sentence_coverage,
     _split_sentences_per_line,
     _reassemble,
-    OVERLAP_THRESHOLD,
     MIN_SENTENCE_TOKENS,
 )
 
@@ -54,8 +53,10 @@ class TestTurkishNormalization:
     def test_mixed_case(self):
         assert _normalize_turkish("Türk Medeni KANUNU") == "türk medeni kanunu"
 
-    def test_content_tokens_strips_stopwords(self):
-        # "bu", "ile", "de" are in NLTK Turkish stopwords; "bir" is NOT
+    def test_content_tokens_strips_stopwords(self, monkeypatch):
+        # Pin the stopword set: the real one needs the NLTK corpus, which a
+        # light CI environment does not have.
+        monkeypatch.setattr(train_citations, "_STOPWORDS", frozenset({"bu", "ile", "de"}))
         toks = _content_tokens("Bu kanun ile duzenlenmistir de uygulanir")
         assert "bu" not in toks
         assert "ile" not in toks
@@ -91,7 +92,6 @@ class TestSentenceCoverage:
     def test_denominator_is_sentence_not_min(self):
         """Critical fix: short sentence against large chunk must NOT get 1.0
         just because min(2, 100) = 2 and 2/2 = 1.0."""
-        short = {"evet", "kanun"}
         big = {"evet", "kanun", "madde", "hukuk", "uygulama", "mahkeme",
                "dava", "hak", "yasa", "ceza"}
         # Old logic: min(2,10)=2, overlap=2, score=1.0

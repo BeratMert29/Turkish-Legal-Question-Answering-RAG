@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,11 @@ try:
         _STOPWORDS = frozenset(_nltk.corpus.stopwords.words("turkish"))
 except Exception:
     _STOPWORDS = frozenset()
+    import logging
+    logging.getLogger(__name__).warning(
+        "NLTK Turkish stopwords unavailable: training-citation overlap runs "
+        "without stopword removal"
+    )
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -199,7 +204,7 @@ class CitationStats:
     def log_summary(self) -> str:
         d = self.summary_dict()
         lines = [
-            f"  Citation stats:",
+            "  Citation stats:",
             f"    Records: {d['cited_records']}/{d['total_records']} cited ({d['cited_pct']}%)",
             f"    Sentences: {d['cited_sentences']}/{d['total_sentences']} cited",
             f"    Short-sentence skips: {d['short_sentence_skips']}",
